@@ -1,0 +1,441 @@
+[2026-08-24 15:06:52.784] [INFO] [launch]: All log files can be found below /var/nerv/log/nodes/2026-08-24-15-06-52-783670-nerv-testmaster-001-2119900
+[2026-08-24 15:06:52.785] [INFO] [launch]: Default logging verbosity is set to INFO
+[2026-08-24 15:06:52.905] [INFO] [launch.user]: [ProductInfo] {"hardware_model":"NERV-AMA01","serial_number":"12345678"}
+[2026-08-24 15:06:52.905] [INFO] [launch.user]: [Launch Config] Wheeled Robot Namespace: /
+[2026-08-24 15:06:52.906] [INFO] [launch.user]: [Launch Config] Current arch: x86_64, start SpeechInteractionNode
+[2026-08-24 15:06:52.907] [INFO] [launch.user]: [Launch Config] Joy Stick is enabled
+[2026-08-24 15:06:53.495] [INFO] [launch.user]: [Launch Config] Simulation is enabled
+[2026-08-24 15:06:53.505] [INFO] [speech_interaction_node-1]: process started with pid [2119979]
+[2026-08-24 15:06:53.505] [INFO] [joy_node-2]: process started with pid [2119981]
+[2026-08-24 15:06:53.505] [INFO] [joy_event_receiver_node-3]: process started with pid [2119983]
+[2026-08-24 15:06:53.505] [INFO] [web_event_receiver_node-4]: process started with pid [2119985]
+[2026-08-24 15:06:53.505] [INFO] [controller_spawner-5]: process started with pid [2119987]
+[2026-08-24 15:06:53.506] [INFO] [controller_spawner-6]: process started with pid [2119989]
+[2026-08-24 15:06:53.506] [INFO] [controller_spawner-7]: process started with pid [2119991]
+[2026-08-24 15:06:53.506] [INFO] [controller_spawner-8]: process started with pid [2119993]
+[2026-08-24 15:06:53.506] [INFO] [rviz2-9]: process started with pid [2119995]
+[2026-08-24 15:06:53.506] [INFO] [gzserver-10]: process started with pid [2120000]
+[2026-08-24 15:06:53.506] [INFO] [spawn_entity.py-11]: process started with pid [2120004]
+[2026-08-24 15:06:53.506] [INFO] [robot_state_publisher-12]: process started with pid [2120006]
+[2026-08-24 15:06:53.506] [INFO] [urdf_publisher-13]: process started with pid [2120008]
+[2026-08-24 15:06:53.506] [INFO] [urdf_publisher-14]: process started with pid [2120010]
+[2026-08-24 15:06:53.506] [INFO] [urdf_publisher-15]: process started with pid [2120012]
+[2026-08-24 15:06:53.506] [INFO] [urdf_publisher-16]: process started with pid [2120014]
+[2026-08-24 15:06:53.506] [speech_interaction_node-1] hello world speech_interaction package
+[2026-08-24 15:06:53.508] [joy_event_receiver_node-3] hello world joy_event_receiver package
+[2026-08-24 15:06:53.508] [web_event_receiver_node-4] hello world web_event_receiver package
+[2026-08-24 15:06:53.509] [joy_node-2] [DEBUG] [joy_node]: Load library libjoy.so
+[2026-08-24 15:06:53.515] [joy_node-2] [DEBUG] [joy_node]: Instantiate class rclcpp_components::NodeFactoryTemplate<joy::Joy>
+[2026-08-24 15:06:53.530] [rviz2-9] Warning: Ignoring XDG_SESSION_TYPE=wayland on Gnome. Use QT_QPA_PLATFORM=wayland to run on Wayland anyway.
+[2026-08-24 15:06:53.544] [speech_interaction_node-1] run:51 I task thread enter
+[2026-08-24 15:06:53.544] [speech_interaction_node-1] run:57 I wait task
+[2026-08-24 15:06:53.566] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Lbase
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Llink1
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Llink2
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Llink3
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Llink4
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Llink5
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Llink6
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Llink7
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Ltcp
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Rbase
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Rlink1
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Rlink2
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Rlink3
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Rlink4
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Rlink5
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Rlink6
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Rlink7
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment AR5_Rtcp
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Head_Back_Link
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Head_Eye_Link
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Head_Forward_Link
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Lfinger_l
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Lfinger_r
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Lgripper_base_link
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Lgripper_gap_link
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Lrail_155
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Lslider_l
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Lslider_r
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Rfinger_l
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Rfinger_r
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Rgripper_base_link
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Rgripper_gap_link
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Rrail_155
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Rslider_l
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Rslider_r
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Trunk_Back_Link4
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment Trunk_Forward_Link4
+[2026-08-24 15:06:53.567] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment chassis_base_link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment chassis_left_Link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment chassis_right_Link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment head1_link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment head2_link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment left_flange_base_link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment right_flange_base_link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment trunk1_link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment trunk2_link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment trunk3_link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment trunk4_link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment trunk_base_link
+[2026-08-24 15:06:53.568] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment veye_link
+[2026-08-24 15:06:53.569] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment vision_rgb_optical_frame
+[2026-08-24 15:06:53.569] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment vtrunk_base_link
+[2026-08-24 15:06:53.569] [robot_state_publisher-12] [INFO] [robot_state_publisher]: got segment world
+[2026-08-24 15:06:53.581] [joy_event_receiver_node-3] [INFO] [JoyEventReceiverNode]: 91 Load config file (./install/product/config/arm_motion.json) ok
+[2026-08-24 15:06:53.809] [urdf_publisher-14] [INFO] [right_arm.controller_manager.control_urdf_publisher]: /right_arm/controller_manager/control_urdf_publisher is successfully publishing urdf
+[2026-08-24 15:06:53.845] [urdf_publisher-15] [INFO] [trunk.controller_manager.control_urdf_publisher]: /trunk/controller_manager/control_urdf_publisher is successfully publishing urdf
+[2026-08-24 15:06:53.880] [urdf_publisher-13] [INFO] [left_arm.controller_manager.control_urdf_publisher]: /left_arm/controller_manager/control_urdf_publisher is successfully publishing urdf
+[2026-08-24 15:06:53.897] [controller_spawner-5] [INFO] [left_arm.spawner_joint_state_broadcaster]: waiting for service /left_arm/controller_manager/list_controllers to become available...
+[2026-08-24 15:06:53.919] [urdf_publisher-16] [INFO] [chassis.controller_manager.control_urdf_publisher]: /chassis/controller_manager/control_urdf_publisher is successfully publishing urdf
+[2026-08-24 15:06:53.934] [controller_spawner-6] [INFO] [left_arm.spawner_follow_position_controller]: waiting for service /left_arm/controller_manager/list_controllers to become available...
+[2026-08-24 15:06:53.949] [controller_spawner-8] [INFO] [left_arm.spawner_hand_controller]: waiting for service /left_arm/controller_manager/list_controllers to become available...
+[2026-08-24 15:06:53.954] [controller_spawner-7] [INFO] [left_arm.spawner_arm_controller]: waiting for service /left_arm/controller_manager/list_controllers to become available...
+[2026-08-24 15:06:54.055] [spawn_entity.py-11] [INFO] [urdf_spawner]: Spawn Entity started
+[2026-08-24 15:06:54.056] [spawn_entity.py-11] [INFO] [urdf_spawner]: Loading entity published on topic /robot_description
+[2026-08-24 15:06:54.058] [spawn_entity.py-11] [INFO] [urdf_spawner]: Waiting for entity xml on /robot_description
+[2026-08-24 15:06:54.070] [spawn_entity.py-11] [INFO] [urdf_spawner]: Waiting for service /spawn_entity, timeout = 30
+[2026-08-24 15:06:54.070] [spawn_entity.py-11] [INFO] [urdf_spawner]: Waiting for service /spawn_entity
+[2026-08-24 15:06:54.094] [rviz2-9] [INFO] [rviz2]: Stereo is NOT SUPPORTED
+[2026-08-24 15:06:54.094] [rviz2-9] [INFO] [rviz2]: OpenGl version: 4.6 (GLSL 4.6)
+[2026-08-24 15:06:54.111] [rviz2-9] [INFO] [rviz2]: Stereo is NOT SUPPORTED
+[2026-08-24 15:06:54.230] [gzserver-10] 2026-08-24 15:06:54	134493223291328	[resources]	[LEVEL_INFO]	/home/eu/EYou/eyou_sdk/eyou_canopen_sdk/third_party/eyou_m_resources/src/eu_resources_unix.cpp:36	Success! Copied 46353 bytes
+[2026-08-24 15:06:54.230] [gzserver-10] 2026-08-24 15:06:54	134493223291328	[canopen]	[LEVEL_INFO]	/home/eu/EYou/eyou_sdk/eyou_canopen_sdk/eyou_canopen_sdk/eyou_m_canopen/src/canfestival/TestMaster.cpp:188	file size:46353
+[2026-08-24 15:06:54.233] [gzserver-10] 2023: warning: 16-bit unsigned integer overflow: Numerical result out of range
+[2026-08-24 15:06:54.233] [gzserver-10] 2025: warning: 16-bit unsigned integer overflow: Numerical result out of range
+[2026-08-24 15:06:54.233] [gzserver-10] 2140: warning: 32-bit unsigned integer overflow: Numerical result out of range
+[2026-08-24 15:06:54.233] [gzserver-10] 2142: warning: 32-bit unsigned integer overflow: Numerical result out of range
+[2026-08-24 15:06:54.233] [gzserver-10] 2148: warning: 32-bit unsigned integer overflow: Numerical result out of range
+[2026-08-24 15:06:54.475] [gzserver-10] run:51 I task thread enter
+[2026-08-24 15:06:54.476] [gzserver-10] run:57 I wait task
+[2026-08-24 15:06:54.476] [gzserver-10] run:51 I task thread enter
+[2026-08-24 15:06:54.476] [gzserver-10] run:57 I wait task
+[2026-08-24 15:06:54.825] [spawn_entity.py-11] [INFO] [urdf_spawner]: Calling service /spawn_entity
+[2026-08-24 15:06:54.902] [gzserver-10] [DEBUG] [gazebo]: SpawnEntity: reference_frame is empty/world/map, using inertial frame
+[2026-08-24 15:06:55.098] [spawn_entity.py-11] [INFO] [urdf_spawner]: Spawn status: SpawnEntity: Successfully spawned entity [wheel_robot]
+[2026-08-24 15:06:55.101] [spawn_entity.py-11] [INFO] [urdf_spawner]: Calling service /unpause_physics
+[2026-08-24 15:06:55.248] [INFO] [spawn_entity.py-11]: process has finished cleanly [pid 2120004]
+[2026-08-24 15:06:55.924] [gzserver-10] [INFO] [gazebo_ros2_control]: Loading gazebo_ros2_control plugin
+[2026-08-24 15:06:55.931] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Starting gazebo_ros2_control plugin in namespace: /left_arm
+[2026-08-24 15:06:55.931] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Starting gazebo_ros2_control plugin in ros 2 node: gazebo_ros2_control
+[2026-08-24 15:06:55.936] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: connected to service!! /left_arm/controller_manager/control_urdf_publisher
+[2026-08-24 15:06:55.936] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Received urdf from param server, parsing...
+[2026-08-24 15:06:55.937] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmpok_9kfp6.yaml
+[2026-08-24 15:06:55.937] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmp2uak7j56.yaml
+[2026-08-24 15:06:55.937] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmpf107h0yr.yaml
+[2026-08-24 15:06:55.937] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmplpgj2jzm.yaml
+[2026-08-24 15:06:55.937] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmpd7c6wg0v.yaml
+[2026-08-24 15:06:55.937] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmpelzldiv1.yaml
+[2026-08-24 15:06:55.945] [gzserver-10] [INFO] [2026-08-24 15:06:55.944] [arm_gazebo.cpp:44]: ArmGazebo<DoF>::initSim
+[2026-08-24 15:06:55.945] [gzserver-10] [INFO] [2026-08-24 15:06:55.944] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Ljoint_1
+[2026-08-24 15:06:55.945] [gzserver-10] [INFO] [2026-08-24 15:06:55.944] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Ljoint_2
+[2026-08-24 15:06:55.945] [gzserver-10] [INFO] [2026-08-24 15:06:55.944] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Ljoint_3
+[2026-08-24 15:06:55.945] [gzserver-10] [INFO] [2026-08-24 15:06:55.944] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Ljoint_4
+[2026-08-24 15:06:55.945] [gzserver-10] [INFO] [2026-08-24 15:06:55.944] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Ljoint_5
+[2026-08-24 15:06:55.945] [gzserver-10] [INFO] [2026-08-24 15:06:55.944] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Ljoint_6
+[2026-08-24 15:06:55.945] [gzserver-10] [INFO] [2026-08-24 15:06:55.944] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Ljoint_7
+[2026-08-24 15:06:55.948] [gzserver-10] [INFO] [2026-08-24 15:06:55.947] [arm_gazebo.cpp:98]: initSim success
+[2026-08-24 15:06:55.948] [gzserver-10] [INFO] [resource_manager]: Initialize hardware 'left_arm' 
+[2026-08-24 15:06:55.948] [gzserver-10] [INFO] [2026-08-24 15:06:55.947] [arm_gazebo.cpp:106]: ArmGazebo<DoF>::initSim
+[2026-08-24 15:06:55.949] [gzserver-10] [INFO] [resource_manager]: Successful initialization of hardware 'left_arm'
+[2026-08-24 15:06:55.949] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:06:55.949]: ArmGazebo<DoF>::export_state_interfaces
+[2026-08-24 15:06:55.949] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:06:55.949]: ArmGazebo<DoF>::export_command_interfaces
+[2026-08-24 15:06:55.949] [gzserver-10] [INFO] [resource_manager]: 'configure' hardware 'left_arm' 
+[2026-08-24 15:06:55.950] [gzserver-10] [INFO] [resource_manager]: Successful 'configure' of hardware 'left_arm'
+[2026-08-24 15:06:55.950] [gzserver-10] [INFO] [resource_manager]: 'activate' hardware 'left_arm' 
+[2026-08-24 15:06:55.950] [gzserver-10] [INFO] [resource_manager]: Successful 'activate' of hardware 'left_arm'
+[2026-08-24 15:06:55.957] [gzserver-10] [WARN] [left_arm.gazebo_ros2_control]: Parameter 'hold_joints' has already been declared, parameter 'hold_joints' has already been declared
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Loading joint: Lgripper_joint
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: 	State:
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: 		 position
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: 		 velocity
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: 	Command:
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: 		 position
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [resource_manager]: Initialize hardware 'left_hand' 
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [resource_manager]: Successful initialization of hardware 'left_hand'
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [resource_manager]: 'configure' hardware 'left_hand' 
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [resource_manager]: Successful 'configure' of hardware 'left_hand'
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [resource_manager]: 'activate' hardware 'left_hand' 
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [resource_manager]: Successful 'activate' of hardware 'left_hand'
+[2026-08-24 15:06:55.958] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Loading controller_manager
+[2026-08-24 15:06:56.000] [gzserver-10] [INFO] [left_arm.gazebo_ros2_control]: Loaded gazebo_ros2_control.
+[2026-08-24 15:06:56.000] [gzserver-10] [INFO] [gazebo_ros2_control]: Loading gazebo_ros2_control plugin
+[2026-08-24 15:06:56.009] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Starting gazebo_ros2_control plugin in namespace: /right_arm
+[2026-08-24 15:06:56.009] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Starting gazebo_ros2_control plugin in ros 2 node: gazebo_ros2_control
+[2026-08-24 15:06:56.015] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: connected to service!! /right_arm/controller_manager/control_urdf_publisher
+[2026-08-24 15:06:56.016] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Received urdf from param server, parsing...
+[2026-08-24 15:06:56.016] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmpok_9kfp6.yaml
+[2026-08-24 15:06:56.016] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmp2uak7j56.yaml
+[2026-08-24 15:06:56.016] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmpf107h0yr.yaml
+[2026-08-24 15:06:56.016] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmplpgj2jzm.yaml
+[2026-08-24 15:06:56.017] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmpd7c6wg0v.yaml
+[2026-08-24 15:06:56.017] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Loading parameter files /tmp/tmpelzldiv1.yaml
+[2026-08-24 15:06:56.018] [gzserver-10] [INFO] [2026-08-24 15:06:56.018] [arm_gazebo.cpp:44]: ArmGazebo<DoF>::initSim
+[2026-08-24 15:06:56.018] [gzserver-10] [INFO] [2026-08-24 15:06:56.018] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Rjoint_1
+[2026-08-24 15:06:56.018] [gzserver-10] [INFO] [2026-08-24 15:06:56.018] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Rjoint_2
+[2026-08-24 15:06:56.018] [gzserver-10] [INFO] [2026-08-24 15:06:56.018] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Rjoint_3
+[2026-08-24 15:06:56.018] [gzserver-10] [INFO] [2026-08-24 15:06:56.018] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Rjoint_4
+[2026-08-24 15:06:56.019] [gzserver-10] [INFO] [2026-08-24 15:06:56.018] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Rjoint_5
+[2026-08-24 15:06:56.019] [gzserver-10] [INFO] [2026-08-24 15:06:56.018] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Rjoint_6
+[2026-08-24 15:06:56.019] [gzserver-10] [INFO] [2026-08-24 15:06:56.018] [arm_gazebo.cpp:79]: Load joint in gazebo model: AR5_Rjoint_7
+[2026-08-24 15:06:56.019] [gzserver-10] [INFO] [2026-08-24 15:06:56.019] [arm_gazebo.cpp:98]: initSim success
+[2026-08-24 15:06:56.019] [gzserver-10] [INFO] [resource_manager]: Initialize hardware 'right_arm' 
+[2026-08-24 15:06:56.019] [gzserver-10] [INFO] [2026-08-24 15:06:56.019] [arm_gazebo.cpp:106]: ArmGazebo<DoF>::initSim
+[2026-08-24 15:06:56.020] [gzserver-10] [INFO] [resource_manager]: Successful initialization of hardware 'right_arm'
+[2026-08-24 15:06:56.020] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:06:56.019]: ArmGazebo<DoF>::export_state_interfaces
+[2026-08-24 15:06:56.020] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:06:56.019]: ArmGazebo<DoF>::export_command_interfaces
+[2026-08-24 15:06:56.021] [gzserver-10] [INFO] [resource_manager]: 'configure' hardware 'right_arm' 
+[2026-08-24 15:06:56.021] [gzserver-10] [INFO] [resource_manager]: Successful 'configure' of hardware 'right_arm'
+[2026-08-24 15:06:56.022] [gzserver-10] [INFO] [resource_manager]: 'activate' hardware 'right_arm' 
+[2026-08-24 15:06:56.022] [gzserver-10] [INFO] [resource_manager]: Successful 'activate' of hardware 'right_arm'
+[2026-08-24 15:06:56.022] [gzserver-10] [WARN] [right_arm.gazebo_ros2_control]: Parameter 'hold_joints' has already been declared, parameter 'hold_joints' has already been declared
+[2026-08-24 15:06:56.022] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Loading joint: Rgripper_joint
+[2026-08-24 15:06:56.022] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: 	State:
+[2026-08-24 15:06:56.022] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: 		 position
+[2026-08-24 15:06:56.022] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: 		 velocity
+[2026-08-24 15:06:56.022] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: 	Command:
+[2026-08-24 15:06:56.022] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: 		 position
+[2026-08-24 15:06:56.023] [gzserver-10] [INFO] [resource_manager]: Initialize hardware 'right_hand' 
+[2026-08-24 15:06:56.023] [gzserver-10] [INFO] [resource_manager]: Successful initialization of hardware 'right_hand'
+[2026-08-24 15:06:56.023] [gzserver-10] [INFO] [resource_manager]: 'configure' hardware 'right_hand' 
+[2026-08-24 15:06:56.023] [gzserver-10] [INFO] [resource_manager]: Successful 'configure' of hardware 'right_hand'
+[2026-08-24 15:06:56.023] [gzserver-10] [INFO] [resource_manager]: 'activate' hardware 'right_hand' 
+[2026-08-24 15:06:56.023] [gzserver-10] [INFO] [resource_manager]: Successful 'activate' of hardware 'right_hand'
+[2026-08-24 15:06:56.023] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Loading controller_manager
+[2026-08-24 15:06:56.070] [gzserver-10] [INFO] [right_arm.gazebo_ros2_control]: Loaded gazebo_ros2_control.
+[2026-08-24 15:06:56.070] [gzserver-10] [INFO] [gazebo_ros2_control]: Loading gazebo_ros2_control plugin
+[2026-08-24 15:06:56.082] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Starting gazebo_ros2_control plugin in namespace: /trunk
+[2026-08-24 15:06:56.082] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Starting gazebo_ros2_control plugin in ros 2 node: gazebo_ros2_control
+[2026-08-24 15:06:56.090] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: connected to service!! /trunk/controller_manager/control_urdf_publisher
+[2026-08-24 15:06:56.091] [gzserver-10] [DEBUG] [trunk.gazebo_ros2_control]: param_name robot_description
+[2026-08-24 15:06:56.091] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Received urdf from param server, parsing...
+[2026-08-24 15:06:56.091] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Loading parameter files /tmp/tmpok_9kfp6.yaml
+[2026-08-24 15:06:56.091] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Loading parameter files /tmp/tmp2uak7j56.yaml
+[2026-08-24 15:06:56.092] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Loading parameter files /tmp/tmpf107h0yr.yaml
+[2026-08-24 15:06:56.092] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Loading parameter files /tmp/tmplpgj2jzm.yaml
+[2026-08-24 15:06:56.092] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Loading parameter files /tmp/tmpd7c6wg0v.yaml
+[2026-08-24 15:06:56.092] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Loading parameter files /tmp/tmpelzldiv1.yaml
+[2026-08-24 15:06:56.093] [gzserver-10] [DEBUG] [trunk.gazebo_ros2_control]: Load hardware interface wheeled_robot/trunk_hw/TrunkGazebo ...
+[2026-08-24 15:06:56.098] [gzserver-10] [DEBUG] [trunk.gazebo_ros2_control]: Loaded hardware interface wheeled_robot/trunk_hw/TrunkGazebo!
+[2026-08-24 15:06:56.098] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: 61 Load joint in gazebo model: trunk1_joint
+[2026-08-24 15:06:56.098] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: 61 Load joint in gazebo model: trunk2_joint
+[2026-08-24 15:06:56.098] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: 61 Load joint in gazebo model: trunk3_joint
+[2026-08-24 15:06:56.098] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: 61 Load joint in gazebo model: trunk4_joint
+[2026-08-24 15:06:56.099] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: 61 Load joint in gazebo model: head1_joint
+[2026-08-24 15:06:56.099] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: 61 Load joint in gazebo model: head2_joint
+[2026-08-24 15:06:56.099] [gzserver-10] [DEBUG] [trunk.gazebo_ros2_control]: Initialized robot simulation interface wheeled_robot/trunk_hw/TrunkGazebo!
+[2026-08-24 15:06:56.099] [gzserver-10] [INFO] [resource_manager]: Initialize hardware 'trunk' 
+[2026-08-24 15:06:56.099] [gzserver-10] [INFO] [resource_manager]: Successful initialization of hardware 'trunk'
+[2026-08-24 15:06:56.099] [gzserver-10] [INFO] [resource_manager]: 'configure' hardware 'trunk' 
+[2026-08-24 15:06:56.099] [gzserver-10] [INFO] [resource_manager]: Successful 'configure' of hardware 'trunk'
+[2026-08-24 15:06:56.099] [gzserver-10] [INFO] [resource_manager]: 'activate' hardware 'trunk' 
+[2026-08-24 15:06:56.099] [gzserver-10] [INFO] [resource_manager]: Successful 'activate' of hardware 'trunk'
+[2026-08-24 15:06:56.099] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Loading controller_manager
+[2026-08-24 15:06:56.135] [gzserver-10] [WARN] [trunk.gazebo_ros2_control]:  Desired controller update period (0.00625 s) is slower than the gazebo simulation period (0.001 s).
+[2026-08-24 15:06:56.135] [gzserver-10] [INFO] [trunk.gazebo_ros2_control]: Loaded gazebo_ros2_control.
+[2026-08-24 15:06:56.136] [gzserver-10] [INFO] [gazebo_ros2_control]: Loading gazebo_ros2_control plugin
+[2026-08-24 15:06:56.149] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Starting gazebo_ros2_control plugin in namespace: /chassis
+[2026-08-24 15:06:56.150] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Starting gazebo_ros2_control plugin in ros 2 node: gazebo_ros2_control
+[2026-08-24 15:06:56.154] [gzserver-10] [INFO] [left_arm.controller_manager]: Loading controller 'joint_state_broadcaster'
+[2026-08-24 15:06:56.170] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: connected to service!! /chassis/controller_manager/control_urdf_publisher
+[2026-08-24 15:06:56.170] [gzserver-10] [DEBUG] [chassis.gazebo_ros2_control]: param_name robot_description
+[2026-08-24 15:06:56.170] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Received urdf from param server, parsing...
+[2026-08-24 15:06:56.170] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Loading parameter files /tmp/tmpok_9kfp6.yaml
+[2026-08-24 15:06:56.170] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Loading parameter files /tmp/tmp2uak7j56.yaml
+[2026-08-24 15:06:56.170] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Loading parameter files /tmp/tmpf107h0yr.yaml
+[2026-08-24 15:06:56.171] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Loading parameter files /tmp/tmplpgj2jzm.yaml
+[2026-08-24 15:06:56.171] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Loading parameter files /tmp/tmpd7c6wg0v.yaml
+[2026-08-24 15:06:56.171] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Loading parameter files /tmp/tmpelzldiv1.yaml
+[2026-08-24 15:06:56.173] [gzserver-10] [DEBUG] [chassis.gazebo_ros2_control]: Load hardware interface wheeled_robot/chassis_hw/ChassisGazebo ...
+[2026-08-24 15:06:56.179] [gzserver-10] [DEBUG] [chassis.gazebo_ros2_control]: Loaded hardware interface wheeled_robot/chassis_hw/ChassisGazebo!
+[2026-08-24 15:06:56.180] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: 67 Load joint in gazebo model: chassis_left_Joint
+[2026-08-24 15:06:56.180] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: 67 Load joint in gazebo model: chassis_right_Joint
+[2026-08-24 15:06:56.180] [gzserver-10] [DEBUG] [chassis.gazebo_ros2_control]: Initialized robot simulation interface wheeled_robot/chassis_hw/ChassisGazebo!
+[2026-08-24 15:06:56.180] [gzserver-10] [INFO] [resource_manager]: Initialize hardware 'chassis' 
+[2026-08-24 15:06:56.180] [gzserver-10] [INFO] [resource_manager]: Successful initialization of hardware 'chassis'
+[2026-08-24 15:06:56.180] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: 99 ChassisGazebo command size 2
+[2026-08-24 15:06:56.180] [gzserver-10] [INFO] [resource_manager]: 'configure' hardware 'chassis' 
+[2026-08-24 15:06:56.180] [gzserver-10] [INFO] [resource_manager]: Successful 'configure' of hardware 'chassis'
+[2026-08-24 15:06:56.180] [gzserver-10] [INFO] [resource_manager]: 'activate' hardware 'chassis' 
+[2026-08-24 15:06:56.181] [gzserver-10] [INFO] [resource_manager]: Successful 'activate' of hardware 'chassis'
+[2026-08-24 15:06:56.181] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Loading controller_manager
+[2026-08-24 15:06:56.208] [controller_spawner-5] [INFO] [left_arm.spawner_joint_state_broadcaster]: [94mLoaded [1mjoint_state_broadcaster[0m
+[2026-08-24 15:06:56.209] [gzserver-10] [INFO] [left_arm.controller_manager]: Loading controller 'follow_position_controller'
+[2026-08-24 15:06:56.243] [gzserver-10] [INFO] [left_arm.controller_manager]: Loading controller 'hand_controller'
+[2026-08-24 15:06:56.244] [controller_spawner-6] [INFO] [left_arm.spawner_follow_position_controller]: [94mLoaded [1mfollow_position_controller[0m
+[2026-08-24 15:06:56.259] [gzserver-10] [WARN] [chassis.gazebo_ros2_control]:  Desired controller update period (0.01 s) is slower than the gazebo simulation period (0.001 s).
+[2026-08-24 15:06:56.260] [gzserver-10] [INFO] [chassis.gazebo_ros2_control]: Loaded gazebo_ros2_control.
+[2026-08-24 15:06:56.283] [gzserver-10] [INFO] [left_arm.controller_manager]: Configuring controller 'joint_state_broadcaster'
+[2026-08-24 15:06:56.283] [gzserver-10] [INFO] [left_arm.joint_state_broadcaster]: 'joints' or 'interfaces' parameter is empty. All available state interfaces will be published
+[2026-08-24 15:06:56.284] [controller_spawner-8] [INFO] [left_arm.spawner_hand_controller]: [94mLoaded [1mhand_controller[0m
+[2026-08-24 15:06:56.289] [gzserver-10] [INFO] [left_arm.controller_manager]: Loading controller 'arm_controller'
+[2026-08-24 15:06:56.326] [gzserver-10] [INFO] [left_arm.controller_manager]: Configuring controller 'follow_position_controller'
+[2026-08-24 15:06:56.327] [controller_spawner-7] [INFO] [left_arm.spawner_arm_controller]: [94mLoaded [1marm_controller[0m
+[2026-08-24 15:06:56.330] [gzserver-10] [INFO] [left_arm.follow_position_controller]: [2026-08-24 15:06:56.330]: ControllerBase::on_configure
+[2026-08-24 15:06:56.332] [gzserver-10] [INFO] [left_arm.controller_manager]: Configuring controller 'hand_controller'
+[2026-08-24 15:06:56.332] [gzserver-10] [INFO] [left_arm.hand_controller]: No specific joint names are used for command interfaces. Using 'joints' parameter.
+[2026-08-24 15:06:56.332] [gzserver-10] [INFO] [left_arm.hand_controller]: Command interfaces are [position] and state interfaces are [position velocity].
+[2026-08-24 15:06:56.332] [gzserver-10] [INFO] [left_arm.hand_controller]: Using 'splines' interpolation method.
+[2026-08-24 15:06:56.333] [gzserver-10] [INFO] [left_arm.hand_controller]: Controller state will be published at 50.00 Hz.
+[2026-08-24 15:06:56.336] [gzserver-10] [INFO] [left_arm.hand_controller]: Action status changes will be monitored at 20.00 Hz.
+[2026-08-24 15:06:56.347] [gzserver-10] [INFO] [left_arm.controller_manager]: Configuring controller 'arm_controller'
+[2026-08-24 15:06:56.348] [gzserver-10] [INFO] [left_arm.arm_controller]: No specific joint names are used for command interfaces. Using 'joints' parameter.
+[2026-08-24 15:06:56.348] [gzserver-10] [INFO] [left_arm.arm_controller]: Command interfaces are [position] and state interfaces are [position velocity].
+[2026-08-24 15:06:56.348] [gzserver-10] [INFO] [left_arm.arm_controller]: Using 'splines' interpolation method.
+[2026-08-24 15:06:56.349] [controller_spawner-5] [INFO] [left_arm.spawner_joint_state_broadcaster]: [92mConfigured and activated [1mjoint_state_broadcaster[0m
+[2026-08-24 15:06:56.349] [gzserver-10] [INFO] [left_arm.arm_controller]: Controller state will be published at 50.00 Hz.
+[2026-08-24 15:06:56.353] [gzserver-10] [INFO] [left_arm.arm_controller]: Action status changes will be monitored at 20.00 Hz.
+[2026-08-24 15:06:56.365] [gzserver-10] [INFO] [left_arm.controller_manager]: Loading controller 'follow_velocity_controller'
+[2026-08-24 15:06:56.392] [controller_spawner-6] [INFO] [left_arm.spawner_follow_position_controller]: [94mLoaded [1mfollow_velocity_controller[0m
+[2026-08-24 15:06:56.392] [gzserver-10] [INFO] [left_arm.controller_manager]: Configuring controller 'follow_velocity_controller'
+[2026-08-24 15:06:56.392] [controller_spawner-8] [INFO] [left_arm.spawner_hand_controller]: [92mConfigured and activated [1mhand_controller[0m
+[2026-08-24 15:06:56.398] [gzserver-10] [INFO] [left_arm.follow_velocity_controller]: [2026-08-24 15:06:56.398]: ControllerBase::on_configure
+[2026-08-24 15:06:56.402] [gzserver-10] [INFO] [left_arm.controller_manager]: Loading controller 'follow_servoj_controller'
+[2026-08-24 15:06:56.431] [controller_spawner-6] [INFO] [left_arm.spawner_follow_position_controller]: [94mLoaded [1mfollow_servoj_controller[0m
+[2026-08-24 15:06:56.432] [gzserver-10] [INFO] [left_arm.controller_manager]: Configuring controller 'follow_servoj_controller'
+[2026-08-24 15:06:56.436] [gzserver-10] [INFO] [left_arm.follow_servoj_controller]: [2026-08-24 15:06:56.435]: ControllerBase::on_configure
+[2026-08-24 15:06:56.477] [gzserver-10] run:51 I task thread enter
+[2026-08-24 15:06:56.477] [gzserver-10] run:57 I wait task
+[2026-08-24 15:06:56.477] [gzserver-10] run:51 I task thread enter
+[2026-08-24 15:06:56.477] [gzserver-10] run:57 I wait task
+[2026-08-24 15:06:56.477] [gzserver-10] setEndEffectorType 58 [I] Left end effector type set to: DexterousHand
+[2026-08-24 15:06:56.478] [gzserver-10] setEndEffectorType 81 [I] Right end effector type set to: DexterousHand
+[2026-08-24 15:06:56.478] [gzserver-10] initRobotModel 883 [I] Left robot model initialized successfully
+[2026-08-24 15:06:56.478] [gzserver-10] initRobotModel 891 [I] Right robot model initialized successfully
+[2026-08-24 15:06:56.479] [gzserver-10] run:51 I task thread enter
+[2026-08-24 15:06:56.479] [gzserver-10] run:57 I wait task
+[2026-08-24 15:06:56.479] [gzserver-10] setEndEffectorType 58 [I] Left end effector type set to: DexterousHand
+[2026-08-24 15:06:56.479] [gzserver-10] setEndEffectorType 81 [I] Right end effector type set to: DexterousHand
+[2026-08-24 15:06:56.480] [gzserver-10] [INFO] [ArmControlNode]: 112 End effector type configured - Left: 0, Right: 0
+[2026-08-24 15:06:56.536] [INFO] [controller_spawner-5]: process has finished cleanly [pid 2119987]
+[2026-08-24 15:06:56.538] [INFO] [controller_spawner-17]: process started with pid [2120767]
+[2026-08-24 15:06:56.555] [INFO] [controller_spawner-7]: process has finished cleanly [pid 2119991]
+[2026-08-24 15:06:56.556] [INFO] [controller_spawner-18]: process started with pid [2120774]
+[2026-08-24 15:06:56.575] [INFO] [controller_spawner-8]: process has finished cleanly [pid 2119993]
+[2026-08-24 15:06:56.577] [INFO] [controller_spawner-19]: process started with pid [2120777]
+[2026-08-24 15:06:56.604] [INFO] [controller_spawner-6]: process has finished cleanly [pid 2119989]
+[2026-08-24 15:06:56.606] [INFO] [controller_spawner-20]: process started with pid [2120780]
+[2026-08-24 15:06:57.224] [controller_spawner-17] [INFO] [right_arm.spawner_joint_state_broadcaster]: waiting for service /right_arm/controller_manager/list_controllers to become available...
+[2026-08-24 15:06:57.230] [controller_spawner-20] [INFO] [right_arm.spawner_follow_position_controller]: waiting for service /right_arm/controller_manager/list_controllers to become available...
+[2026-08-24 15:06:57.243] [controller_spawner-19] [INFO] [right_arm.spawner_hand_controller]: waiting for service /right_arm/controller_manager/list_controllers to become available...
+[2026-08-24 15:06:57.244] [controller_spawner-18] [INFO] [right_arm.spawner_arm_controller]: waiting for service /right_arm/controller_manager/list_controllers to become available...
+[2026-08-24 15:06:57.816] [gzserver-10] [INFO] [right_arm.controller_manager]: Loading controller 'joint_state_broadcaster'
+[2026-08-24 15:06:57.841] [controller_spawner-17] [INFO] [right_arm.spawner_joint_state_broadcaster]: [94mLoaded [1mjoint_state_broadcaster[0m
+[2026-08-24 15:06:57.844] [gzserver-10] [INFO] [right_arm.controller_manager]: Configuring controller 'joint_state_broadcaster'
+[2026-08-24 15:06:57.845] [gzserver-10] [INFO] [right_arm.joint_state_broadcaster]: 'joints' or 'interfaces' parameter is empty. All available state interfaces will be published
+[2026-08-24 15:06:57.852] [controller_spawner-17] [INFO] [right_arm.spawner_joint_state_broadcaster]: [92mConfigured and activated [1mjoint_state_broadcaster[0m
+[2026-08-24 15:06:58.006] [INFO] [controller_spawner-17]: process has finished cleanly [pid 2120767]
+[2026-08-24 15:06:58.008] [INFO] [controller_spawner-21]: process started with pid [2120989]
+[2026-08-24 15:06:58.304] [gzserver-10] [INFO] [right_arm.controller_manager]: Loading controller 'hand_controller'
+[2026-08-24 15:06:58.331] [controller_spawner-21] [INFO] [trunk.spawner_joint_state_broadcaster]: waiting for service /trunk/controller_manager/list_controllers to become available...
+[2026-08-24 15:06:58.392] [gzserver-10] [INFO] [right_arm.controller_manager]: Loading controller 'arm_controller'
+[2026-08-24 15:06:58.393] [controller_spawner-19] [INFO] [right_arm.spawner_hand_controller]: [94mLoaded [1mhand_controller[0m
+[2026-08-24 15:06:58.437] [gzserver-10] [INFO] [right_arm.controller_manager]: Loading controller 'follow_position_controller'
+[2026-08-24 15:06:58.438] [controller_spawner-18] [INFO] [right_arm.spawner_arm_controller]: [94mLoaded [1marm_controller[0m
+[2026-08-24 15:06:58.464] [gzserver-10] [INFO] [right_arm.controller_manager]: Configuring controller 'hand_controller'
+[2026-08-24 15:06:58.465] [gzserver-10] [INFO] [right_arm.hand_controller]: No specific joint names are used for command interfaces. Using 'joints' parameter.
+[2026-08-24 15:06:58.465] [gzserver-10] [INFO] [right_arm.hand_controller]: Command interfaces are [position] and state interfaces are [position velocity].
+[2026-08-24 15:06:58.465] [gzserver-10] [INFO] [right_arm.hand_controller]: Using 'splines' interpolation method.
+[2026-08-24 15:06:58.466] [controller_spawner-20] [INFO] [right_arm.spawner_follow_position_controller]: [94mLoaded [1mfollow_position_controller[0m
+[2026-08-24 15:06:58.466] [gzserver-10] [INFO] [right_arm.hand_controller]: Controller state will be published at 50.00 Hz.
+[2026-08-24 15:06:58.471] [gzserver-10] [INFO] [right_arm.hand_controller]: Action status changes will be monitored at 20.00 Hz.
+[2026-08-24 15:06:58.484] [gzserver-10] [INFO] [right_arm.controller_manager]: Configuring controller 'arm_controller'
+[2026-08-24 15:06:58.485] [gzserver-10] [INFO] [right_arm.arm_controller]: No specific joint names are used for command interfaces. Using 'joints' parameter.
+[2026-08-24 15:06:58.485] [gzserver-10] [INFO] [right_arm.arm_controller]: Command interfaces are [position] and state interfaces are [position velocity].
+[2026-08-24 15:06:58.486] [gzserver-10] [INFO] [right_arm.arm_controller]: Using 'splines' interpolation method.
+[2026-08-24 15:06:58.487] [gzserver-10] [INFO] [right_arm.arm_controller]: Controller state will be published at 50.00 Hz.
+[2026-08-24 15:06:58.490] [gzserver-10] [INFO] [right_arm.arm_controller]: Action status changes will be monitored at 20.00 Hz.
+[2026-08-24 15:06:58.499] [gzserver-10] [INFO] [right_arm.controller_manager]: Configuring controller 'follow_position_controller'
+[2026-08-24 15:06:58.506] [gzserver-10] [INFO] [right_arm.follow_position_controller]: [2026-08-24 15:06:58.505]: ControllerBase::on_configure
+[2026-08-24 15:06:58.509] [controller_spawner-19] [INFO] [right_arm.spawner_hand_controller]: [92mConfigured and activated [1mhand_controller[0m
+[2026-08-24 15:06:58.510] [gzserver-10] [INFO] [right_arm.controller_manager]: Loading controller 'follow_velocity_controller'
+[2026-08-24 15:06:58.548] [controller_spawner-20] [INFO] [right_arm.spawner_follow_position_controller]: [94mLoaded [1mfollow_velocity_controller[0m
+[2026-08-24 15:06:58.549] [gzserver-10] [INFO] [right_arm.controller_manager]: Configuring controller 'follow_velocity_controller'
+[2026-08-24 15:06:58.555] [gzserver-10] [INFO] [right_arm.follow_velocity_controller]: [2026-08-24 15:06:58.554]: ControllerBase::on_configure
+[2026-08-24 15:06:58.558] [gzserver-10] [INFO] [right_arm.controller_manager]: Loading controller 'follow_servoj_controller'
+[2026-08-24 15:06:58.589] [controller_spawner-20] [INFO] [right_arm.spawner_follow_position_controller]: [94mLoaded [1mfollow_servoj_controller[0m
+[2026-08-24 15:06:58.589] [gzserver-10] [INFO] [right_arm.controller_manager]: Configuring controller 'follow_servoj_controller'
+[2026-08-24 15:06:58.593] [gzserver-10] [INFO] [right_arm.follow_servoj_controller]: [2026-08-24 15:06:58.592]: ControllerBase::on_configure
+[2026-08-24 15:06:58.680] [INFO] [controller_spawner-18]: process has finished cleanly [pid 2120774]
+[2026-08-24 15:06:58.688] [INFO] [controller_spawner-19]: process has finished cleanly [pid 2120777]
+[2026-08-24 15:06:58.690] [INFO] [controller_spawner-22]: process started with pid [2121083]
+[2026-08-24 15:06:58.744] [INFO] [controller_spawner-20]: process has finished cleanly [pid 2120780]
+[2026-08-24 15:06:58.746] [INFO] [controller_spawner-23]: process started with pid [2121085]
+[2026-08-24 15:06:59.297] [controller_spawner-22] [INFO] [chassis.spawner_chassis_controller]: waiting for service /chassis/controller_manager/list_controllers to become available...
+[2026-08-24 15:06:59.338] [controller_spawner-23] [INFO] [trunk.spawner_trunk_controller]: waiting for service /trunk/controller_manager/list_controllers to become available...
+[2026-08-24 15:07:00.286] [gzserver-10] [INFO] [trunk.controller_manager]: Loading controller 'joint_state_broadcaster'
+[2026-08-24 15:07:00.315] [controller_spawner-21] [INFO] [trunk.spawner_joint_state_broadcaster]: [94mLoaded [1mjoint_state_broadcaster[0m
+[2026-08-24 15:07:00.317] [gzserver-10] [INFO] [trunk.controller_manager]: Configuring controller 'joint_state_broadcaster'
+[2026-08-24 15:07:00.318] [gzserver-10] [INFO] [trunk.joint_state_broadcaster]: 'joints' or 'interfaces' parameter is empty. All available state interfaces will be published
+[2026-08-24 15:07:00.334] [controller_spawner-21] [INFO] [trunk.spawner_joint_state_broadcaster]: [92mConfigured and activated [1mjoint_state_broadcaster[0m
+[2026-08-24 15:07:00.358] [gzserver-10] [INFO] [trunk.controller_manager]: Loading controller 'trunk_controller'
+[2026-08-24 15:07:00.509] [INFO] [controller_spawner-21]: process has finished cleanly [pid 2120989]
+[2026-08-24 15:07:00.512] [INFO] [controller_spawner-24]: process started with pid [2121287]
+[2026-08-24 15:07:00.552] [gzserver-10] [INFO] [chassis.controller_manager]: Loading controller 'chassis_controller'
+[2026-08-24 15:07:00.568] [controller_spawner-23] [INFO] [trunk.spawner_trunk_controller]: [94mLoaded [1mtrunk_controller[0m
+[2026-08-24 15:07:00.570] [gzserver-10] [INFO] [trunk.controller_manager]: Configuring controller 'trunk_controller'
+[2026-08-24 15:07:00.571] [gzserver-10] [INFO] [trunk.trunk_controller]: No specific joint names are used for command interfaces. Using 'joints' parameter.
+[2026-08-24 15:07:00.571] [gzserver-10] [INFO] [trunk.trunk_controller]: Command interfaces are [position] and state interfaces are [position velocity].
+[2026-08-24 15:07:00.571] [gzserver-10] [INFO] [trunk.trunk_controller]: Using 'splines' interpolation method.
+[2026-08-24 15:07:00.575] [gzserver-10] [INFO] [trunk.trunk_controller]: Controller state will be published at 50.00 Hz.
+[2026-08-24 15:07:00.588] [gzserver-10] [INFO] [trunk.trunk_controller]: Action status changes will be monitored at 20.00 Hz.
+[2026-08-24 15:07:00.619] [gzserver-10] [INFO] [trunk.controller_manager]: Loading controller 'position_controller'
+[2026-08-24 15:07:00.631] [controller_spawner-22] [INFO] [chassis.spawner_chassis_controller]: [94mLoaded [1mchassis_controller[0m
+[2026-08-24 15:07:00.634] [gzserver-10] [INFO] [chassis.controller_manager]: Configuring controller 'chassis_controller'
+[2026-08-24 15:07:00.675] [controller_spawner-22] [INFO] [chassis.spawner_chassis_controller]: [92mConfigured and activated [1mchassis_controller[0m
+[2026-08-24 15:07:00.676] [controller_spawner-23] [INFO] [trunk.spawner_trunk_controller]: [94mLoaded [1mposition_controller[0m
+[2026-08-24 15:07:00.677] [gzserver-10] [INFO] [trunk.controller_manager]: Configuring controller 'position_controller'
+[2026-08-24 15:07:00.680] [gzserver-10] [INFO] [trunk.position_controller]: configure successful
+[2026-08-24 15:07:00.854] [controller_spawner-24] [INFO] [chassis.spawner_joint_state_broadcaster]: waiting for service /chassis/controller_manager/list_controllers to become available...
+[2026-08-24 15:07:00.889] [INFO] [controller_spawner-22]: process has finished cleanly [pid 2121083]
+[2026-08-24 15:07:00.925] [INFO] [controller_spawner-23]: process has finished cleanly [pid 2121085]
+[2026-08-24 15:07:04.110] [gzserver-10] [INFO] [chassis.controller_manager]: Loading controller 'joint_state_broadcaster'
+[2026-08-24 15:07:04.149] [controller_spawner-24] [INFO] [chassis.spawner_joint_state_broadcaster]: [94mLoaded [1mjoint_state_broadcaster[0m
+[2026-08-24 15:07:04.151] [gzserver-10] [INFO] [chassis.controller_manager]: Configuring controller 'joint_state_broadcaster'
+[2026-08-24 15:07:04.152] [gzserver-10] [INFO] [chassis.joint_state_broadcaster]: 'joints' or 'interfaces' parameter is empty. All available state interfaces will be published
+[2026-08-24 15:07:04.179] [controller_spawner-24] [INFO] [chassis.spawner_joint_state_broadcaster]: [92mConfigured and activated [1mjoint_state_broadcaster[0m
+[2026-08-24 15:07:04.324] [INFO] [controller_spawner-24]: process has finished cleanly [pid 2121287]
+[2026-08-24 15:07:57.874] [gzserver-10] [INFO] [TrunkControlNode]: 321 Disconnect trunk motor
+[2026-08-24 15:08:15.778] [gzserver-10] [INFO] [TrunkControlNode]: 312 Connect trunk motor
+[2026-08-24 15:08:15.778] [gzserver-10] run:57 I wait task
+[2026-08-24 15:08:15.778] [gzserver-10] [WARN] [trunk.controller_manager]: Controller with name 'position_controller' can not be deactivated since it is not active.
+[2026-08-24 15:08:15.778] [gzserver-10] [WARN] [trunk.controller_manager]: Could not deactivate controller with name 'position_controller'. Check above warnings for more details. Check the state of the controllers and their required interfaces using `ros2 control list_controllers -v` CLI to get more information.
+[2026-08-24 15:08:15.790] [gzserver-10] [INFO] [TrunkControlNode]: Successfully activated trunk controller
+[2026-08-24 15:08:25.264] [gzserver-10] run:57 I wait task
+[2026-08-24 15:08:25.269] [gzserver-10] [INFO] [trunk.position_controller]: activate successful
+[2026-08-24 15:08:25.277] [gzserver-10] [INFO] [TrunkControlNode]: Successfully activated trunk controller
+[2026-08-24 15:08:32.811] [gzserver-10] [INFO] [TrunkControlNode]: 312 Connect trunk motor
+[2026-08-24 15:08:38.830] [gzserver-10] connectDev 126 [I] Build version : 20260812_135810_
+[2026-08-24 15:08:38.831] [gzserver-10] connectDev 135 [I] left arm start to connect
+[2026-08-24 15:08:38.831] [gzserver-10] string2time 100 [I] l date : 20260819175910
+[2026-08-24 15:08:38.831] [gzserver-10] isTrialPeriod 143 [I] Temporary use 117 hours
+[2026-08-24 15:08:38.831] [gzserver-10] isTrialPeriod 145 [I] Licensed device temporary.
+[2026-08-24 15:08:38.831] [gzserver-10] [INFO] [left_arm.controller_manager]: Switch controller timeout is set to 0, using default 1s!
+[2026-08-24 15:08:38.832] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:08:38.832]: activated controller: arm_controller
+[2026-08-24 15:08:38.833] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:08:38.832]: connected to robot: remote_ip 192.168.2.161, local_ip 192.168.2.100
+[2026-08-24 15:08:38.833] [gzserver-10] connectDev 152 [I] right arm start to connect
+[2026-08-24 15:08:38.835] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:08:38.834]: activated controller: arm_controller
+[2026-08-24 15:08:38.835] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:08:38.834]: connected to robot: remote_ip 192.168.2.160, local_ip 192.168.2.100
+[2026-08-24 15:08:38.835] [gzserver-10] printRobotVersion 120 [I] [xCoreSDK]控制器版本号:None 机型:Gazebo SDK 版本:None
+[2026-08-24 15:08:46.770] [gzserver-10] [INFO] [ArmControlNode]: 504 Setting left arm follow position...
+[2026-08-24 15:08:46.770] [gzserver-10] setFollowPosition 392 [I] set follow state 0   1
+[2026-08-24 15:08:46.770] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:08:46.770]: stopping follow
+[2026-08-24 15:08:46.770] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:08:46.770]: controller is already deactivated: follow_velocity_controller
+[2026-08-24 15:08:46.770] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:08:46.770]: controller is already activated: arm_controller
+[2026-08-24 15:08:46.770] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:08:46.770]: stopped follow
+[2026-08-24 15:08:46.771] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:08:46.770]: starting follow with parameters: follow_period=0.008000
+[2026-08-24 15:08:46.772] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:08:46.772]: deactivated controller: arm_controller
+[2026-08-24 15:08:46.810] [gzserver-10] [INFO] [left_arm.follow_velocity_controller]: [2026-08-24 15:08:46.810]: follow_velocity_controller is activating with parameters: follow_period=0.008000
+[2026-08-24 15:08:46.811] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:08:46.811]: activated controller: follow_velocity_controller
+[2026-08-24 15:08:46.811] [gzserver-10] [INFO] [left_arm.hardware_interface]: [2026-08-24 15:08:46.811]: started follow
+[2026-08-24 15:08:50.570] [gzserver-10] [INFO] [ArmControlNode]: 517 Setting right arm follow position...
+[2026-08-24 15:08:50.570] [gzserver-10] setFollowPosition 392 [I] set follow state 1   1
+[2026-08-24 15:08:50.570] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:08:50.570]: stopping follow
+[2026-08-24 15:08:50.571] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:08:50.570]: controller is already deactivated: follow_velocity_controller
+[2026-08-24 15:08:50.572] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:08:50.571]: controller is already activated: arm_controller
+[2026-08-24 15:08:50.572] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:08:50.571]: stopped follow
+[2026-08-24 15:08:50.572] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:08:50.571]: starting follow with parameters: follow_period=0.008000
+[2026-08-24 15:08:50.573] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:08:50.573]: deactivated controller: arm_controller
+[2026-08-24 15:08:50.636] [gzserver-10] [INFO] [right_arm.follow_velocity_controller]: [2026-08-24 15:08:50.636]: follow_velocity_controller is activating with parameters: follow_period=0.008000
+[2026-08-24 15:08:50.637] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:08:50.637]: activated controller: follow_velocity_controller
+[2026-08-24 15:08:50.637] [gzserver-10] [INFO] [right_arm.hardware_interface]: [2026-08-24 15:08:50.637]: started follow
