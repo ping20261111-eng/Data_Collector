@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.bak
+
+# 日志
+log/
+*.log
+
+# 虚拟环境
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# 编译产物
+build/
+install/
+
+# 数据文件
+*.bag
+*.mcap
