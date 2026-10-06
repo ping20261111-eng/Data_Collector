@@ -6,6 +6,7 @@ import tarfile
 import tempfile
 import time
 import zipfile
+import hashlib
 from pathlib import Path
 from typing import Optional, List, Callable, Tuple
 
@@ -14,6 +15,23 @@ import paramiko
 from .core import (logger, DEFAULT_BAG_DIR, DEFAULT_LOG_DIR, DEFAULT_REMOTE_HOST,
                    DEFAULT_REMOTE_PORT, DEFAULT_REMOTE_USER, DEFAULT_REMOTE_BASE)
 from .errors import AppError, ErrorCode, describe, is_retryable
+from .manifest import (
+    MANIFEST_NAME,
+    STATUS_COMPLETE,
+    STATUS_INTERRUPTED,
+    BagManifest,
+)
+from .verify import sha256_file, sha256_sftp, write_sha256_sidecar
+
+
+def _current_operator() -> str:
+    """当前操作员标识，用于数据溯源。
+
+    取值顺序：`DATA_COLLECTOR_OPERATOR` 环境变量 → `USER`。
+    上位机**不做登录体系**（现场是共用机器，单人操作为主），
+    所以只求"能区分是谁录的"，不强求身份认证。
+    """
+    return os.environ.get("DATA_COLLECTOR_OPERATOR") or os.environ.get("USER") or ""
 
 # 打包/上传调参
 PACK_CHUNK = 4 * 1024 * 1024        # 单次读写块大小（进度粒度 vs 系统调用开销）
@@ -201,6 +219,9 @@ class RecorderManager:
         # 本次录制的起始时间：看门狗用它划基线，只统计之后写入的文件 ——
         # 否则 bag 目录里的历史数据会让"是否在产出"永远判为真。
         self._started_at: Optional[float] = None
+        # 本次录制对应的 bag 目录（写manifest 用）；启动瞬间可能还找不到，
+        # 收尾时会再兜一次
+        self._manifest_dir: Optional[Path] = None
 
     def start(self, script_type: str, name: str = "", desc: str = "",
               label: str = "", action_id=None, settle_seconds: float = 0.5) -> bool:
@@ -243,13 +264,83 @@ class RecorderManager:
 
         self.last_error = ""
         self._started_at = time.time()
+        self._begin_manifest(name, desc, script_type)
         return True
+
+    # ---------- manifest（录制连续性） ----------
+    # 目的：让"这次录制完整吗"在**事后**也能回答。health() 只能在运行时判断，
+    # 而现场最常见的故障是断电 —— 工程师第二天开机时，没有任何进程能告诉他
+    # 昨天那次录到哪、能不能用。manifest跟着 bag 走，换台机器也说得清。
+
+    def _begin_manifest(self, name: str, desc: str, script_type: str) -> None:
+        """录制开始时写清单。失败只记日志，不影响录制本身 ——
+        采数是主任务，清单是辅助，不该因为写不了清单就不让录。"""
+        try:
+            bag_dir = self._latest_bag_dir()
+            if bag_dir is None:
+                # 脚本刚起，bag 目录可能还没建出来：这不是错误，
+                # 下一轮 health 巡检会补上
+                logger.info("录制刚开始，bag 目录尚未生成，manifest 稍后补写")
+                return
+            manifest = BagManifest(bag_dir)
+            manifest.start(task_name=name or bag_dir.name,
+                            operator=_current_operator(),
+                            script_type=script_type,
+                            extra={"desc": desc} if desc else None)
+            self._manifest_dir = bag_dir
+            logger.info(f"已写录制清单: {manifest.path}")
+        except Exception as exc:
+            logger.warning(f"写录制清单失败（不影响录制）：{exc}")
+
+    def _latest_bag_dir(self) -> Optional[Path]:
+        try:
+            bag_root = Path(self.config.get_bag_dir())
+        except Exception as exc:
+            logger.warning(f"读取 bag 目录失败：{exc}")
+            return None
+        if not bag_root.is_dir():
+            return None
+        try:
+            dirs = [p for p in bag_root.iterdir() if p.is_dir()]
+        except OSError as exc:
+            logger.warning(f"列举 bag 目录失败：{exc}")
+            return None
+        if not dirs:
+            return None
+        # 按 mtime 取最新：录制脚本按时间戳命名目录，最新的即本次
+        return max(dirs, key=lambda p: p.stat().st_mtime)
+
+    def finalize_manifest(self) -> Optional[str]:
+        """录制正常结束后调用：把清单标为 complete 并返回状态。
+
+        若期间真的没落盘任何文件，标成"中断"而不是"完整" ——
+        与其让工程师以为录到了，不如明确告诉他这一段是空的。
+        """
+        bag_dir = getattr(self, "_manifest_dir", None) or self._latest_bag_dir()
+        if bag_dir is None:
+            return None
+        try:
+            manifest = BagManifest(bag_dir)
+            if not manifest.exists():
+                self._begin_manifest("", "", "")
+                manifest = BagManifest(bag_dir)
+            produced = self._files_since(Path(self.config.get_bag_dir()),
+                                         (self._started_at or time.time()) - 1.0)[0]
+            if produced <= 0:
+                manifest.mark_interrupted("录制已停止，但未检测到新数据落盘")
+                return STATUS_INTERRUPTED
+            manifest.finish()
+            return STATUS_COMPLETE
+        except Exception as exc:
+            logger.warning(f"收尾录制清单失败：{exc}")
+            return None
 
     def stop(self) -> bool:
         if self.current_proc and self.current_proc.poll() is None:
             from .core import terminate
             terminate(self.current_proc)
             self.current_proc = None
+            self.finalize_manifest()
             self._started_at = None
             return True
         return False
@@ -270,12 +361,23 @@ class RecorderManager:
     # ---------- 录制看门狗 ----------
     @staticmethod
     def _files_since(root: Path, since: float) -> Tuple[int, float]:
-        """统计 root 下在 since 之后被写过的文件数，以及最近一次写入的时间。"""
+        """统计 root 下在 since 之后被写过的**文件**数，以及最近一次写入的时间。
+
+        只数文件、**跳过目录**：录制脚本会先建出 bag 目录再往里写数据，
+        若把新建目录本身算作产出，"脚本起来了但没落盘"会被判成正在产出 ——
+        那样 health() 就失去了它唯一要拦的那种事故。
+        同理跳过 `manifest.json`：它由上位机自己写，不是机器人侧的数据产出，
+        把它算进去会让"零数据录制"被误判为正常。
+        """
         count, newest = 0, 0.0
         if not root.is_dir():
             return count, newest
         for path in root.rglob("*"):
+            if path.name in (MANIFEST_NAME, "info.json"):
+                continue
             try:
+                if path.is_dir():
+                    continue
                 mtime = path.stat().st_mtime
             except OSError:
                 continue          # 录制中被移走/重命名的条目，忽略即可
@@ -338,6 +440,10 @@ class DataUploader:
         self.transfer_compression = upload.get("compression", "store")
         self.upload_retries = max(int(upload.get("retries", 1) or 0), 0)
         self.space_check = bool(upload.get("space_check", True))
+        # 内容校验：只比大小挡不住"传输位翻转/ 磁盘静默错误"这类**大小不变**的损坏，
+        # 所以加一层 SHA-256。默认关闭是为了不给现有流程增加可见耗时，
+        # 现场交付时可在 app_config.yaml 里打开（upload.verify_content: true）。
+        self.verify_content = bool(upload.get("verify_content", False))
         # 本地打包的额外空间余量：临时目录很小（tmpfs）时可调小
         self.temp_margin_mb = max(int(upload.get("temp_margin_mb", 200) or 0), 0)
         self.retry_delay = 2.0  # 重试前等待秒数（测试里置 0，避免 sleep）
@@ -421,11 +527,27 @@ class DataUploader:
 
     def _pack_folder(self, folder: Path, fp, fmt: str, compress: bool,
                      entries: List[tuple], running_cb=None,
-                     on_source_bytes: Callable[[int], None] = None) -> None:
-        """把 folder 打包写入 fp（可为不可 seek 的流）。
+                     on_source_bytes: Callable[[int], None] = None,
+                     collect_digest: bool = False) -> Optional[str]:
+        """把 folder 打包写入 fp（可为不可 seek 的流），返回归档 SHA-256（可选）。
 
         - arcname 保留 bag 文件夹名（与旧 zip 行为一致：压缩包内为 <bag名>/xxx.mcap）
         - 支持随时取消；on_source_bytes 收到的是“已读源数据累计字节”，用于实时进度
+        - `collect_digest=True` 时返回归档字节的 SHA-256。
+
+        **摘要必须算"归档字节"而不是源文件字节** —— 远端收到的就是归档字节。
+
+        ## 为什么不边写边算
+
+        zipfile 关闭时会**回退 seek** 重写 local header 与中央目录
+        （实测一个普通 zip 就要回退 5 次），所以"顺序累加"的摘要与落盘内容
+        必然不一致。而一个**看起来通过的错误校验比没有校验更危险** ——
+        它会让一份坏数据带着"已校验"的标记流进下游。
+
+        因此这里改成：把写入**暂存**到一个可 seek 的对象（SpooledTemporaryFile，
+        小归档只在内存，超过阈值自动落盘），关闭后对最终内容一次性求摘要，
+        再把字节交给 fp。这样摘要与落盘内容**按构造一致**，不依赖对
+        zipfile 内部行为的假设。
         """
         fmt = (fmt or "zip").lower()
         if fmt not in ARCHIVE_FORMATS:
@@ -433,15 +555,41 @@ class DataUploader:
 
         read_total = 0
 
+        spool = None
+        sink = fp
+        if collect_digest:
+            # 内存优先，超出阈值自动落盘到临时文件 —— 单个超大 bag 不会把内存吃满
+            spool = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024)
+            sink = spool
+
         def on_read(delta: int) -> None:
             nonlocal read_total
             read_total += delta
             if on_source_bytes is not None:
                 on_source_bytes(read_total)
 
+        def finish() -> Optional[str]:
+            """把 spool 内容写给真实目标，并返回归档摘要。
+
+            摘要与写入都基于**同一份最终字节**，所以两者按构造一致 ——
+            这是这里不用"边写边算"的原因，见docstring。
+            """
+            if spool is None:
+                return None
+            digest = hashlib.sha256()
+            spool.seek(0)
+            while True:
+                chunk = spool.read(PACK_CHUNK)
+                if not chunk:
+                    break
+                digest.update(chunk)
+                fp.write(chunk)
+            spool.close()
+            return digest.hexdigest()
+
         if fmt == "tar":
             # 流式（w|）写法：只顺序写，不 seek，可直接对接网络通道
-            with tarfile.open(fileobj=fp, mode="w|", format=tarfile.GNU_FORMAT) as tar:
+            with tarfile.open(fileobj=sink, mode="w|", format=tarfile.GNU_FORMAT) as tar:
                 top = tarfile.TarInfo(folder.name)
                 top.type = tarfile.DIRTYPE
                 top.mode = 0o755
@@ -455,12 +603,12 @@ class DataUploader:
                         reader = ProgressReader(src, on_read, running_cb, arcname)
                         tar.addfile(info, reader)
                         reader.flush_pending()
-            return
+            return finish()
 
         # zip：显式 ZIP64（Bag/MCAP/DB3 容易超过 2GiB/4GiB 边界），
         # 流式写出时 zipfile 会自动改用 data descriptor，解包工具（unzip/7-Zip）均支持。
         zip_compress = zipfile.ZIP_DEFLATED if compress else zipfile.ZIP_STORED
-        with zipfile.ZipFile(fp, mode="w", compression=zip_compress, allowZip64=True) as z:
+        with zipfile.ZipFile(sink, mode="w", compression=zip_compress, allowZip64=True) as z:
             for path, size in entries:
                 self._check_cancel(running_cb)
                 arcname = str(path.relative_to(folder.parent))
@@ -475,6 +623,7 @@ class DataUploader:
                             break
                         dst.write(chunk)
                         on_read(len(chunk))
+        return finish()
 
     def compress_folder(self, folder: Path, output_zip: Path,
                         running_cb: Callable[[], bool] = None,
@@ -607,6 +756,16 @@ class DataUploader:
                     f"远端 {_mb(remote_size)}（已清理远端半成品，可直接重试）",
                 )
 
+            # 大小对不代表内容对：位翻转与磁盘静默错误都保持大小不变。
+            digest = self._verify_remote_digest(sftp, local_path, remote_path,
+                                                remote_size)
+            if self.verify_content and digest is None:
+                return False
+            if digest:
+                # 边车文件让现场能用 `sha256sum -c` 独立复核，不依赖本工具
+                write_sha256_sidecar(local_path, digest)
+                logger.info(f"内容校验通过，边车已写入: {local_path.name}.sha256")
+
             if progress_percent:
                 progress_percent(100)
             if progress_cb:
@@ -650,6 +809,40 @@ class DataUploader:
             return False
         finally:
             transport.close()
+
+    def _verify_remote_digest(self, sftp, local_path: Path, remote_path: str,
+                              remote_size: int) -> Optional[str]:
+        """内容级校验：比对本地与远端的 SHA-256，不一致则清理远端并报带码失败。
+
+        为什么在大小校验之后做：大小是廉价的快速闸门，先用它挡掉截断；
+        剩下"大小对但内容错"的那一类才交给 SHA-256。
+
+        返回本地摘要（供调用方写边车文件）；未开启校验时返回 None。
+        任何读取异常都**按校验失败处理** —— 读不到摘要就等于没验过，
+        把它当成功会留下一个虚假的安全感。
+        """
+        if not self.verify_content:
+            return None
+        try:
+            local_digest = sha256_file(local_path)
+            remote_digest = sha256_sftp(sftp, remote_path, remote_size)
+        except Exception as exc:
+            self._remove_remote_quietly(sftp, remote_path)
+            self._fail(
+                ErrorCode.VERIFY_FAILED,
+                f"内容校验无法完成：{type(exc).__name__}: {exc}"
+                f"（已清理远端半成品，可直接重试）",
+            )
+            return None
+        if local_digest != remote_digest:
+            self._remove_remote_quietly(sftp, remote_path)
+            self._fail(
+                ErrorCode.VERIFY_FAILED,
+                f"远端内容校验不一致：本地 {local_digest[:16]}…，"
+                f"远端 {remote_digest[:16]}…（已清理远端半成品，可直接重试）",
+            )
+            return None
+        return local_digest
 
     @staticmethod
     def _resume_offset(sftp, remote_path: str, file_size: int) -> int:
@@ -1008,6 +1201,7 @@ class DataUploader:
         sftp = None
         channel = None
         sent = 0
+        local_digest = None
         try:
             transport, sftp = self._connect_sftp()
             self._ensure_remote_dir(sftp, os.path.dirname(remote_path))
@@ -1016,7 +1210,9 @@ class DataUploader:
             raw = channel.makefile("wb", 0)
             writer = ProgressWriter(raw)
             try:
-                self._pack_folder(folder, writer, fmt, compress, entries, running_cb, reporter.update)
+                local_digest = self._pack_folder(
+                    folder, writer, fmt, compress, entries, running_cb,
+                    reporter.update, collect_digest=self.verify_content)
                 writer.flush()
             except BaseException:
                 # 无论成功失败都记录已写出的字节数：为 0 才可能是不支持 exec
@@ -1043,6 +1239,22 @@ class DataUploader:
                     ErrorCode.VERIFY_FAILED,
                     f"远端文件大小校验不一致：已发送 {_mb(sent)}，远端 {_mb(remote_size)}"
                 )
+            if local_digest is not None:
+                # 大小相同之后仍要确认内容：大小不变的中断/位翻转是这个闸门挡不住的
+                try:
+                    remote_digest = sha256_sftp(sftp, remote_path, remote_size)
+                except Exception as exc:
+                    raise AppError(
+                        ErrorCode.VERIFY_FAILED,
+                        f"内容校验无法完成：{type(exc).__name__}: {exc}"
+                    ) from exc
+                if local_digest != remote_digest:
+                    raise AppError(
+                        ErrorCode.VERIFY_FAILED,
+                        f"远端内容校验不一致：本地 {local_digest[:16]}…，"
+                        f"远端 {remote_digest[:16]}…"
+                    )
+                logger.info(f"流式内容校验通过: {remote_path}")
             reporter.finish(f"上传完成：{_mb(sent)}")
             logger.info(f"流式直传成功: {remote_path}（{_mb(sent)}）")
             return sent

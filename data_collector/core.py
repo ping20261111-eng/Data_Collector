@@ -1481,6 +1481,7 @@ class ConfigManager:
             logger.warning(f"upload_compression 取值无效（{raw_compression}），回退 store")
 
         space_check = self.app_config.get("upload_space_check")
+        verify_content = self.app_config.get("verify_content")
         return {
             "mode": mode,
             "format": fmt,
@@ -1489,6 +1490,48 @@ class ConfigManager:
             "temp_margin_mb": int(self.app_config.get("upload_temp_margin_mb") or 200),
             "retries": int(self.app_config.get("upload_retries") or 1),
             "space_check": True if space_check is None else bool(space_check),
+            "verify_content": False if verify_content is None else bool(verify_content),
+        }
+
+    EXPORT_TARGETS = ("server", "disk", "both")
+
+    def get_export_settings(self) -> dict:
+        """导出目标（数据往哪儿送）。
+
+        - server: 只送远端服务器（**默认值，保持既有行为不变**）
+        - disk:   只写本地挂载的移动硬盘（现场离线场景）
+        - both:   两边都写（内网环境兜底）
+
+        为什么单独一段`disk_export` 而不复用 `remote_base`：
+        `remote_base` 带**越界校验语义**（`_check_remote_path` 用前缀匹配
+        限制"只能写在它下面"）。本地挂载点不套这套规则，两套语义混在一个键上
+        会让"哪些路径算合法"变得无法推理。
+        """
+        raw = (self.app_config.get("export_target") or "server").strip().lower()
+        target = raw if raw in self.EXPORT_TARGETS else "server"
+        if target != raw:
+            logger.warning(f"export_target 取值无效（{raw}），回退 server")
+
+        disk = self.app_config.get("disk_export") or {}
+        if not isinstance(disk, dict):
+            logger.warning(f"disk_export 应为映射结构，实际是 {type(disk).__name__}，已忽略")
+            disk = {}
+
+        # 盘标识只在**确实配了 disk_export 段**时才生效。
+        # 不这么做的话：默认 target=server（根本不写硬盘），标识校验却开着，
+        # 启动自检会报一个与本次操作无关的"盘不对"。默认值要跟"有没有在用"绑定，
+        # 而不是各自独立取默认。
+        volume_id_file = str(disk.get("volume_id_file") or ".nerv_volume")
+        require_id = disk.get("require_volume_id")
+        return {
+            "target": target,
+            "mount_point": str(disk.get("mount_point") or "").strip(),
+            "volume_id_file": volume_id_file,
+            # 配了 disk_export 段 → 默认要求标识（防把数据写进错盘）；
+            # 完全没配 → 不要求（根本没在用硬盘）。
+            "require_volume_id": bool(disk) if require_id is None else bool(require_id),
+            "min_free_margin_mb": int(disk.get("min_free_margin_mb") or 2048),
+            "warn_file_bytes": int(disk.get("warn_file_bytes") or 3_800_000_000),
         }
 
     def check_workspace(self) -> bool:
