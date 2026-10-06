@@ -2,10 +2,20 @@
 __pycache__/
 *.py[cod]
 *.bak
+.pytest_cache/
+.ruff_cache/
 
 # 日志
 log/
+logs/
 *.log
+
+# 本地配置：含机器人/服务器地址，填入密码后绝不能入库
+configs/app_config.yaml
+
+# 运行时状态（遥操作 PID 等）
+*.state.json
+*.pid
 
 # 虚拟环境
 .venv/

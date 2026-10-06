@@ -1,0 +1,28 @@
+[project]
+name = "data-collector"
+description = "布草机器人数据采集上位机"
+requires-python = ">=3.8"
+
+[tool.ruff]
+line-length = 120
+target-version = "py38"
+exclude = [".git", "__pycache__", ".venv", "venv", "build", "install", ".pytest_cache"]
+
+[tool.ruff.lint]
+# 起步只开最基础的规则集：语法错误 + pyflakes（未定义名、未使用导入等）。
+# 先让 CI 跑起来并保持绿色，再逐步加规则 —— 一上来全开会被历史告警淹没，
+# 最后的结果通常是"CI 常年红着，没人看"。
+select = ["E", "F"]
+ignore = [
+    "E501",  # 行长：中文注释天然容易超，不做硬约束
+    "E402",  # 导入不在文件顶部：theme 初始化前需要先设置环境变量
+    "F401",  # 未使用导入：部分用于类型注解或对外兼容
+]
+
+[tool.ruff.lint.per-file-ignores]
+# 测试里常有"为了构造环境而导入"的模块，以及占位变量
+"tests/*" = ["F401", "F841"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
