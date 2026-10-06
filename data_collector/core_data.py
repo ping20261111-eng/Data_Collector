@@ -23,6 +23,12 @@ from .manifest import (
 )
 from .verify import sha256_file, sha256_sftp, write_sha256_sidecar
 
+#: 磁盘导出目标。**延迟导入**（不在模块顶层）：
+#: `disk_export` 会在 import 期读一次 `get_export_settings`（拿挂载点/盘标识），
+#: 顶��导入会把「导入 core_data」与「读配置」两件事绑死 ——
+#: 单元测试里只想用 `_pack_folder` 时也会被迫构造一份配置。
+#: 真正的使用点在 `DataUploader._export_to_disk`，那里才需要配置。
+
 
 def _current_operator() -> str:
     """当前操作员标识，用于数据溯源。
@@ -880,6 +886,148 @@ class DataUploader:
                 done += len(buf)
                 callback(done, total)
 
+    # ---------- 磁盘导出（`export_target: disk` / `both`） ----------
+    def _export_target(self) -> str:
+        """读导出目标；**没有 config 时按 `server` 处理**。
+
+        缺省必须是 `server` —— 现场已有部署不能因为加了一个配置键就改行为，
+        这是 PRD 里最强的约束。而 `DataUploader` 允许不传 config 构造
+        （若干处历史调用如此），那条路径上更不能凭空去写硬盘。
+        """
+        if self.config is None:
+            return "server"
+        try:
+            return str(self.config.get_export_settings().get("target") or "server")
+        except Exception as exc:            # 配置层异常不该让"导出"整体失败
+            logger.warning(f"读取 export_target 失败，按 server 处理：{exc}")
+            return "server"
+
+    def _disk_export_target(self):
+        """按当前配置造一个 `DiskExportTarget`（延迟导入，见文件头的注释）。"""
+        from .disk_export import DiskExportTarget
+        settings = self.config.get_export_settings() if self.config else {}
+        return DiskExportTarget(
+            mount_point=settings.get("mount_point", ""),
+            volume_id_file=settings.get("volume_id_file", ".nerv_volume"),
+            require_volume_id=bool(settings.get("require_volume_id")),
+            min_free_margin_mb=int(settings.get("min_free_margin_mb", 2048)),
+            warn_file_bytes=int(settings.get("warn_file_bytes", 3_800_000_000)),
+        )
+
+    def _export_to_disk(self, folder_path: Path, remote_subpath: str = "",
+                        progress_cb=None, progress_percent=None) -> bool:
+        """把一次采集的数据写到本地挂载的移动硬盘。
+
+        与远端路径的差异是**刻意的**（见 `disk_export` 的模块说明）：不建 SSH、
+        不断点续传、不算远端空间。打包器共用 `_pack_folder`——它接受任意文件对象，
+        所以"边打包边写盘"不需要第二套实现。
+        """
+        self.upload_cancelled = False
+        self.last_error = ""
+        self.last_code = None
+
+        folder = Path(folder_path) if folder_path is not None else None
+        if folder is None or not folder.exists() or not folder.is_dir():
+            return self._fail(ErrorCode.NOT_FOUND, f"文件夹不存在：{folder_path}")
+
+        try:
+            entries, total_size = self._iter_files(folder)
+        except AppError as exc:
+            return self._fail(exc.code, exc.message)
+        if total_size == 0:
+            return self._fail(ErrorCode.NOT_FOUND, f"bag 文件夹为空：{folder}")
+
+        disk = self._disk_export_target()
+        if not disk.mount_point or str(disk.mount_point) == ".":
+            return self._fail(
+                ErrorCode.CONFIG_MISSING,
+                "未配置移动硬盘导出路径。\n"
+                "请在 app_config.yaml 的 disk_export.mount_point 填入实际挂载点，"
+                "或把 export_target 改回 server。",
+            )
+
+        archive_name = self._archive_name(folder)
+        est_size = self._estimate_archive_size(total_size, len(entries), self.transfer_format)
+        subpath = remote_subpath or folder.name
+
+        # ---------- 导出前四道检查，按序执行 ----------
+        # 顺序不是随手排的：前一道是"这个盘能不能用"，后一道才是"这批数据放不放得下"。
+        # 反过来先报"空间不足"，而盘根本没挂载的话，这个提示会指向错误的方向。
+        try:
+            disk.prepare(subpath, total_bytes=est_size)      # ① 挂载点 ② 盘标识 ③ 空间
+        except AppError as exc:
+            return self._fail(exc.code, exc.message)
+
+        # ④ FAT32 单文件上限：**只提醒不拦截**（现场不能被程序卡住交不出数据）
+        oversize = disk.warn_oversize([(p.name, s) for p, s in entries])
+        if oversize:
+            hint = disk.describe_limit_hint()
+            names = "、".join(f"{n}（{s / 1e9:.1f}GB）" for n, s in oversize[:3])
+            more = f"等 {len(oversize)} 个文件" if len(oversize) > 3 else ""
+            message = (f"本次有 {len(oversize)} 个文件超过该盘的单文件上限：{names}{more}。\n"
+                       f"{hint}\n可选择「仍继续」（部分文件会写入失败）或更换 exFAT 硬盘。")
+            logger.warning(message)
+            if progress_cb:
+                progress_cb(message)
+        if progress_cb:
+            progress_cb(f"目标：移动硬盘 {disk.mount_point}（{disk.filesystem_type() or '文件系统未知'}）")
+
+        def running() -> bool:
+            return not self.upload_cancelled
+
+        # `_pack_folder` 的 `fp` 要的是一个**有 `.write()`/`flush()` 的文件对象**
+        # （它直接当 zipfile/tarfile 的 fileobj 用），而 `write_stream` 给的
+        # `sink` 是**写入回调**（bytes -> None）。两者语义不同，所以套一层适配。
+        #
+        # 复用已有的 `ProgressWriter`（它本来就是"把只顺序写的目标包装成
+        # zipfile 可用的文件对象"，职责完全一致），不另造一个只写壳。
+        class _CallbackSink:
+            """把写入回调伪装成文件对象，供 zipfile/tarfile 使用。"""
+
+            def __init__(self, fn):
+                self._fn = fn
+
+            def write(self, data) -> int:
+                self._fn(data)
+                return len(data)
+
+            def flush(self) -> None:
+                """zipfile 关闭前会 flush。这里**不能报错**：底层的
+                "已写入多少"由 `write_stream` 自己统计，flush 对磁盘侧无意义。"""
+
+        def producer(sink) -> None:
+            self._pack_folder(
+                folder, ProgressWriter(_CallbackSink(sink)),
+                self.transfer_format,
+                self.transfer_compression == "deflate",
+                entries, running_cb=running, collect_digest=self.verify_content,
+            )
+
+        try:
+            target_dir = disk.prepare(subpath)
+            disk.write_stream(
+                target_dir, archive_name, producer,
+                progress_cb=progress_cb, progress_percent=progress_percent,
+            )
+        except AppError as exc:
+            # 拔盘/空间/IO 都已是带码异常，原样保留码，界面才能给对建议
+            return self._fail(exc.code, exc.message)
+        except Exception as exc:
+            return self._fail(ErrorCode.LOCAL_IO, f"导出到移动硬盘失败：{exc}")
+
+        if self.verify_content:
+            try:
+                written = target_dir / archive_name
+                write_sha256_sidecar(written, sha256_file(written))
+            except OSError as exc:
+                # 边车文件写不出来不算导出失败：数据已经在盘上且已验过内容
+                logger.warning(f"写 .sha256 边车文件失败（数据本身已写入）：{exc}")
+
+        logger.info(f"已导出到移动硬盘：{target_dir / archive_name}")
+        if progress_cb:
+            progress_cb(f"已导出到移动硬盘：{archive_name}")
+        return True
+
     # ---------- 打包 + 上传（统一入口） ----------
     def _archive_name(self, folder: Path) -> str:
         suffix = "tar" if self.transfer_format == "tar" else "zip"
@@ -994,6 +1142,45 @@ class DataUploader:
         - 不压缩（MCAP/视频本身已压缩，再 DEFLATE 只耗 CPU）
         - 边打包边直传（不占本地临时空间，pack 与上传重叠进行）
         - 失败自动重试；远端不支持流式时自动回退“本地打包 + SFTP 上传”
+
+        ## 导出目标分流（`export_target`）
+
+        三态，**缺省 `server` = 行为与加这个功能之前完全一致**：
+
+        | 值 | 行为 |
+        | --- | --- |
+        | `server`（默认） | 只走原来的 SFTP 路径，磁盘侧**一行都不碰** |
+        | `disk` | 只写本地挂载点，**完全不建立 SSH 连接** |
+        | `both` | 两边都写；任一边失败都报出来（不吞掉） |
+
+        为什么分流放在这里而不是界面层：界面有**两个**入口
+        （`upload_latest_bag` 与 `upload_specific_bag`，数据查看页与上传页各走一个），
+        在界面分流要改两处、漏一处就是"某个入口的导出目标不生效"——
+        而这类不一致极难在测试里发现。`upload_bag_folder` 是两者的唯一汇合点。
+        """
+        target = self._export_target()
+        if target in ("disk", "both"):
+            if target == "disk":
+                return self._export_to_disk(folder_path, remote_subpath,
+                                            progress_cb, progress_percent)
+            # both：先磁盘后服务器。顺序理由是磁盘侧是"把数据带走"的最后一环，
+            # 现场最关心的就是它；先做它可以在网络异常时仍拿到本地副本。
+            disk_ok = self._export_to_disk(folder_path, remote_subpath,
+                                           progress_cb, progress_percent)
+            if not disk_ok:
+                return False
+            return self._upload_bag_folder_to_server(
+                folder_path, remote_subpath, progress_cb, progress_percent)
+
+        return self._upload_bag_folder_to_server(
+            folder_path, remote_subpath, progress_cb, progress_percent)
+
+    def _upload_bag_folder_to_server(self, folder_path: Path, remote_subpath: str,
+                                     progress_cb, progress_percent) -> bool:
+        """原来的上传实现，一字未改（只是从 `upload_bag_folder` 里挪出来）。
+
+        单独成方法是为了让"分流"这件事在代码上可见：远端路径的行为与
+        加磁盘导出之前**逐行相同**，回归风险因此只落在磁盘侧那半边。
         """
         self.upload_cancelled = False
         self.last_error = ""
