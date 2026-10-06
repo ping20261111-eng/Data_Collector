@@ -1,0 +1,9 @@
+# 数据采集任务单（由界面「数据录制 → 管理任务」维护，也可以手改）
+# name      : 任务名，会写进 info.json 的 label 字段
+# action_id : 可选，对应 SDK /arm_control/motion 的编号；
+#             采集任务一般留 null（不需要预设位动作编号）
+labels:
+- name: 布草挂架
+  action_id: 1
+- name: 矿泉水瓶分拣
+  action_id: 2

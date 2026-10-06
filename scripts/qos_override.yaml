@@ -1,0 +1,41 @@
+/joint_states:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: volatile
+
+/vision/rgb:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: volatile
+
+/vision/depth:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: volatile
+
+/camera_left/color/image_rect_raw:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: volatile
+
+/camera_left/aligned_depth_to_color/image_raw:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: volatile
+
+/camera_right/color/image_rect_raw:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: volatile
+
+/camera_right/aligned_depth_to_color/image_raw:
+  history: keep_last
+  depth: 10
+  reliability: reliable
+  durability: volatile

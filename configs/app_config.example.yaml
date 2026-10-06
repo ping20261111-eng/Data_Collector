@@ -1,22 +1,151 @@
 workspace_root: ~/test_ws/wheeled_robot_pkg
-run_nodes_script: run_nodes.sh
-run_teleop_script: run_teleop.sh
 teleop_config_path: install/config/teleop_config.yaml
-record_bag_script: scripts/record_bag.sh
-record_cmd_script: scripts/record_cmd.sh
+# 末端参数文件（「末端参数」页面读写的那个）：张开/握紧指令、末端类型都在这里。
+# 机器人侧 arm_control_node **启动时读一次**，所以页面保存后要重启主程序才生效。
+# 留空则取 install/config/arm_control_config.yaml。
+arm_control_config_path: install/config/arm_control_config.yaml
+# 「姿势控制」（v5.6.0）用到的三份预设：
+#   · 前两份是**机器人侧**文件（示教脚本、手柄也读它们）→ 页面只读
+#   · motion_presets_file 是上位机自己维护的自定义预设（「另存当前为预设」写它）
+# 留空则各自取下面的默认值；老配置里没有这三项时用同一个默认值。
+# trunk_motion_file: install/product/config/trunk_motion.json
+# arm_motion_file: install/product/config/arm_motion.json
+# motion_presets_file: configs/motion_presets.yaml
 terminal_command: gnome-terminal
 
+# ---------- 版本下载（可选；version_repo_url 留空则该功能不启用） ----------
+# 远端只读文件服务器的**版本包目录**（nginx 目录列表）。上位机从它拉版本列表、
+# 下载 tar.bz2、解压成工作空间；解压完可直接切换 workspace_root。
+# 注意要指到具体产品目录，指到上层目录会解析不出包列表。
+version_repo_url: ""                     # 例如 http://172.16.10.2:9000/file/wheeled_robot/
+# 下载与解压的落点：归档下到这里，解压成 ${version_download_dir}/<包名>/<工作空间>。
+# 留空则取当前 workspace_root 的父目录。
+version_download_dir: ""
+version_auto_switch: true      # 解压成功后自动把 workspace_root 切到新版本（下载时仍可取消勾选）
+version_keep_archive: true     # 解压成功后保留 tar.bz2（每个约 290MB，按需取舍）
+version_repo_timeout: 20       # 列目录超时(秒)；下载与解压走各自的长超时
+
+# ---------- 界面（可选） ----------
+# ui_theme: light（默认，办公/现场）/ dark（暗光环境）
+ui_theme: light
+# 机型/序列号/末端手型来源（顶栏与手型都用它）。留空则依次找：
+#   ${nerv_dir}/product/Product.json（机器人侧 product.sh 读的同一个文件，权威）
+#   > 项目根/Product.json > ${workspace}/Product.json > ${workspace}/install/config/Product.json
+product_file: ""
+# 版本号来源（顶栏「版本」）。留空则 ${workspace}/doc/version.txt，再回退 ${workspace}/VERSION
+version_file: ""
+# 录制动作标签的存储文件（由界面「数据录制 → 管理任务」维护，可手改）
+# 留空取 configs/action_labels.yaml；首次打开会用 SDK 默认 7 个动作播种
+action_labels_file: ""
+# 打点标签的存储文件（打点时可选/可手输的标签，由界面「打点 → 管理标签」维护）
+# 留空取 configs/point_labels.yaml；首次打开用下面 point_labels 那一段播种
+point_labels_file: ""
+
+# ---------- 脚本目录与脚本（必填项写相对 scripts_dir 的裸文件名） ----------
+# scripts_dir 相对项目根目录解析，也可写绝对路径；
+# 单个脚本同样支持绝对路径或项目内相对路径（如 scripts/record_bag.sh）。
+scripts_dir: scripts
+# 主程序脚本以机器人侧为准（workspace_root 根目录下的 run_nodes.sh），
+# 上位机不维护镜像，避免两套脚本参数约定不一致
+run_nodes_script: run_nodes.sh
+run_teleop_script: run_teleop.sh
+# 录制脚本（record_bag/vla/cmd）以机器人侧为准（workspace_root/scripts/ 下），
+# 对数据要求高，用真机脚本录制；动作标签并入 desc 传递
+record_bag_script: record_bag.sh
+record_vla_script: record_vla.sh
+record_cmd_script: record_cmd.sh
+play_bag_script: play_bag.sh
+bag_rate_stat_script: bag_rate_stat.py
+monitor_performance_script: monitor_record_performance.sh
+robot_monitor_script: robot_monitor.py   # 机器人状态监控（订阅电量/急停/定位/地图）
+
 # ---------- 运行路径（可选，留空则使用下列默认值） ----------
-bag_dir: /var/nerv/bag          # 录制数据存放目录
-log_dir: /var/nerv/log          # 各节点日志目录（抓取日志的源目录）
+nerv_dir: /var/nerv              # 数据根目录（脚本按 NERV_DIR 读取）
+bag_dir: /var/nerv/bag           # 录制数据存放目录（留空则取 ${nerv_dir}/bag）
+log_dir: /var/nerv/log           # 各节点日志目录（留空则取 ${nerv_dir}/log；抓取日志的源目录）
+
+# ---------- 三相机标定与戳点（可选；节点由机器人侧提供） ----------
+# 上位机只负责"拉起节点"和"下发一条采集指令"，采集流程与按键交互全在节点里。
+vision_calib_dir: ""                      # 标定结果目录，留空取 ${nerv_dir}/vision/calib
+camera_calib_package: calibration         # 标定节点包名
+camera_calib_node: calibration_node       # 标定节点名（注意：teleop 包里也有同名节点，
+                                          #   那个是遥操作的 VR tracker 标定，别混）
+camera_calib_service: /calibration/start_srv
+camera_calib_timeout: 600                 # 下发采集指令后最长等待秒数（走后台线程，不卡界面）
+pokepoint_package: pokepoint
+pokepoint_node: pokepoint_node
+video_streamer_package: teleop_video_streamer
+video_streamer_node: teleop_video_streamer_node
+start_video_stream: true                  # 拉起标定/戳点时一并启动视频流节点（画面弹窗来源）
+
+# ---------- 机器人状态监控（可选） ----------
+robot_status_file: ""            # 状态 JSON，留空取 ${nerv_dir}/status/robot_status.json
+robot_monitor_ttl: 5             # 状态文件超过该秒数未刷新即视为监控已停
+sdk_service_name: wheel_controller.service   # SDK 系统服务名（默认开机自启）
+hand_rviz_dir: ""                # 手型配置目录，留空取 ${workspace}/install/share/robot_description/rviz
+                                 # 目录名即合法手型（empty/yushu_dex11/hangkai_tg9801/yinshi_rh56d）
 
 # ---------- 数据回传 SFTP（可选，留空则使用下列默认值） ----------
 remote_host: 172.16.10.2
 remote_port: 22
 remote_user: nerv
 remote_base: /NervData/share/logs/遥操作数据
-# 密码留空即使用内置默认值；推荐改用环境变量，避免明文入库：
+# 密码没有内置默认值：必须在这里填，或用环境变量提供。
+# 强烈建议用环境变量，避免明文入库（configs/app_config.yaml 已加入 .gitignore）：
 #   export DATA_COLLECTOR_REMOTE_PASSWORD=xxx
+# 未配置时上传/浏览会在连接前直接报错并给出提示。
 remote_password: ""  #服务器密码
-# sudo 密码同理，可用 DATA_COLLECTOR_SUDO_PASSWORD 覆盖
+# sudo 密码同理，没有内置默认值，未配置时「启动主程序」会跳过 sudo 预授权：
+#   export DATA_COLLECTOR_SUDO_PASSWORD=xxx
 sudo_password: ""  #本机密码
+
+# ---------- 数据采集任务单（可选，仅用于首次播种） ----------
+# 任务清单由界面「数据录制 → 管理任务」维护，存在 configs/action_labels.yaml 里，
+# 新增一个采集任务不需要改这个文件。首次生成（action_labels.yaml 还不存在）时
+# 会用下面这份清单作为初始内容。
+#
+# 写法：
+#   - 只写任务名         → 推荐。采集任务多是自研动作，与 SDK 预设位编号无关
+#   - {name, action_id} → 可选地关联 SDK /arm_control/motion 的编号（一般不需要）
+# 想初始为空就写 []
+record_action_labels:
+  - 布草挂架
+  - 矿泉水瓶分拣
+
+# ---------- 数据上传（可选，留空则使用下列默认值） ----------
+# 大数据量（几十 GB 的 MCAP/Bag）推荐默认值：不压缩 + 边打包边直传。
+# MCAP/视频本身已是压缩格式，再套 DEFLATE 只耗 CPU 不省体积；
+# 而“先打包到本地再上传”需要等量临时空间，是过去“压缩失败”的主要原因。
+upload_mode: auto          # auto=优先流式直传，不受支持时回退本地打包 | stream | tempfile
+upload_format: zip         # zip=保留下游解包习惯 | tar=超大/超多文件更省心
+upload_compression: store  # store=不压缩(最快) | deflate=压缩(仅对文本类数据有意义)
+upload_temp_dir: ""        # tempfile 模式的打包目录，留空用系统临时目录（大数据建议指向数据盘）
+upload_temp_margin_mb: 200 # tempfile 模式的额外空间余量(MB)，临时目录很小(tmpfs)时调小
+upload_retries: 1          # 上传失败自动重试次数（用户主动取消不重试）
+upload_resume: true        # 断点续传：重试时从远端已有字节继续，不必从头重传
+                           # 只对"本地打包后上传"路径生效 —— 流式直传没有本地副本，
+                           # 谈不上偏移续传。auto 模式下首次尝试走流式，所以想让续传
+                           # 真正生效，把它设为 upload_retries: 2（第三次尝试会续传），
+                           # 或直接 upload_mode: tempfile（第二次尝试就能续传）。
+                           # 不可重试的错误（凭据错/空间不足等）会当场停止，不空转。
+upload_space_check: true   # 上传前检查本地/远端可用空间，空间不足直接报错而不是传到一半失败
+
+# ---------- 打点标签（可选，仅用于首次播种） ----------
+# 打点时可选 / 可手输的标签，**按采集任务分组**：录制时选了哪个任务，打点窗口
+# 就显示"通用组 + 该任务那一组"。存在 configs/point_labels.yaml 里，由界面
+# 「打点 → 管理标签」维护；首次生成（文件还不存在）时用下面这份作为初始内容，
+# 手输的新标签会自动沉淀进当前任务那一组。
+#
+# "*" 是通用组的固定键（不属于任何任务、每个任务下都显示）；用 "*" 而不是写
+# "通用"两个字，免得现场真有个采集任务就叫"通用"，两组撞在一起分不开。
+# action_id 是可选编号，写进 points.csv 的「编号」列；编号只要求**组内**唯一
+# ——不同任务各有各的编号体系（都是 1、2、3…），互不影响。
+point_labels:
+  "*":
+    - {name: 开始任务, action_id: 1}
+    - {name: 结束任务, action_id: 2}
+  布草挂架:
+    - {name: 双爪夹住第一个角, action_id: 1}
+    - {name: 第一个角上夹具, action_id: 2}
+    - {name: 双爪夹住第二个角, action_id: 3}
+    - {name: 第二个角上夹具, action_id: 4}

@@ -1,0 +1,37 @@
+# 打点标签（由界面「打点 → 管理标签」维护，也可以手改）
+# 分组：'*' 是通用组（装开始 / 结束这类夹在流程两端的标签），其余键是采集任务名
+# 面板里的顺序 = 通用组首项 → 该任务组的标签 → 通用组其余（末项落在最后）
+# name      : 标签名，会写进 points.csv 的「标签」列
+# action_id : 「组内编号」，只决定本组内的先后（没编号的排在组内最后）；
+#             points.csv 的「标签编号」写的是面板里的流程序号（1..N），不是这个值
+labels:
+  '*':
+  - name: 开始任务
+    action_id: 1
+  - name: 结束任务
+    action_id: 2
+  布草挂架:
+  - name: 双爪夹住第一个角
+    action_id: 1
+  - name: 第一个角上夹具
+    action_id: 2
+  - name: 双爪夹住第二个角
+    action_id: 3
+  - name: 第二个角上夹具
+    action_id: 4
+  - name: '1'
+    action_id: null
+  - name: '2'
+    action_id: null
+  - name: '3'
+    action_id: null
+  - name: '4'
+    action_id: null
+  - name: '5'
+    action_id: null
+  - name: '6'
+    action_id: null
+  - name: '7'
+    action_id: null
+  - name: 夹取失败
+    action_id: null
