@@ -287,13 +287,23 @@ class FakeStreamTransport(FakeTransport):
 
 
 @pytest.fixture
-def uploader(monkeypatch):
-    """DataUploader + 全假 SFTP/exec 通道：_connect_sftp 与 paramiko.Transport 都被替换。"""
+def uploader(monkeypatch, tmp_path):
+    """DataUploader + 全假 SFTP/exec 通道：_connect_sftp 与 paramiko.Transport 都被替换。
+
+    `temp_dir` 用 pytest 的 `tmp_path` 而**不是** `tempfile.mkdtemp`：
+    这个夹具被上百个用例共用，而 mkdtemp 造出来的目录**没人会清理** ——
+    实测一轮测试就在用户目录里堆了 90 个 `dc_uploader_test_*`（17MB）。
+    `tmp_path` 跟着 `conftest` 的 basetemp 轮换，会被一并回收。
+    """
     up = DataUploader()
     up.remote_base = BASE
     up.password = "test-secret"      # 凭据不再内置默认值，测试里显式给出
     up.retry_delay = 0  # 测试里不等待重试间隔
-    up.temp_dir = Path(tempfile.mkdtemp(prefix="dc_uploader_test_"))
+    # `temp_dir` 要**真的存在**：`compress_folder` 往它里面写东西，
+    # 目录不存在就是 FileNotFoundError（实测踩过 —— tmp_path 本身有，
+    # 但 tmp_path/"upload" 这层没人替你建）。`parents=True` 是关键。
+    up.temp_dir = tmp_path / "upload"
+    up.temp_dir.mkdir(parents=True, exist_ok=True)
     fake = FakeSFTP()
     transport = FakeStreamTransport(fake)
     created = {}

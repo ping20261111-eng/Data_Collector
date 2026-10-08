@@ -115,7 +115,19 @@ TYPE_SCALE = {
 SPACING = {"sp1": 4, "sp2": 8, "sp3": 12, "sp4": 16, "sp5": 24, "sp6": 32, "sp7": 48}
 # B 方案是"卡片"语言：圆角明显大于工业风的发丝边框（原 2/4/7）。
 # pill 给徽章与幽灵按钮用，做成全圆角。
-RADIUS = {"r1": 8, "r2": 12, "r3": 16, "pill": 999}
+#
+# `r0` 是**给 15px 级小方块**的（复选框指示器），它**不跟 r1 走**：
+# r1=8 是卡片的圆角，放到 15px 见方的指示器上半径就超过了一半，
+# Qt 会把它直接画成**圆形**（实测）—— 而复选框该是圆角方块、单选才是圆。
+# B 方案把 r1 从 2 放大到 8 时，漏了小控件这一处。
+#
+# ⚠️ `pill` **不能给 999**：Qt 的 QSS 对过大的 `border-radius` **直接忽略**
+#    （不是把它截断到一半），实测同一个 103×31 的控件上
+#    `4/8/15/16px` 都画出圆角，`20px` 及以上**全部退回方角**。
+#    所以 999 等于"没有圆角"—— 全项目所有本该是药丸的地方（幽灵按钮、徽章、
+#    芯片）此前实际都是方角。这是 B 方案引入这个值时留下的问题。
+#    16 是在 31px 高的控件上既生效、又刚好是完美胶囊（= 高度一半）的值。
+RADIUS = {"r0": 4, "r1": 8, "r2": 12, "r3": 16, "pill": 16}
 
 #: 弹出层（菜单 / 下拉列表 / 悬停提示）的**布局尺寸**：全站弹层共用这几个数，只写一次。
 #: 圆角、底色、描边走既有令牌（`r2` / `popup` / `popup_line`），这里只放尺寸。
@@ -850,11 +862,43 @@ QCheckBox:hover { color: ${text}; }
 QCheckBox::indicator {
     width: 15px; height: 15px;
     border: 1px solid ${line_strong};
-    border-radius: ${r1}px;
+    border-radius: ${r0}px;
     background-color: ${surface2};
 }
 QCheckBox::indicator:checked { background-color: ${accent}; border-color: ${accent}; }
 QCheckBox:disabled { color: ${muted2}; }
+
+/* 单选钮：与复选框同尺寸同描边，**只有圆角不同** ——
+   复选框是圆角方块（r0=4）、单选是整圆（pill）。
+   这条规则此前完全缺失，界面上出现过系统默认样式的单选钮（与整套卡片语言不符）。
+   注意：`border-radius` 在浅色主题下只把圆角画成边框线、不裁底色，
+   四角仍会被底色填满 —— 这是 Qt 的既有行为，全项目一致，不是这一处的缺陷。 */
+QRadioButton { color: ${muted}; spacing: 7px; background: transparent; }
+QRadioButton:hover { color: ${text}; }
+QRadioButton::indicator {
+    width: 15px; height: 15px;
+    border: 1px solid ${line_strong};
+    /* 用 r1（8px）而**不是 pill**：指示器只有 15px 见方，
+       pill=16 超过它的一半又被 Qt 忽略了（实测退回方框）——
+       "半径上限"是跟着控件尺寸走的，小控件不能套大控件的值。
+       8px 在这个尺寸上正好是整圆。 */
+    border-radius: ${r1}px;
+    background-color: ${surface2};
+}
+QRadioButton::indicator:checked {
+    /* 选中态用**粗边框成环**，而不是 `background-color: accent` 填满：
+       Qt 的 QSS 只把 `border-radius` 画成边框线、**不裁底色矩形**，
+       所以实心底色会填满四角、把圆画成方块（实测就是这个样子）。
+       靠边框画环则没有这个问题 —— 边框线本身是圆的。
+       中间那点底色用 surface（与卡片同色，不外露）。 */
+    background-color: ${surface};
+    border: 4px solid ${accent};
+}
+QRadioButton:disabled { color: ${muted2}; }
+/* 只读的单选（面板里用它表示"当前项"，真正可点的是整张卡片）：
+   禁用态别画成灰 —— 那看着像"不可选"，而它要表达的是"已选中"。 */
+QRadioButton::indicator:checked:disabled { background-color: ${surface}; border: 4px solid ${accent}; }
+QRadioButton::indicator:disabled { border-color: ${line_strong}; background-color: ${surface2}; }
 
 QGroupBox {
     border: 1px solid ${line};

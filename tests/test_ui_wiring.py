@@ -6110,7 +6110,7 @@ def test_the_mount_config_lives_inside_the_panel_not_the_main_card(status_env):
     而它平时还是默认隐藏的 —— 那行位置要么空着、要么劈开，没有第三种状态。
     """
     win, _cm, _status = status_env
-    panel = win.chip_export_target.menu()
+    panel = win.export_panel
 
     # 控件的父级链上必须有那个面板，而不能是主卡片
     parent = win.disk_mount_row.parentWidget()
@@ -6131,7 +6131,7 @@ def test_clicking_a_target_option_switches_and_closes(status_env):
 
     assert win.cb_export_target.currentData() == "disk"
     assert cm.get_export_settings()["target"] == "disk", "切换目标要写回配置"
-    assert win.chip_export_target.menu().isVisible() is False, "选完应自动收起"
+    assert win.export_panel.isVisible() is False, "选完应自动收起"
 
 
 def test_the_probe_timer_is_started_and_idempotent(status_env):
@@ -6204,3 +6204,64 @@ def test_the_status_glyph_draws_all_three_kinds(qapp):
         ptr.setsize(img.byteCount())     # PyQt5 要显式给长度，否则 voidptr 未知大小
         arr = np.frombuffer(ptr, np.uint8).reshape(img.height(), img.width(), 4)
         assert (arr[:, :, 3] > 30).sum() > 10, f"{kind} 图标几乎没画出来"
+
+
+def test_the_panel_is_a_popup_not_a_menu(status_env):
+    """面板必须是**自管尺寸的 Popup 窗口**，不能是 `QMenu`。
+
+    这条钉的是那次的"花屏"根因。现场看到的是选项文字互相重叠，
+    但问题不在文字而在**布局**：`QMenu` 给 `QWidgetAction` 的高度是**启发式**的
+    （实测容器只拿到 276px，而内容需要 426px），内部布局被压扁 ——
+    后半截控件的 `geometry()` 停在 Qt 的初始默认值 `(0,0,640,480)`
+    （= **从未被排布**），于是全画在同一个位置上。
+
+    为什么断言写成"是不是 Popup"而不是"去量每个子控件的坐标"：
+    量坐标要先让面板排布，而在离屏环境下**让一个顶层窗口排布**（`show()` 或
+    `activate()`）会**偶发段错误**（实测：同样的代码一次绿一次崩，
+    崩点在 pytest 的收尾阶段）。把不稳定的检查留在测试里，等于给全量测试
+    埋了个随机红。所以这里退回**结构断言**：它零运行时风险，
+    且直接钉住根因 —— 只要有人把面板换回 `QMenu`，花屏就会回来。
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtWidgets import QMenu
+
+    from data_collector.ui.panels.export_target import ExportTargetMixin
+
+    win, _cm, _status = status_env
+    panel = win.export_panel
+
+    assert not isinstance(panel, QMenu), (
+        "面板不能是 `QMenu`：它给 `QWidgetAction` 的高度不够，会把内容压扁成花屏。"
+        "要用 `QFrame(parent, Qt.Popup | Qt.FramelessWindowHint)` + `adjustSize()`。"
+    )
+    assert panel.windowFlags() & Qt.Popup, "面板应是 Popup 窗口（点外部自动关闭）"
+    # 尺寸要装得下内容：`sizeHint` 是纯计算，不碰窗口系统。
+    need = panel.layout().sizeHint().height()
+    assert panel.sizeHint().height() >= need, (
+        f"面板给不出内容需要的高度（内容 {need}px，面板 {panel.sizeHint().height()}px）"
+    )
+    # 面板最小宽这个值是按"就绪态那句状态说明不折行"实测定的（见常量注释），
+    # 别为了别的地方好看去调小它。
+    assert panel.minimumWidth() >= ExportTargetMixin.PANEL_MIN_WIDTH, \
+        "面板最小宽被调小了 —— 状态说明会折行"
+
+
+def test_pill_radius_stays_within_what_qt_accepts():
+    """`pill` 令牌**不能给超大的值** —— 过大的 `border-radius` 会被 Qt 直接忽略。
+
+    实测（同一个 103×31 的控件）：
+      `4 / 8 / 15 / 16px` → 画出圆角；
+      `20 / 30 / 50 / 100 / 999px` → **全部退回方角**。
+
+    也就是说 `pill=999` 等于"根本没有圆角"：全项目所有本该是药丸的地方
+    （幽灵按钮、徽章、导出芯片）此前实际都是方角。
+    这条守卫把上限钉住，免得以后有人"为了更圆"再往大改。
+    """
+    from data_collector import theme
+
+    assert theme.RADIUS["pill"] <= 16, (
+        f"pill={theme.RADIUS['pill']} 超过 Qt 能接受的上限（实测 16 可以、20 不行）；"
+        f"给更大值等于**取消圆角**，画出来是方角而不是药丸"
+    )
+    assert theme.RADIUS["r0"] < theme.RADIUS["r1"], \
+        "r0（小方块圆角）必须比 r1（卡片圆角）小，否则 15px 的复选框会被画成圆"

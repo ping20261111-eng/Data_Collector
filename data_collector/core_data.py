@@ -1178,13 +1178,22 @@ class DataUploader:
             stamp = datetime.now()
         return stamp.strftime("%Y-%m-%d")
 
-    def _disk_subpath(self, folder: Path) -> str:
+    def _disk_subpath(self, folder: Optional[Path] = None) -> str:
         """磁盘落点（相对挂载点）：`<序列号>/<YYYY-MM-DD>/`。
 
         每个采集 bag 一个目录的安排保留在 `prepare` 里（`subpath` 再拼 bag 名），
         所以同一天多次采集不会互相覆盖。
+
+        `folder=None` 表示**预览一次还没发生的采集**（界面上的"将保存到"用）：
+        此时日期取**今天**。不能拿某个已有目录的 mtime 顶替 ——
+        `bag_dir` 是上次采集建的，它的 mtime 是**上一次**的时间，
+        拿它算会让预览显示成上次的日期，而本次采集显然在今天。
         """
-        return f"{self._serial_number()}/{self._capture_date(folder)}"
+        if folder is None:
+            date = datetime.now().strftime("%Y-%m-%d")
+        else:
+            date = self._capture_date(folder)
+        return f"{self._serial_number()}/{date}"
 
     def _remote_target(self, archive_name: str, remote_subpath: str = "") -> tuple:
         remote_dir = self.remote_base + (f"/{remote_subpath}" if remote_subpath else "")
