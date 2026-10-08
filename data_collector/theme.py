@@ -207,6 +207,10 @@ QWidget {
 }
 QMainWindow, QDialog { background-color: ${bg}; }
 QLabel { background: transparent; }
+/* 主界面里"按需展开的一行"（如导出目标的挂载点行）：它是个裸 QWidget，
+   会被上面的全局 `QWidget` 规则涂上 `${bg}` —— 而它坐在**白色卡片**里，
+   于是显示成一条与卡片不同色的灰带。装饰性容器一律透明，由父卡片提供底色。 */
+QWidget#InlineRow { background: transparent; }
 QToolTip {
     background-color: ${popup}; color: ${text};
     border: 1px solid ${popup_line}; padding: 6px 10px;

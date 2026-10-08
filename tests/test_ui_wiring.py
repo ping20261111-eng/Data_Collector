@@ -604,6 +604,85 @@ def test_release_emergency_stop_asks_for_confirmation(ui_env, monkeypatch):
     assert calls == [False]
 
 
+# ---------- 导出目标选择（主界面「数据」行尾） ----------
+
+def test_export_target_defaults_to_server_and_hides_the_mount_row(status_env):
+    """没配过的机器：下拉停在「服务器」、挂载点行**不占地方**。
+
+    这一条是"零行为变更"在界面上的样子：现场现有部署打开看到的
+    与加这个控件之前应当没有区别（除行尾多一个下拉）。
+    """
+    win, _cm, _status = status_env
+
+    assert win.cb_export_target.currentData() == "server"
+    assert win.disk_mount_row.isVisibleTo(win) is False
+    assert [win.cb_export_target.itemText(i)
+            for i in range(win.cb_export_target.count())] == [
+        "送到：服务器", "送到：移动硬盘", "送到：服务器 + 移动硬盘"]
+
+
+def test_choosing_the_disk_reveals_the_mount_row_and_saves_it(status_env):
+    """选「移动硬盘」→ 挂载点行出现，**并且立刻写回配置**。
+
+    为什么切换就写：这个设置决定"数据送到哪儿"，只留在内存里的话，
+    现场下次开程序会退回服务器 —— 而那时没人会记得自己改过。
+    """
+    win, cm, _status = status_env
+
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+
+    assert win.disk_mount_row.isVisibleTo(win) is True
+    assert cm.get_export_settings()["target"] == "disk"
+    # 没填路径时给一句"该做什么"，而不是空白
+    assert "挂载点" in win.lb_disk_state.text()
+
+
+def test_an_unmounted_path_is_flagged_right_away(status_env):
+    """路径不对时**当场**出红字 —— 不等用户点上传才发现。
+
+    现场最贵的事故是"以为导成功了、其实数据落在本机磁盘上"：
+    路径写错时若那个目录恰好存在，界面会显示成功。
+    """
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+
+    win.ed_disk_mount.setText(str(Path("/definitely/not/here")))
+    win.on_disk_mount_edited()
+
+    assert "不存在" in win.lb_disk_state.text()
+    assert win.btn_disk_recheck.isVisibleTo(win) is True, "要能重新检测（盘可能是后来插上的）"
+
+
+def test_going_back_to_server_hides_the_row_but_keeps_the_path(status_env):
+    """切回服务器：行收起来，但**已填的挂载点要留着** —— 下次切回来不用重填。"""
+    win, cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.ed_disk_mount.setText("/media/x")
+    win.on_disk_mount_edited()
+
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
+
+    assert win.disk_mount_row.isVisibleTo(win) is False
+    assert cm.get_export_settings()["target"] == "server"
+    assert cm.get_export_settings()["mount_point"] == "/media/x"
+    assert win.ed_disk_mount.text() == "/media/x"
+
+
+def test_export_target_widgets_follow_the_config_on_reopen(status_env):
+    """配置里已经在用硬盘时，打开界面就该看到它 —— 不必等用户去切。
+
+    以及 `load` 回填**不许触发保存**（回填不是用户改的，那会多写一次文件）。
+    """
+    win, cm, _status = status_env
+    cm.save_export_settings("disk", "/media/robot/NERV")
+
+    win._sync_export_target_widgets(probe=False)
+
+    assert win.cb_export_target.currentData() == "disk"
+    assert win.ed_disk_mount.text() == "/media/robot/NERV"
+    assert win.disk_mount_row.isVisibleTo(win) is True
+
+
 def test_status_labels_show_emergency_and_power(status_env):
     win, _cm, status_file = status_env
     _write_status(status_file, {

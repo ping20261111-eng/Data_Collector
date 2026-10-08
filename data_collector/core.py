@@ -9,6 +9,7 @@ import logging
 import unicodedata
 import yaml
 import shutil
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple, Any, Dict
 
@@ -64,6 +65,195 @@ def load_yaml(path: Path) -> dict:
 def save_yaml(path: Path, data: dict) -> None:
     with open(path, 'w', encoding='utf-8') as f:
         yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+
+# ============ app_config.yaml 的按行改写 ============
+# 界面改「导出目标」时要写回 `app_config.yaml`，而那份文件**满是说明性注释**
+# （每一行都要告诉现场"这个键是干什么的"）。整份 `yaml.dump` 会把注释全丢掉 ——
+# 那是现场唯一的键说明，丢了就再也找不回来。
+#
+# 所以按行改：只替换目标行 `:` 之后、`#` 之前的那一段，其余逐字保留。
+# 与 `core_operations.patch_arm_control_text`（改机器人侧 arm_control_config.yaml）
+# 是同一套做法，那边踩过的坑这里同样成立：
+# **找不到键就必须如实报出来，不能写盘** —— 写了一半的配置比不写更糟。
+
+#: `export_target` 不存在时补的那一行（连同它上面那句说明）。
+EXPORT_TARGET_HINT = """\
+# 导出目标：数据往哪儿送。server=只送远端服务器（缺省）| disk=只写移动硬盘 | both=两边都写
+export_target: {target}
+"""
+
+#: `disk_export` 段不存在时补的整段（含注释），与 `configs/app_config.example.yaml`
+#: 保持一致 —— 两处文案不同的话，现场拿到手会以为是两个不同的键。
+#:
+#: **这一段刻意不含 `export_target`**：那个键一律由上面那一行负责。
+#: 让一个"追加整段"的块里也带一个顶层键，就得额外判"文件里是不是已经有一行了"——
+#: 判错的后果是**两个同名顶层键**，YAML 取后一个、静默覆盖（第一版就是这么错的）。
+#: 拆开之后这个类错误从结构上不可能发生。
+DISK_EXPORT_BLOCK = """\
+
+# 这一段只有真正要写硬盘时才需要配。不配它就不会校验盘标识 ——
+# 避免在纯服务器模式下自检报一个与本次操作无关的"盘不对"。
+disk_export:
+  mount_point: {mount_point}         # 移动硬盘挂载点，如 /media/robot/NERV 或 /mnt/nerv_data
+  volume_id_file: .nerv_volume       # 盘内标识文件，用于防"插错盘"
+                                     # 配了本段就默认要求它存在（可显式写 false 关闭）
+  min_free_margin_mb: 2048           # 导出前的可用空间余量，不足时提前报错
+  warn_file_bytes: 3800000000        # 超过这个大小的文件会提醒（FAT32 单文件上限约 4GB）
+                                     # 只提醒不拦截；目标盘为 exFAT/NTFS 时自动跳过
+"""
+
+
+#: 写回时**不加引号**的标量白名单。
+#: 用白名单而不是"看字符像不像路径"：后者会漏 —— `str.isalnum()` 对中文返回 True，
+#: 于是 `/media/机器人盘` 被当成"安全值"不加引号（实测踩到）；
+#: 而路径里若含 `#`，不加引号会被 YAML 当成注释起点，值被截断。
+_UNQUOTED_SCALARS = frozenset({
+    "server", "disk", "both", "true", "false", "null", "none",
+    "auto", "stream", "tempfile", "zip", "tar", "store", "deflate",
+})
+
+
+def _quote_scalar(value: str) -> str:
+    """YAML 标量：枚举值照原样，**其余一律加双引号**。
+
+    与配置文件里的既有写法保持一致（`export_target: server` 不带引号、
+    `mount_point: ""` 带引号），否则现场会看到"同一个键两种写法"。
+    """
+    value = str(value)
+    if value in _UNQUOTED_SCALARS:
+        return value
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _replace_scalar_keep_comment(line: str, new_value: str) -> str:
+    """替换一行里 `:` 之后、`#` 之前的值，**行内注释与缩进逐字保留**。
+
+    `#` 的判断要避开值内部的井号：YAML 里 `#` 只有在**前面有空白**时才是注释
+    （`a: "x#y"` 的井号不是注释）。这里按"前面是空白且不在引号内"来找。
+
+    **注释与值之间那个空格必须补回来**：`cut` 指向 `#`，而 `#` 前的空格属于
+    "值那一侧"、会被丢掉，直接拼就成了 `export_target: both# 说明` ——
+    那个 `#` 前没有空白，YAML **不认它是注释**，于是整段 `# 说明` 成了值的一部分
+    （实测：解析出来是 `'both# server=只送远端 | disk=只写移动硬盘'`）。
+
+    **行尾的换行符也要单独摘出来保住**：没有 `#` 时 `cut` 落在行尾，
+    若把换行也算进"要丢掉的部分"，这一行就会与下一行**粘成一行** ——
+    于是下一行那句注释成了本行的值（实测：`export_target: server# 这一段只有…`）。
+    """
+    newline = ""
+    if line.endswith("\n"):
+        line, newline = line[:-1], "\n"
+    colon = line.find(":")
+    if colon < 0:
+        return line + newline
+    head = line[:colon + 1]                       # 含缩进与 `键:`
+    rest = line[colon + 1:]
+    in_quote = None
+    cut = len(rest)
+    for i, ch in enumerate(rest):
+        if in_quote:
+            if ch == in_quote:
+                in_quote = None
+            continue
+        if ch in "\"'":
+            in_quote = ch
+            continue
+        if ch == "#" and i > 0 and rest[i - 1] in " \t":
+            cut = i
+            break
+    tail = rest[cut:]                             # 含注释
+    if tail and not tail.startswith((" ", "\t")):
+        tail = " " + tail                         # 补回被丢弃的那个空格
+    # 值前后各留一个空格，与配置文件里 `key: value` 的写法一致
+    return f"{head} {new_value}{tail}{newline}"
+
+
+def _find_key_line(lines, key: str, indent: str = "") -> int:
+    """找 `键:` 所在行号；找不到返回 -1。
+
+    只在**顶层**（indent=""）或指定缩进层里找 —— 否则 `mount_point` 会匹配到
+    别的段里同名的键（这份配置里有 60 多个顶层键，重名不是假想）。
+    """
+    prefix = f"{indent}{key}:"
+    for i, line in enumerate(lines):
+        if line.startswith(prefix):
+            return i
+    return -1
+
+
+def patch_export_settings_text(text: str, target: str,
+                               mount_point: Optional[str] = None) -> dict:
+    """按行改 `app_config.yaml` 里的导出目标；键不存在时**追加整段**。
+
+    为什么必须支持"追加"：现场在用的 `app_config.yaml` 大多**早于**这两个键
+    （实测本机这份就完全没有 `export_target` 与 `disk_export` 段）。
+    只做替换的话，界面写回会静默什么都没改 —— 用户以为存进去了。
+
+    Args:
+        text: 原文件全文。
+        target: `server` / `disk` / `both`。
+        mount_point: 挂载点；`None` 表示**不动它**（只改导出目标时用）。
+
+    Returns:
+        dict: ``{"text": 新全文, "applied": [...], "appended": [...]}``。
+        调用方必须检查两个列表是否覆盖了预期的键，不覆盖就不能写盘。
+    """
+    lines = text.splitlines(keepends=True)
+    applied: List[str] = []
+    appended: List[str] = []
+
+    idx = _find_key_line(lines, "export_target")
+    if idx >= 0:
+        lines[idx] = _replace_scalar_keep_comment(lines[idx], _quote_scalar(target))
+        applied.append("export_target")
+    else:
+        appended.append("export_target")
+
+    mount_idx = -1
+    if mount_point is not None:
+        disk_idx = _find_key_line(lines, "disk_export")
+        if disk_idx >= 0:
+            # 只在这个段**之内**找 mount_point（下一个顶层键之前）
+            mount_idx = -1
+            for i in range(disk_idx + 1, len(lines)):
+                line = lines[i]
+                if line.strip() and not line[0].isspace():
+                    break              # 到下一个顶层键了
+                if line.startswith("  mount_point:"):
+                    mount_idx = i
+                    break
+            if mount_idx >= 0:
+                lines[mount_idx] = _replace_scalar_keep_comment(
+                    lines[mount_idx], _quote_scalar(mount_point))
+                applied.append("disk_export.mount_point")
+            else:
+                appended.append("disk_export.mount_point")
+        else:
+            appended.append("disk_export.mount_point")
+
+    if appended:
+        # 追加缺失的键。两种情形**分开处理**，不混在一个分支里：
+        #   ① `export_target` 缺 → 末尾单独补一行
+        #   ② `disk_export` 段（或段内 `mount_point`）缺 → 末尾补整段
+        # 两个都缺是现场最常见的（老配置）；只缺后者也发生过（段被手工删过）。
+        if lines and not lines[-1].endswith("\n"):
+            lines.append("\n")
+
+        if "export_target" in appended:
+            lines.append("\n")
+            lines.extend(EXPORT_TARGET_HINT.format(target=_quote_scalar(target)).splitlines(keepends=True))
+            applied.append("export_target")
+
+        if "disk_export.mount_point" in appended:
+            lines.extend(DISK_EXPORT_BLOCK.format(
+                mount_point=_quote_scalar(mount_point or "")).splitlines(keepends=True))
+            applied.append("disk_export.mount_point")
+
+        appended = []
+
+    return {"text": "".join(lines), "applied": applied, "appended": appended}
 
 
 # ============ 遥操作用户名 ============
@@ -1533,6 +1723,105 @@ class ConfigManager:
             "min_free_margin_mb": int(disk.get("min_free_margin_mb") or 2048),
             "warn_file_bytes": int(disk.get("warn_file_bytes") or 3_800_000_000),
         }
+
+    def save_export_settings(self, target: str, mount_point: Optional[str] = None,
+                             backup_dir: Optional[Path] = None) -> dict:
+        """把导出目标写回 `app_config.yaml`：**备份 → 按行改 → 回读校验**。
+
+        三步都必要（与 `core_operations.save_end_effector_config` 同一套理由）：
+
+        1. **备份**：现场那份配置是手工维护的，改错了要能一键找回。
+           备份失败**不拦写入**，但如实报出来 —— 否则现场会以为有备份。
+        2. **按行改**（`patch_export_settings_text`）：只动目标行，注释逐字保留。
+           那份文件的注释是现场唯一的键说明，整份 `yaml.dump` 会把它们全丢掉。
+        3. **回读校验**：写文件没有退出码可看，**唯一可信的判据是重新解析后值相等**。
+
+        Args:
+            target: `server` / `disk` / `both`；非法值直接拒绝（不写盘）。
+            mount_point: 挂载点；`None` 表示不动它。
+            backup_dir: 备份目录；不传用 `<本地上位机日志>/config_backup`。
+
+        Returns:
+            dict: ``{"ok": bool, "lines": [...], "errors": [...], "backup": Path|None}``。
+            `ok=False` 时**没有写盘**（或写了但回读不符，此时 lines 会点明哪个值）。
+        """
+        lines: List[str] = []
+        errors: List[str] = []
+        backup_path: Optional[Path] = None
+
+        if target not in self.EXPORT_TARGETS:
+            errors.append(f"导出目标取值非法：{target}（只能是 {'/'.join(self.EXPORT_TARGETS)}）")
+            return {"ok": False, "lines": lines, "errors": errors, "backup": None}
+
+        try:
+            original = self.config_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            errors.append(f"读取配置文件失败：{self.config_path}（{exc}）")
+            return {"ok": False, "lines": lines, "errors": errors, "backup": None}
+
+        # ---------- ① 备份 ----------
+        try:
+            folder = backup_dir or (self.get_local_log_dir() / "config_backup")
+            folder.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_path = folder / f"app_config_{stamp}.yaml"
+            backup_path.write_text(original, encoding="utf-8")
+            lines.append(f"已备份原配置：{backup_path}")
+        except OSError as exc:
+            backup_path = None
+            lines.append(f"备份失败（不拦写入，请自行留意）：{exc}")
+
+        # ---------- ② 按行改 ----------
+        patched = patch_export_settings_text(original, target, mount_point)
+        if not patched["applied"]:
+            errors.append("没有找到可改的键，已放弃写入（配置结构与预期不符）")
+            return {"ok": False, "lines": lines, "errors": errors, "backup": backup_path}
+        for key in patched["applied"]:
+            lines.append(f"已写入 {key}")
+        new_text = patched["text"]
+
+        # 语法自检：写进坏掉的 YAML 会让**整个界面打不开**，比不改严重得多
+        try:
+            parsed = yaml.safe_load(new_text)
+            if not isinstance(parsed, dict):
+                raise ValueError("解析结果不是映射")
+        except Exception as exc:
+            errors.append(f"改后的内容不是合法 YAML，已放弃写入：{exc}")
+            return {"ok": False, "lines": lines, "errors": errors, "backup": backup_path}
+
+        # ---------- ③ 回读校验 ----------
+        try:
+            self.config_path.write_text(new_text, encoding="utf-8")
+        except OSError as exc:
+            errors.append(f"写入配置失败：{self.config_path}（{exc}）")
+            return {"ok": False, "lines": lines, "errors": errors, "backup": backup_path}
+
+        try:
+            check = load_yaml(self.config_path)
+        except Exception as exc:
+            errors.append(f"回读配置失败：{exc}")
+            return {"ok": False, "lines": lines, "errors": errors, "backup": backup_path}
+
+        problems = []
+        if check.get("export_target") != target:
+            problems.append(f"export_target 期望 {target}，实际 {check.get('export_target')}")
+        if mount_point is not None:
+            actual = (check.get("disk_export") or {}).get("mount_point")
+            if actual != mount_point:
+                problems.append(f"mount_point 期望 {mount_point}，实际 {actual}")
+        if problems:
+            errors.append("回读校验不通过：" + "；".join(problems))
+            return {"ok": False, "lines": lines, "errors": errors, "backup": backup_path}
+
+        # 热更新内存里的配置：否则界面显示的还是旧值，直到重启
+        self.app_config["export_target"] = target
+        if mount_point is not None:
+            self.app_config.setdefault("disk_export", {})
+            if isinstance(self.app_config["disk_export"], dict):
+                self.app_config["disk_export"]["mount_point"] = mount_point
+
+        lines.append("回读校验通过")
+        return {"ok": True, "lines": lines, "errors": errors, "backup": backup_path}
 
     def check_workspace(self) -> bool:
         return self.workspace.exists()
