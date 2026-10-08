@@ -30,6 +30,15 @@ def qapp():
     yield app
 
 
+# v6.4.4 的挂载点配置搬进了**芯片展开的面板**（不再是主窗口的一行），
+# 所以这一带用例断言的可见性一律用 **`isHidden()`**（显隐标记本身）。
+# `isVisible()` 与 `isVisibleTo(任意父级)` 都不能用：面板收着的时候，
+# 里面所有控件对谁都"不可见"，两者恒为 False —— 那不是"控件坏了"，
+# 是"面板还没展开"。实测（面板收着时）：
+#   disk_mount_row.isHidden() = False（没被隐藏）   isVisible() = False
+#   btn_disk_recheck.isHidden() = True（被显式隐藏）isVisible() = False
+
+
 def _app_config(tmp_path, **overrides):
     """界面的完整脚本配置；overrides 用于覆盖单个键（如 nerv_dir）。
 
@@ -615,7 +624,7 @@ def test_export_target_defaults_to_server_and_hides_the_mount_row(status_env):
     win, _cm, _status = status_env
 
     assert win.cb_export_target.currentData() == "server"
-    assert win.disk_mount_row.isVisibleTo(win) is False
+    assert win.disk_mount_row.isHidden() is True
     assert [win.cb_export_target.itemText(i)
             for i in range(win.cb_export_target.count())] == [
         "送到：服务器", "送到：移动硬盘", "送到：服务器 + 移动硬盘"]
@@ -631,7 +640,7 @@ def test_choosing_the_disk_reveals_the_mount_row_and_saves_it(status_env):
 
     win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
 
-    assert win.disk_mount_row.isVisibleTo(win) is True
+    assert win.disk_mount_row.isHidden() is False
     assert cm.get_export_settings()["target"] == "disk"
     # 没填路径时给一句"该做什么"，而不是空白
     assert "挂载点" in win.lb_disk_state.text()
@@ -650,7 +659,7 @@ def test_an_unmounted_path_is_flagged_right_away(status_env):
     win.on_disk_mount_edited()
 
     assert "不存在" in win.lb_disk_state.text()
-    assert win.btn_disk_recheck.isVisibleTo(win) is True, "要能重新检测（盘可能是后来插上的）"
+    assert win.btn_disk_recheck.isHidden() is False, "要能重新检测（盘可能是后来插上的）"
 
 
 def test_missing_volume_marker_offers_a_one_click_fix(status_env, monkeypatch, tmp_path):
@@ -673,7 +682,7 @@ def test_missing_volume_marker_offers_a_one_click_fix(status_env, monkeypatch, t
     win.on_disk_mount_edited()
 
     assert "标识文件" in win.lb_disk_state.text()
-    assert win.btn_disk_mark.isVisibleTo(win) is True, "缺标识时要给出路"
+    assert win.btn_disk_mark.isHidden() is False, "缺标识时要给出路"
 
 
 def test_creating_the_marker_flips_the_state_to_ready(status_env, monkeypatch, tmp_path):
@@ -698,7 +707,7 @@ def test_creating_the_marker_flips_the_state_to_ready(status_env, monkeypatch, t
     assert (mount / ".nerv_volume").exists(), "标识文件没建出来"
     assert "盘已就绪" in win.lb_disk_state.text(), \
         f"建完没有当场变绿：{win.lb_disk_state.text()}"
-    assert win.btn_disk_mark.isVisibleTo(win) is False, "就绪后不该还摆着出路按钮"
+    assert win.btn_disk_mark.isHidden() is True, "就绪后不该还摆着出路按钮"
 
 
 def test_creating_the_marker_is_refused_on_an_unmounted_path(status_env, monkeypatch, tmp_path):
@@ -722,7 +731,7 @@ def test_creating_the_marker_is_refused_on_an_unmounted_path(status_env, monkeyp
                         lambda self: "ext4")
     win.ed_disk_mount.setText(str(plain))
     win.on_disk_mount_edited()
-    assert win.btn_disk_mark.isVisibleTo(win) is True, "前置不成立：按钮没出现"
+    assert win.btn_disk_mark.isHidden() is False, "前置不成立：按钮没出现"
 
     # 恢复真实的挂载点判断：tmp_path 下的普通目录不是挂载点
     monkeypatch.undo()      # ← 关键：撤掉上面那两个"假装就绪"的 patch
@@ -752,7 +761,7 @@ def test_the_fix_button_disappears_when_the_path_is_emptied(status_env):
     win.ed_disk_mount.setText("")
     win.on_disk_mount_edited()
 
-    assert win.btn_disk_mark.isVisibleTo(win) is False
+    assert win.btn_disk_mark.isHidden() is True
 
 
 def test_going_back_to_server_hides_the_row_but_keeps_the_path(status_env):
@@ -764,7 +773,7 @@ def test_going_back_to_server_hides_the_row_but_keeps_the_path(status_env):
 
     win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
 
-    assert win.disk_mount_row.isVisibleTo(win) is False
+    assert win.disk_mount_row.isHidden() is True
     assert cm.get_export_settings()["target"] == "server"
     assert cm.get_export_settings()["mount_point"] == "/media/x"
     assert win.ed_disk_mount.text() == "/media/x"
@@ -782,7 +791,7 @@ def test_export_target_widgets_follow_the_config_on_reopen(status_env):
 
     assert win.cb_export_target.currentData() == "disk"
     assert win.ed_disk_mount.text() == "/media/robot/NERV"
-    assert win.disk_mount_row.isVisibleTo(win) is True
+    assert win.disk_mount_row.isHidden() is False
 
 
 def test_status_labels_show_emergency_and_power(status_env):
@@ -5995,3 +6004,203 @@ def test_browsing_the_remote_dir_still_asks_for_the_password(
         dlg.deleteLater()
 
     assert asked["n"] == 1, "浏览远端目录必须问密码"
+
+
+# ---------- 导出目标芯片（v6.4.4） ----------
+
+def test_the_chip_is_narrower_than_the_combo_it_replaced(status_env):
+    """芯片必须比原来那个下拉**窄**—— 这是这一版的核心诉求（不抢按钮行重心）。
+
+    实测下拉是 210px。芯片按内容自适应：「服务器」约 94、「移动硬盘 + 可用空间」
+    约 171。取宽的一态比，确保它在最坏情况下也不比下拉宽。
+    """
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.on_disk_mount_edited()
+
+    assert win.chip_export_target.width() < 210, \
+        f"芯片比原来的下拉还宽：{win.chip_export_target.width()}px"
+
+
+def test_the_chip_fits_its_own_text(status_env, monkeypatch, tmp_path):
+    """芯片宽度要装得下自己的三段内容 —— **截断比空一块更难懂**。
+
+    实测踩过：`CHIP_WIDTH` 拍成常数、容器又没减padding，
+    「移动硬盘」被截成「移动硬:」、「635GB 可用」被截成「635GB」。
+    所以这里逐段量需求宽度，和按钮实际宽度比。
+    """
+    import data_collector.disk_export as de
+    win, _cm, _status = status_env
+    monkeypatch.setattr(de.DiskExportTarget, "is_mounted", lambda self: True)
+    monkeypatch.setattr(de.DiskExportTarget, "filesystem_type", lambda self: "exfat")
+
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    (mount / ".nerv_volume").touch()          # 就绪态：最宽的一态
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.ed_disk_mount.setText(str(mount))
+    win.on_disk_mount_edited()
+
+    need = (win.chip_glyph.width()
+            + win.lb_chip_title.sizeHint().width()
+            + win.lb_chip_caption.sizeHint().width() + 12)
+    assert win.chip_export_target.width() >= need, \
+        (f"芯片 {win.chip_export_target.width()}px 装不下内容 {need}px"
+         f"（标题「{win.lb_chip_title.text()}」"
+         f"次要「{win.lb_chip_caption.text()}」）")
+
+
+def test_the_chip_shows_the_disk_state_without_being_opened(status_env, monkeypatch, tmp_path):
+    """**默认态就能看见盘的状态** —— 这是这一版最要紧的一条。
+
+    原来的实现只在展开面板那一刻探一次，默认态与异常态长得一模一样，
+    而「以为导成功了、其实没上盘」正是从这个缝里钻出来的。
+    """
+    import data_collector.disk_export as de
+    win, _cm, _status = status_env
+    monkeypatch.setattr(de.DiskExportTarget, "is_mounted", lambda self: True)
+    monkeypatch.setattr(de.DiskExportTarget, "filesystem_type", lambda self: "exfat")
+
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    (mount / ".nerv_volume").touch()
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.ed_disk_mount.setText(str(mount))
+    win.on_disk_mount_edited()
+
+    assert win.chip_export_target.property("state") == "ok", \
+        f"就绪时芯片应是ok 态，实际 {win.chip_export_target.property('state')}"
+    assert "可用" in win.lb_chip_caption.text(), \
+        f"可用空间要常显（设计稿定的是常显），实际「{win.lb_chip_caption.text()}」"
+
+
+def test_a_missing_disk_shows_warn_on_the_chip(status_env):
+    """盘没插好时芯片是 warn 态，且写明「未插好」—— 不是打不开就完事。"""
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.ed_disk_mount.setText("/definitely/not/here")
+    win.on_disk_mount_edited()
+
+    assert win.chip_export_target.property("state") == "warn", \
+        f"路径不存在时芯片应是 warn，实际 {win.chip_export_target.property('state')}"
+    assert win.lb_chip_caption.text() == "未插好"
+
+
+def test_the_server_target_never_shows_a_disk_warning(status_env):
+    """选了服务器就别报「未插好」—— 那个提醒跟这个目标无关。
+
+    没有盘的概念，却显示一颗警告图标，会让人以为数据发不出去了。
+    """
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.ed_disk_mount.setText("/definitely/not/here")
+    win.on_disk_mount_edited()
+
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
+
+    assert win.chip_glyph._kind == "none", \
+        f"服务器态不该显示警告图标，实际 {win.chip_glyph._kind}"
+    assert win.lb_chip_caption.text() == "", "服务器态不该有可用空间文案"
+
+
+def test_the_mount_config_lives_inside_the_panel_not_the_main_card(status_env):
+    """挂载点配置**只在面板里**，主卡片不再多占一行。
+
+    原来那行挂在「数据」按钮行下面，把同一个组从中间劈开（看着像两件事），
+    而它平时还是默认隐藏的 —— 那行位置要么空着、要么劈开，没有第三种状态。
+    """
+    win, _cm, _status = status_env
+    panel = win.chip_export_target.menu()
+
+    # 控件的父级链上必须有那个面板，而不能是主卡片
+    parent = win.disk_mount_row.parentWidget()
+    assert parent is not None, "挂载点块应当有父级"
+    assert win.disk_mount_row.isAncestorOf(panel) or panel.isAncestorOf(win.disk_mount_row), \
+        "挂载点块应该住在芯片面板里，而不是主卡片上"
+
+
+def test_clicking_a_target_option_switches_and_closes(status_env):
+    """点面板里的卡片 = 切换目标 + 面板自动收起。
+
+    现场是「设置好 → 立刻开始录」，面板留着挡视线。
+    """
+    win, cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
+
+    win.on_target_option_clicked("disk")
+
+    assert win.cb_export_target.currentData() == "disk"
+    assert cm.get_export_settings()["target"] == "disk", "切换目标要写回配置"
+    assert win.chip_export_target.menu().isVisible() is False, "选完应自动收起"
+
+
+def test_the_probe_timer_is_started_and_idempotent(status_env):
+    """定时探测必须起，且**重复起不会变成两个**。
+
+    芯片在默认态显示状态，而现场是"插上/拔掉"这种物理动作 ——
+    没有定时器，芯片会一直显示第一次探出来的结果。
+    """
+    win, _cm, _status = status_env
+    timer = getattr(win, "_disk_timer", None)
+
+    assert timer is not None, "应有一个低频探测定时器"
+    assert timer.isActive(), "定时器应在跑"
+    first = timer
+
+    win._start_disk_probe_timer()             # 幂等：再调一次
+
+    assert win._disk_timer is first, "重复启动会另起一个定时器（会双倍刷日志）"
+
+
+def test_the_probe_stays_quiet_while_the_state_is_unchanged(status_env, monkeypatch, tmp_path):
+    """状态**没变就不记日志** —— 每 3s 记一条会把真故障淹掉。"""
+    import data_collector.disk_export as de
+    win, _cm, _status = status_env
+    monkeypatch.setattr(de.DiskExportTarget, "is_mounted", lambda self: True)
+    monkeypatch.setattr(de.DiskExportTarget, "filesystem_type", lambda self: "exfat")
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    (mount / ".nerv_volume").touch()
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.ed_disk_mount.setText(str(mount))
+    win.on_disk_mount_edited()
+
+    lines_before = len(win.log.toPlainText())
+    for _ in range(3):
+        win._tick_disk_probe()
+    lines_after = len(win.log.toPlainText())
+
+    assert lines_after == lines_before, \
+        f"状态没变却记了 {lines_after - lines_before} 条日志：{win.log.toPlainText()[-200:]}"
+
+
+def test_the_status_glyph_draws_all_three_kinds(qapp):
+    """三个图标都要真能画出来 —— 画不出时报错日志里只有一句"绘制失败"。
+
+    踩过的坑：`QPoint` 只接受 int，传 `6.5` 会抛 TypeError，
+    而抛异常的后果不是少画一根线 —— 是整个 paintEvent 中断，
+    三种图标**一块都画不出来**。
+    """
+    import numpy as np
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QPixmap
+
+    from data_collector.ui.widgets import StatusGlyph
+
+    # 用 `render()` 画到 QPixmap 上，**不调 show()**。
+    # 踩过的坑：`show()` 一个没有父窗口的顶层控件，在离屏环境里、且跑在
+    # 其他界面用例之后，会段错误（实测崩在 show()+processEvents 那一行，
+    # 而崩溃点离病因很远，只看栈顶会以为是别处坏了）。`render()` 走的是
+    # 同一条 paintEvent，只是不经过窗口系统，行为确定得多。
+    for kind in ("none", "ok", "warn", "danger"):
+        glyph = StatusGlyph(kind)
+        glyph.set_mode("light")
+        glyph.resize(13, 13)
+        pixmap = QPixmap(glyph.size())
+        pixmap.fill(Qt.transparent)
+        glyph.render(pixmap)
+        img = pixmap.toImage()
+        ptr = img.bits()
+        ptr.setsize(img.byteCount())     # PyQt5 要显式给长度，否则 voidptr 未知大小
+        arr = np.frombuffer(ptr, np.uint8).reshape(img.height(), img.width(), 4)
+        assert (arr[:, :, 3] > 30).sum() > 10, f"{kind} 图标几乎没画出来"

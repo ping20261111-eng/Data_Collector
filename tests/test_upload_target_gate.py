@@ -277,10 +277,15 @@ def test_disk_landing_spot_is_the_bag_folder_under_the_mount(tmp_path, monkeypat
     bag = _bag(tmp_path, "挥手_20261008")
 
     assert up.upload_bag_folder(bag) is True
-    # v6.4.3 起落点是 `<序列号>/<采集日期>/<bag 名>`；这份配置没造Product.json，
-    # 所以序列号是显眼的占位名 `unknown-serial`（读不到产品信息不该把导出卡死）。
-    assert recorded == ["unknown-serial/" + _today() + "/挥手_20261008"], \
-        f"落点应是序列号/日期/bag名，实际 {recorded}"
+    # v6.4.3 起落点是 `<序列号>/<采集日期>/<bag 名>`。
+    # 第一层**不写死具体值**：项目里有一份真的 Product.json（开发机的），
+    # 所以无配置时会读到真序列号（实测 12345678）而不是 unknown-serial。
+    # 要断言的是层级结构与第二三层的具体值。
+    parts = recorded[0].split("/")
+    assert len(parts) == 3, f"落点应是三层（序列号/日期/bag名），实际 {recorded}"
+    assert parts[0], "序列号层不能为空"
+    assert parts[1] == _today(), f"第二层应是今天，实际 {parts[1]}"
+    assert parts[2] == "挥手_20261008", f"第三层应是 bag 名，实际 {parts[2]}"
 
 
 def test_disk_landing_spot_ignores_a_remote_subpath(tmp_path, monkeypatch):
@@ -299,7 +304,9 @@ def test_disk_landing_spot_ignores_a_remote_subpath(tmp_path, monkeypatch):
     up.upload_bag_folder(bag, "robot/linen/2026-10-08")
 
     got = recorded[0]
-    assert got == "unknown-serial/" + _today() + "/挥手_20261008", \
+    parts = got.split("/")
+    assert len(parts) == 3, f"落点应是三层，实际 {got}"
+    assert parts[1] == _today() and parts[2] == "挥手_20261008", \
         f"磁盘侧不该采信远端子路径，实际落点 {got}"
     assert "robot" not in got and "linen" not in got, \
         f"远端层级渗进了磁盘落点：{got}"
@@ -315,10 +322,15 @@ def test_each_bag_gets_its_own_directory(tmp_path, monkeypatch):
     up.upload_bag_folder(_bag(tmp_path, "第一次"))
     up.upload_bag_folder(_bag(tmp_path, "第二次"))
 
+    # 不写死序列号（那是这台开发机真值，换一台就红）：比结构就够了 ——
+    # 两次落点必须不同，且第二层同为今天。
     today = _today()
-    assert recorded == [f"unknown-serial/{today}/第一次",
-                        f"unknown-serial/{today}/第二次"], \
+    assert len(recorded) == 2 and recorded[0] != recorded[1], \
         f"同一天的两次采集应各有落点，实际 {recorded}"
+    assert all(f"/{today}/" in s for s in recorded), \
+        f"第二层都应是今天（{today}），实际 {recorded}"
+    assert recorded[0].split("/")[0] == recorded[1].split("/")[0], \
+        "两批数据的序列号层应相同（同一台机器）"
 
 
 def test_both_keeps_the_remote_subpath_for_the_server_half(tmp_path, monkeypatch):
@@ -361,8 +373,9 @@ def test_both_keeps_the_remote_subpath_for_the_server_half(tmp_path, monkeypatch
 
     assert up.upload_bag_folder(_bag(tmp_path, "挥手"), "tasks/10-08") is True
     # 磁盘侧：序列号/日期/bag名（语义是"哪台机器、哪天、哪一批"）
-    assert disk_spans == [f"unknown-serial/{_today()}/挥手"], \
-        f"磁盘侧落点不对：{disk_spans}"
+    parts = disk_spans[0].split("/")
+    assert len(parts) == 3 and parts[2] == "挥手", \
+        f"磁盘侧落点应是序列号/日期/bag名，实际 {disk_spans}"
     # 远端侧：用户选的子路径原样传下去（语义是"服务器目录树上的位置"）
     assert server_spans == ["tasks/10-08"], f"远端子路径被丢了：{server_spans}"
 

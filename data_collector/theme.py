@@ -646,6 +646,89 @@ QPushButton[variant="ghost"] {
 }
 QPushButton[variant="ghost"]:hover { color: ${text}; border-color: ${muted2}; }
 
+/* ---------- 导出目标芯片（v6.4.4）----------
+   一颗药丸：左边状态图标，中间目标名，右边可用空间，末尾一个 caret。
+   取代原来那个裸QComboBox——下拉只该选目标，而挂载点路径是另一件事，
+   塞在一起必然要外挂一行。这里三件事（目标/路径/状态）收在一处。
+
+   `state` 三态与 `theme.set_state` 对齐：none（服务器）/ ok（盘就绪）/ warn（未插好）。
+   默认态就把状态画出来是这一版的关键：盘没插好时不用点开面板就能看见。 */
+QToolButton#ExportChip {
+    background-color: ${surface2};
+    border: 1px solid ${line};
+    border-radius: ${pill}px;
+    padding: 5px 10px 5px 11px;
+    font-size: ${fs_base}px;
+    color: ${muted};
+    text-align: left;
+}
+QToolButton#ExportChip:hover { border-color: ${muted2}; color: ${text}; }
+/* 就绪：整颗药丸染上ok_soft。不只染图标——状态要能在一眼扫过时就被认出来，
+   只染13px 的小图标，现场很容易漏掉（那正是这一版要解决的问题）。 */
+QToolButton#ExportChip[state="ok"] {
+    background-color: ${ok_soft};
+    border-color: ${ok};
+    color: ${text};
+}
+QToolButton#ExportChip[state="ok"]:hover { background-color: ${ok_soft}; border-color: ${ok}; }
+/* 异常：琥珀底。不用 danger 红 —— "盘没插好"是提醒不是故障，
+   红底会让人以为数据已经丢了。 */
+QToolButton#ExportChip[state="warn"] {
+    background-color: ${warn_soft};
+    border-color: ${warn};
+    color: ${text};
+}
+QToolButton#ExportChip[state="warn"]:hover { background-color: ${warn_soft}; border-color: ${warn}; }
+
+/* 芯片里那个"可用 128GB"：次要信息，比目标名弱一档。
+   不能省掉它 —— 29GB 的盘录满这件事，现场必须不点开就知道。 */
+QLabel#ChipCaption {
+    background: transparent;
+    color: ${muted};
+    font-size: ${fs_sm}px;
+}
+QToolButton#ExportChip[state="ok"] QLabel#ChipCaption { color: ${ok}; }
+QToolButton#ExportChip[state="warn"] QLabel#ChipCaption { color: ${warn}; }
+
+/* 展开面板：非模态弹层，浮在卡片之上，所以底色用 popup（纯白）+ popup_line 描边，
+   与项目既有的菜单/下拉列表同一套（见 POPUP_* 注释）。 */
+#ExportPanel {
+    background-color: ${popup};
+    border: 1px solid ${popup_line};
+    border-radius: ${r3}px;
+}
+#ExportPanel QLabel { background: transparent; }
+
+/* 面板里的三个目标选项（卡片式）。选中态用 accent_soft + accent 描边 ——
+   和整体 accent 语言一致，不另造一套高亮色。 */
+QWidget#TargetOption {
+    background-color: ${surface};
+    border: 1px solid ${line};
+    border-radius: ${r1}px;
+}
+QWidget#TargetOption:hover { border-color: ${muted2}; }
+QWidget#TargetOption[selected="true"] {
+    background-color: ${accent_soft};
+    border-color: ${accent};
+}
+
+/* 面板里的挂载点配置块：与整个面板同一张底，不另加灰底 ——
+   嵌套灰底（灰底里的灰底）在浅色系里会显得脏。 */
+QWidget#DiskConfig { background: transparent; border: none; }
+QLabel#PanelTitle {
+    background: transparent;
+    color: ${muted};
+    font-size: ${fs_sm}px;
+}
+/* 落点预览：等宽字体（那是路径）+ 浅底（它是个"引用块"，不是控件）。 */
+QLabel#LandingPreview {
+    background-color: ${surface2};
+    color: ${muted};
+    font-family: "IBM Plex Mono", monospace;
+    font-size: ${fs_sm}px;
+    border-radius: ${r1}px;
+}
+
 /* 紧凑幽灵钮：与幽灵钮同一套形状语言，只把横向内距收到 8px。
    用途是"一行里要塞好几个小步进按钮"的场合（姿势控制的一行走轴表有 4 个 ± 钮，
    用常规内距(14px)时每个按钮要 40px 才放得下 3 个字符，4 个就把滑杆挤没了）。 */

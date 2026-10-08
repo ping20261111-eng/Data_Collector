@@ -224,3 +224,98 @@ class BatteryIndicator(QWidget):
         painter.setFont(theme.mono_font(theme.TYPE_SCALE["fs_sm"]))
         label = "—" if self._percent is None else f"{self._percent}%"
         painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, label)
+
+
+class StatusGlyph(QWidget):
+    """13×13 状态图标：圆点 / 对勾 / 警示三角（导出目标芯片用）。
+
+    ## 为什么自绘而不是用字符或图片
+
+    - **字符（● √ !）**：不同平台字体里字形与基线都不一样，深色主题下
+      尤其容易糊；而且警示三角没有能对齐的等宽字符。
+    - **图片资源**：换深色主题就要重备一套（浅色图标在深底上看不清），
+      而这个项目的主题是**可切换**的，为三个小图形背两套资源不值得。
+    - 项目里已有 `BatteryIndicator` 这个自绘状态控件的先例，三条纪律照它走：
+      取色必须在 try 内、异常绝不外放、`finally: painter.end()`
+      （paintEvent 中途退出会让 QPainter 来不及 end()，进程以段错误收场）。
+
+    几何：绘制区域比控件尺寸**内缩 1px**。QPainter 的描边以路径为中心向两侧各扩
+    pen/2，画到边界会被控件裁掉 —— 现场看到的就是"图标缺一块"。
+    """
+
+    ICON = 13
+    PEN = 2
+
+    #: 三种形态。名字与 `theme.set_state` 的取值对齐（none/ok/warn）。
+    def __init__(self, kind: str = "none", parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.ICON, self.ICON)
+        self._kind = kind
+        self._theme = "light"
+
+    def set_mode(self, mode: str) -> None:
+        self._theme = mode
+        self.update()
+
+    def set_kind(self, kind: str) -> None:
+        if kind == self._kind:
+            return
+        self._kind = kind
+        self.update()
+
+    def paintEvent(self, event):        # noqa: N802 (Qt 命名)
+        painter = QPainter(self)
+        try:
+            colors = theme.palette(self._theme)
+            kind = self._kind
+            if kind == "ok":
+                self._paint_check(painter, QColor(colors["ok"]))
+            elif kind in ("warn", "danger"):
+                self._paint_warn(painter, QColor(colors["warn" if kind == "warn" else "danger"]))
+            else:
+                self._paint_dot(painter, QColor(colors["muted2"]))
+        except Exception as exc:                     # noqa: BLE001
+            # 同 BatteryIndicator：自绘控件的异常绝不能从 paintEvent 漏出去。
+            logger.warning(f"状态图标绘制失败：{exc}")
+        finally:
+            painter.end()
+
+    def _ink(self, painter: QPainter, color: QColor, width: int) -> None:
+        pen = QPen(color)
+        pen.setWidth(width)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+
+    def _paint_dot(self, painter: QPainter, color: QColor) -> None:
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(color)
+        painter.drawEllipse(QRect(3, 3, 7, 7))       # 内缩，留出抗锯齿余量
+
+    def _paint_check(self, painter: QPainter, color: QColor) -> None:
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        self._ink(painter, color, self.PEN)
+        painter.drawPolyline(QPolygon([
+            QPoint(2, 7), QPoint(5, 10), QPoint(11, 3),
+        ]))
+
+    def _paint_warn(self, painter: QPainter, color: QColor) -> None:
+        """警示三角（圆圈 + 感叹号）。
+
+        用**圆圈**而不是真三角：Qt 画多边形要自己算三个顶点，描边又必然溢出边界，
+        而圆圈 + 两条直线在 13px 上稳得多，也和圆点同族（视觉上一套）。
+        """
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        self._ink(painter, color, 2)
+        # 圆心在 (6.5,6.5)，半径 4 → QRect(3,3,8,8)。描边以路径为中心向两侧各扩1px，
+        # 所以正好落在 1..12 的框内；用 QRect(2,2,9,9) 会顶到边界被裁，实拍看是扁的。
+        painter.drawEllipse(QRect(3, 3, 8, 8))
+        # 坐标**必须取整**：`QPoint` 只接受 int，传 6.5 会抛 TypeError。
+        # 而这里抛异常的后果不是少画一根线 —— 是整个 paintEvent 中断，
+        # 三种图标**一块都画不出来**（实测踩过，日志里只有一句"绘制失败"）。
+        painter.drawLine(QPoint(6, 5), QPoint(6, 8))
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(color)
+        painter.drawEllipse(QRect(6, 10, 1, 1))     # 感叹号的点

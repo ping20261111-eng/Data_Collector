@@ -11,8 +11,10 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QGroupBox, QLabel, QDialog, QLineEdit, QComboBox,
                              QInputDialog, QListWidget, QListWidgetItem,
                              QAbstractItemView, QProgressBar, QFileDialog, QMenu,
-                             QFrame, QSizePolicy, QApplication, QAction)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QRect
+                             QFrame, QSizePolicy, QApplication, QAction,
+                             QToolButton, QRadioButton)
+from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QRect,
+                          QEvent)
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QPolygon
 from PyQt5.Qt import QDesktopServices
 import time
@@ -31,6 +33,7 @@ from ...core_data import RecorderManager, DataUploader, LogFetcher
 from ...core_data import UploadCancelledError
 
 from ..common import (SP, make_panel_head)
+from ..widgets import StatusGlyph
 
 
 
@@ -208,13 +211,18 @@ class ActionsMixin:
         secondary.addWidget(self._build_export_target_selector())
         body.addLayout(secondary)
 
-        # ---- 第三行（导出目标展开）：只有选了移动硬盘才出现 ----
-        # 放在「数据」行下面而不是新起一个卡片：它属于"数据往哪去"这一组，
-        # 而这一组现有的高度就是一行 —— 挂载点行默认隐藏，选了才占地方。
-        body.addWidget(self._build_disk_mount_row())
+        # ---- 挂载点配置在哪 ----
+        # v6.4.4 起它住在**芯片展开的面板里**，不再占主卡片的一行。
+        # 原来那行挂在「数据」按钮行下面，把同一个组从中间劈成上下两块
+        # （实测看着像两件事），而它平时还是默认隐藏的 —— 也就是说那行位置
+        # 要么空着、要么劈开，没有第三种状态。
         # 首次进来按配置回填，并做一次探测（配置里本来就在用硬盘的话，
         # 打开界面就该看到"盘已就绪"，而不是等点上传才发现）
         self._sync_export_target_widgets(probe=True)
+        # 芯片在默认态就显示状态，所以要有一个低频探测跟着盘的实际状态变
+        # （现场是"插上/拔掉"这种物理动作，不可能指望用户点一下才知道）。
+        # 幂等：重复调用不会起第二个定时器。
+        self._start_disk_probe_timer()
 
         # ---- 第三行（三级）：工具（低频，药丸幽灵按钮 + 二级菜单）----
         self.btn_bag_stat = QPushButton("采集统计")
@@ -324,36 +332,199 @@ class ActionsMixin:
     # 而导出目标是**偶发改一次**的设置 —— 弹窗会打断手头的事，
     # 新起一行则要为它长期占一行的位置。
 
-    #: 下拉项：值 → 文案。文案直接说"送到哪儿"，不用 `disk` / `both` 这种内部词
-    #: （现场非研发人员不看配置文件，只认界面）。
+    #: 芯片左右 padding 之和（与 theme.py 里 `QToolButton#ExportChip` 的
+    #: `padding: 5px 10px 5px 11px` 对应）。改那条 QSS 时这里要一起改——
+    #: 不然内容会被 padding 挤掉一截（实测「移动硬盘」被截成「移动硬:」）。
+    CHIP_PADDING = 21
+
+    #: 目标选项：值 →(芯片/选项上的短名, 面板里的标题, 一句"这对你意味着什么")
+    #: 三段文案而不是一行标题，是因为现场非研发人员不看配置文件、只认界面，
+    #: 而「两者都送」这类词不解释就不知道是先硬盘还是先服务器。
     EXPORT_TARGET_ITEMS = (
-        ("server", "送到：服务器"),
-        ("disk", "送到：移动硬盘"),
-        ("both", "送到：服务器 + 移动硬盘"),
+        ("server", "服务器", "送到：服务器", "走 SFTP 送到远端"),
+        ("disk", "移动硬盘", "送到：移动硬盘", "写本地挂载点，完全不连服务器"),
+        ("both", "两者都送", "送到：服务器 + 移动硬盘", "先写硬盘，再送服务器"),
     )
 
-    def _build_export_target_selector(self) -> QComboBox:
-        self.cb_export_target = QComboBox()
-        self.cb_export_target.setObjectName("ExportTarget")
-        for value, label in self.EXPORT_TARGET_ITEMS:
-            self.cb_export_target.addItem(label, value)
-        self.cb_export_target.setToolTip(
+    def _build_export_target_selector(self) -> QWidget:
+        """导出目标芯片（v6.4.4 取代原来那个裸 `QComboBox`）。
+
+        **为什么不是下拉**：下拉适合「从若干同类值里选一个」，而这里要选的是
+        目标、要填的是路径、还要显示一个随时间变化的状态 —— 三件事塞进一个控件，
+        就必然要外挂一行（原来那个挂载点行就是这么来的），而外挂的一行会把
+        「数据」这一组从中间劈开，读起来像两件事。
+
+        芯片只做两件事：显示当前目标 + 显示盘的状态。配置放到面板里，
+        点它才展开。`cb_export_target` 仍然保留（藏在面板里），
+        既有守卫断言的是它的 `currentData()`，不用改。
+        """
+        self.chip_export_target = QToolButton()
+        self.chip_export_target.setObjectName("ExportChip")
+        self.chip_export_target.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self.chip_export_target.setPopupMode(QToolButton.InstantPopup)
+        self.chip_export_target.setCursor(Qt.PointingHandCursor)
+        self.chip_export_target.setToolTip(
             "这批数据送到哪儿（写入 app_config.yaml，重启后仍然有效）：\n"
             "· 服务器：走 SFTP 送到远端（缺省，与以前一致）\n"
             "· 移动硬盘：写本地挂载点，完全不连服务器（离线现场用）\n"
-            "· 两者都送：先写硬盘、再送服务器")
-        self.cb_export_target.currentIndexChanged.connect(self.on_export_target_changed)
-        return self.cb_export_target
+            "· 两者都送：先写硬盘、再送服务器\n"
+            "\n点这个按钮展开设置。")
+        self.chip_export_target.setMenu(self._build_export_panel())
 
-    def _build_disk_mount_row(self) -> QWidget:
-        """挂载点那一行（默认隐藏，选了移动硬盘才出现）。"""
+        # 芯片内部：状态图标 + 目标名 + 可用空间，三段不同样式的文字并排。
+        # **为什么不用 `setText`**：QToolButton 的 text 只能是一整串，
+        # 单一字体、单一颜色 —— 想让「移动硬盘」是正文色而「128GB 可用」是次要色，
+        # 就只能自己排。容器铺满按钮本身，QSS 的 padding 仍然作用在按钮上。
+        self.chip_body = QWidget(self.chip_export_target)
+        self.chip_body.setObjectName("ChipBody")
+        chip_row = QHBoxLayout(self.chip_body)
+        chip_row.setContentsMargins(0, 0, 0, 0)
+        chip_row.setSpacing(6)
+        self.chip_glyph = StatusGlyph("none", self.chip_body)
+        chip_row.addWidget(self.chip_glyph)
+        self.lb_chip_title = QLabel("服务器")
+        self.lb_chip_title.setObjectName("ChipTitle")
+        chip_row.addWidget(self.lb_chip_title)
+        self.lb_chip_caption = QLabel("")
+        self.lb_chip_caption.setObjectName("ChipCaption")
+        chip_row.addWidget(self.lb_chip_caption)
+        chip_row.addStretch()
+        # 宽度按内容算，见 `_refit_chip` 的注释（三个坑都在那儿）。
+        self._refit_chip()
+        outer = QHBoxLayout(self.chip_export_target)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.addWidget(self.chip_body)
+        self._set_chip_title("服务器")
+        self._refit_chip()
+        return self.chip_export_target
+
+    def _build_export_panel(self) -> QMenu:
+        """芯片展开的面板（v6.4.4）。
+
+        ## 为什么用 QMenu 承载而不是 QDialog
+
+        **必须是非模态的**：模态面板会锁住主窗口，而这里只是选个设置，
+        不该打断手头的事 —— 现场常常是「设置好导出目标 → 立刻开始录制」。
+        `QToolButton.setMenu` + `InstantPopup` 自带非模态与外部点击关闭，
+        比手写 `QPopupWidget` 的定位代码短得多，行为还更稳。
+
+        面板里的控件（`cb_export_target` / `ed_disk_mount` / `lb_disk_state` /
+        `btn_disk_mark` / `btn_disk_recheck`）**都是原有的那些对象**，
+        只是换了爹妈（挂到面板而不是主卡片）。这是刻意的：既有守卫断言的正是
+        这些对象（`win.cb_export_target` / `win.ed_disk_mount.text()`），
+        复用它们意味着那批用例一行都不用改。
+        """
+        panel = QMenu(self)
+        panel.setObjectName("ExportPanel")
+        # 菜单自带一排 action，这里只要一个"容器 action"承载面板内容
+        holder = QWidget()
+        holder.setObjectName("ExportPanelBody")
+        body = QVBoxLayout(holder)
+        body.setContentsMargins(14, 12, 14, 12)
+        body.setSpacing(SP["sp2"])
+
+        title = QLabel("数据送到哪儿")
+        title.setObjectName("PanelTitle")
+        body.addWidget(title)
+
+        # --- 三个目标选项（卡片式，每项带一句含义） ---
+        self.target_option_widgets = {}
+        for value, _short, label, hint in self.EXPORT_TARGET_ITEMS:
+            opt = QWidget()
+            opt.setObjectName("TargetOption")
+            opt.setProperty("target", value)
+            opt.setCursor(Qt.PointingHandCursor)
+            row = QHBoxLayout(opt)
+            row.setContentsMargins(11, 9, 11, 9)
+            row.setSpacing(10)
+            radio = QRadioButton()
+            radio.setChecked(value == "server")
+            radio.setEnabled(False)          # 只读表示：真正的选择由整张卡片承担
+            row.addWidget(radio, 0, Qt.AlignTop)
+            texts = QVBoxLayout()
+            texts.setSpacing(1)
+            t1 = QLabel(label)
+            t1.setObjectName("TargetOptionTitle")
+            t2 = QLabel(hint)
+            t2.setObjectName("TargetOptionHint")
+            t2.setWordWrap(True)
+            texts.addWidget(t1)
+            texts.addWidget(t2)
+            row.addLayout(texts, 1)
+            opt.installEventFilter(self)
+            for child in opt.findChildren(QWidget):
+                child.installEventFilter(self)
+            self.target_option_widgets[value] = (opt, radio)
+            body.addWidget(opt)
+
+        # --- 分隔：下面那块只在选了硬盘时才有意义 ---
+        self.panel_divider = QFrame()
+        self.panel_divider.setObjectName("Divider")
+        self.panel_divider.setFrameShape(QFrame.HLine)
+        body.addWidget(self.panel_divider)
+
+        # --- 挂载点配置：原有的控件原样搬进来 ---
+        self.panel_disk_title = QLabel("挂载点")
+        self.panel_disk_title.setObjectName("PanelTitle")
+        body.addWidget(self.panel_disk_title)
+        self.disk_mount_row = self._build_disk_mount_row(in_panel=True)
+        body.addWidget(self.disk_mount_row)
+
+        # --- 落点预览（v6.4.3 三层落点的直接收益） ---
+        self.lb_landing_preview = QLabel("")
+        self.lb_landing_preview.setObjectName("LandingPreview")
+        self.lb_landing_preview.setWordWrap(True)
+        self.lb_landing_preview.setVisible(False)
+        body.addWidget(self.lb_landing_preview)
+
+        # 面板内容用一个 `QWidgetAction` 顶替菜单区 —— 它就是"内容是个 widget
+        # 的 action"，是 QMenu 里唯一能塞自定义控件的官方入口。
+        from PyQt5.QtWidgets import QWidgetAction
+
+        action = QWidgetAction(panel)
+        action.setDefaultWidget(holder)
+        panel.addAction(action)
+
+        # `cb_export_target` 是**数据载体**，不是界面控件：面板上的选择由三张
+        # 卡片承担，下拉只保存"当前值"。既有守卫断言的正是 `win.cb_export_target`，
+        # 所以它必须还在（只是不再显示给用户）。放进一个隐藏的 QWidgetAction 里。
+        self.cb_export_target = QComboBox()
+        self.cb_export_target.setObjectName("ExportTarget")
+        for value, _short, label, _hint in self.EXPORT_TARGET_ITEMS:
+            self.cb_export_target.addItem(label, value)
+        self.cb_export_target.currentIndexChanged.connect(self.on_export_target_changed)
+        carrier = QWidgetAction(panel)
+        holder_hide = QWidget()
+        holder_hide.setLayout(QVBoxLayout())
+        holder_hide.layout().addWidget(self.cb_export_target)
+        self.cb_export_target.setVisible(False)
+        carrier.setDefaultWidget(holder_hide)
+        panel.addAction(carrier)
+        return panel
+
+    def _set_chip_title(self, short: str) -> None:
+        """芯片中间那段文字（目标名）。"""
+        self.lb_chip_title.setText(short)
+
+    def _build_disk_mount_row(self, in_panel: bool = False) -> QWidget:
+        """挂载点配置块（v6.4.4 起住在芯片面板里）。
+
+        布局从「横排一行」改成「竖排两行」：面板宽度有限，横排要把路径输入、
+        状态文案、「创建标识」、「重新检测」四个东西塞进 400px，
+        实测会挤成两行且按钮被裁。竖排让每个控件都能拿到整宽。
+        """
         self.disk_mount_row = QWidget()
-        # `InlineRow` = "卡片里按需展开的一行"（见 theme.py）：透明背景，
-        # 否则会被全局 `QWidget` 规则涂成一条与卡片不同色的灰带
-        self.disk_mount_row.setObjectName("InlineRow")
-        row = QHBoxLayout(self.disk_mount_row)
+        # `DiskConfig` = 面板里的一块配置（见 theme.py）：透明背景，
+        # 与面板同一张底 —— 嵌套灰底（灰底里的灰底）在浅色系里会显得脏。
+        self.disk_mount_row.setObjectName("DiskConfig")
+        outer = QVBoxLayout(self.disk_mount_row)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(SP["sp2"])
+
+        row = QHBoxLayout()
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(SP["sp2"])
+        outer.addLayout(row)
 
         self.lb_disk_mount = QLabel("挂载点")
         self.lb_disk_mount.setObjectName("FactLabel")
@@ -363,22 +534,28 @@ class ActionsMixin:
         self.ed_disk_mount = QLineEdit()
         self.ed_disk_mount.setObjectName("DiskMount")
         self.ed_disk_mount.setPlaceholderText("/media/robot/NERV")
-        # **固定宽，不要让它吃掉行末的富余**：`QLineEdit` 默认水平策略是 Expanding，
-        # 与行末的 `addStretch()` 按比例分富余 —— 实测被拉到 570px，
-        # 状态文案（"盘已就绪"那句）被推到屏幕另一头，看着跟输入框没关系。
-        # 300px 够显示 `/media/robot/NERV` 这类常见路径。
-        self.ed_disk_mount.setFixedWidth(300)
+        # 面板宽度固定（设计稿400px），所以让输入框吃掉整行富余即可 ——
+        # 主卡片里那个「固定 300px」的教训是"别让 Expanding 抢走状态文案的
+        # 位置"，而这里状态文案已经换到下一行，不存在那个问题。
+        self.ed_disk_mount.setMinimumWidth(260)
         self.ed_disk_mount.setToolTip("移动硬盘挂载到哪个目录（填设备目录本身，不是它下面的子目录）")
         # 失焦才存：边打边存会在路径打到一半时写入一个不存在的路径
         self.ed_disk_mount.editingFinished.connect(self.on_disk_mount_edited)
         row.addWidget(self.ed_disk_mount)
 
+        row.addStretch()
+
+        # 第二行：状态 + 两个按钮（横排，整块宽）
+        state_row = QHBoxLayout()
+        state_row.setContentsMargins(0, 0, 0, 0)
+        state_row.setSpacing(SP["sp2"])
         self.lb_disk_state = QLabel("")
         self.lb_disk_state.setObjectName("FactValue")
-        row.addWidget(self.lb_disk_state)
+        self.lb_disk_state.setWordWrap(True)
+        state_row.addWidget(self.lb_disk_state, 1)
 
         # 只在「盘已挂载但缺标识文件」时出现（见 _probe_disk_mount）。
-        # 放在状态文案与「重新检测」之间：文案说清缺什么，按钮紧跟着就是解法。
+        # 紧跟在状态文案后面：文案说清缺什么，按钮就是解法。
         self.btn_disk_mark = QPushButton("创建标识")
         self.btn_disk_mark.setProperty("variant", "ghost-compact")
         self.btn_disk_mark.setToolTip(
@@ -386,15 +563,15 @@ class ActionsMixin:
             "用于防止把数据写进插错的盘；该文件不含数据，可随时删除。")
         self.btn_disk_mark.clicked.connect(self.on_create_volume_marker)
         self.btn_disk_mark.setVisible(False)
-        row.addWidget(self.btn_disk_mark)
+        state_row.addWidget(self.btn_disk_mark, 0)
 
         self.btn_disk_recheck = QPushButton("重新检测")
         self.btn_disk_recheck.setProperty("variant", "ghost-compact")
         self.btn_disk_recheck.setToolTip("盘是后来才插上的时候点它")
         self.btn_disk_recheck.clicked.connect(lambda: self._probe_disk_mount())
-        row.addWidget(self.btn_disk_recheck)
+        state_row.addWidget(self.btn_disk_recheck, 0)
 
-        row.addStretch()
+        outer.addLayout(state_row)
         self.disk_mount_row.setVisible(False)
         return self.disk_mount_row
 
@@ -418,7 +595,120 @@ class ActionsMixin:
             self._probe_disk_mount()
 
     def _set_disk_row_visible(self, visible: bool) -> None:
+        """挂载点配置块的显隐（只在面板内部用）。
+
+        v6.4.4 起它住在芯片面板里，所以"显隐"影响的是面板内容的高度，
+        不再是主卡片的行数 —— 面板会自动收窄到只剩目标选择。
+        """
         self.disk_mount_row.setVisible(bool(visible))
+        for w in (self.panel_disk_title, self.panel_divider):
+            w.setVisible(bool(visible))
+
+    def _refresh_chip(self) -> None:
+        """把芯片刷成当前状态（目标名 + 图标 + 可用空间）。
+
+        **默认态就要显示状态**是这一版的核心：盘没插好时不用点开面板就能看见。
+        原来的实现只在展开那一刻探一次，默认态与异常态长得一模一样 ——
+        而「以为导成功了、其实没上盘」正是从这个缝里钻出来的。
+        """
+        target = self.cb_export_target.currentData()
+        short = next((s for v, s, _l, _h in self.EXPORT_TARGET_ITEMS if v == target),
+                     "服务器")
+        self._set_chip_title(short)
+
+        if target not in ("disk", "both"):
+            # 服务器：没有盘的概念，灰点即可。别在这里显示"未插好" ——
+            # 那是"你选了移动硬盘但盘没插好"的提醒，跟这个目标无关。
+            self.chip_glyph.set_kind("none")
+            self.lb_chip_caption.setText("")
+            theme.set_state(self.chip_export_target, "none")
+            self._refit_chip()
+            return
+
+        ok = bool(getattr(self, "_disk_ok", False))
+        cap = str(getattr(self, "_disk_caption", "") or "")
+        if ok:
+            self.chip_glyph.set_kind("ok")
+            theme.set_state(self.chip_export_target, "ok")
+        else:
+            self.chip_glyph.set_kind("warn")
+            theme.set_state(self.chip_export_target, "warn")
+            cap = cap or "未插好"
+        self.lb_chip_caption.setText(cap)
+        # 文案变了宽度就得跟着变（「服务器」→「移动硬盘」要长 8px）
+        self._refit_chip()
+
+    def _refit_chip(self) -> None:
+        """按当前三段内容重算芯片宽度。
+
+        三个坑叠在一起，每一个都得单独处理：
+
+        1. **要��按钮本身设宽度**，不是只给容器设。实测 `chip_body` 已经 132，
+           而 `QToolButton` 仍然只有 42 —— 它的 `sizeHint` 只算自己的图标与
+           text（这里两个都是空），**完全不采纳子控件的尺寸**。
+        2. **容器还要再减去 padding**。QSS 的 padding 不算进 `sizeHint`，
+           不减就会把内容挤掉（实测「移动硬盘」被截成「移动硬:」）。
+        3. **宽度随文案变**。「服务器」和「635GB 可用」长度不同，固定宽度要么
+           空一块、要么截断。所以每次内容变了都重算，而不是拍一个常数。
+
+        量法：图标 + 标题 + 次要文案 + 两段间距（各6px）+ 左右 padding。
+        「635GB 可用」是最长的情况（实测 69px），三位数容量也够用。
+        """
+        need = (self.chip_glyph.width()
+                + self.lb_chip_title.sizeHint().width()
+                + self.lb_chip_caption.sizeHint().width()
+                + 6 * 2)
+        width = need + self.CHIP_PADDING
+        self.chip_export_target.setFixedWidth(width)
+        self.chip_body.setFixedWidth(width - self.CHIP_PADDING)
+
+    def eventFilter(self, obj, event):     # noqa: N802 (Qt 命名)
+        """点面板里任何一张目标卡片 = 选它。
+
+        Qt 的事件**先给最深处的控件**再往上冒泡。所以过滤器必须装到卡片里
+        **每一个**子控件上（两个 label + 那个只读 radio），只装在卡片本体上
+        的话，只有点在卡片空白处才收得到 —— 实测正是那样：点标题文字没反应。
+        这也是为什么这里遍历 `findChildren` 而不是只判断 `obj` 自己。
+        """
+        if event.type() != QEvent.MouseButtonRelease:
+            return super().eventFilter(obj, event)
+        owner = obj
+        while owner is not None and owner.objectName() != "TargetOption":
+            owner = owner.parentWidget()
+        if owner is None:
+            return super().eventFilter(obj, event)
+        value = owner.property("target")
+        if value and value != self.cb_export_target.currentData():
+            self.on_target_option_clicked(value)
+        return super().eventFilter(obj, event)
+
+    def on_target_option_clicked(self, value: str) -> None:
+        """面板里点了某张目标卡片。
+
+        走 `cb_export_target.setCurrentIndex` 而不是直接写配置 ——
+        让它复用 `on_export_target_changed` 那条既有路径（写回配置 + 探盘），
+        不在这里重复一遍"选完之后该做什么"。
+        """
+        index = self.cb_export_target.findData(value)
+        if index >= 0:
+            self.cb_export_target.setCurrentIndex(index)
+        self._sync_option_visuals()
+        # 面板选择完就收起：现场是「设置好 → 立刻开始录」，面板留着挡视线。
+        chip_menu = self.chip_export_target.menu()
+        if chip_menu is not None:
+            chip_menu.close()
+
+    def _sync_option_visuals(self) -> None:
+        """把三张卡片的选中态与可点性刷成当前值。"""
+        current = self.cb_export_target.currentData()
+        for value, (opt, radio) in self.target_option_widgets.items():
+            selected = value == current
+            radio.setChecked(selected)
+            opt.setProperty("selected", "true" if selected else "false")
+            theme.repolish(opt)
+            # 整张卡片可点；选中那张换成箭头光标（点了也不会变，
+            # 「点了没反应」比「光标不是手型」更让人困惑）
+            opt.setCursor(Qt.PointingHandCursor if not selected else Qt.ArrowCursor)
 
     def on_export_target_changed(self) -> None:
         """切换导出目标：立刻写回配置，并（选了硬盘时）探一次盘。
@@ -427,11 +717,14 @@ class ActionsMixin:
         现场下次开程序会退回服务器 —— 而那时没人会记得自己改过。
         """
         target = self.cb_export_target.currentData()
-        self._set_disk_row_visible(target in ("disk", "both"))
-        if target in ("disk", "both"):
+        uses_disk = target in ("disk", "both")
+        self._set_disk_row_visible(uses_disk)
+        if uses_disk:
             self._probe_disk_mount()
+        self._refresh_chip()
+        self._sync_option_visuals()
 
-        mount = self.ed_disk_mount.text().strip() if target in ("disk", "both") else None
+        mount = self.ed_disk_mount.text().strip() if uses_disk else None
         self._save_export_settings(target, mount,
                                    label=self.cb_export_target.currentText())
 
@@ -464,8 +757,11 @@ class ActionsMixin:
             for err in result["errors"]:
                 self.append(f"✖ 导出设置没保存成功：{err}")
 
-    def _probe_disk_mount(self) -> None:
+    def _probe_disk_mount(self, quiet: bool = False) -> None:
         """探一次挂载点，把结果写成一句人话。
+
+        `quiet=True` 供定时探测调用：**更新状态但不弹窗**。
+        用户没点任何东西的时候弹对话框，只会被当成程序抽风。
 
         **为什么值得单独探**：`disk_export` 的检查只在"点上传那一刻"跑，
         而现场最贵的事故是"以为导成功了、其实没上盘"—— 路径写错时若那个目录
@@ -503,16 +799,23 @@ class ActionsMixin:
             self.btn_disk_recheck.setVisible(True)
             # 探测失败时不能提供"创建标识"——那等于在不知道盘状态时往盘上写东西
             self.btn_disk_mark.setVisible(False)
+            # 早退前必须刷芯片：否则上一次探测的"就绪"会留在芯片上，
+            # 而面板已经红字了 —— 界面自相矛盾，比不显示更糟。
+            self._disk_ok, self._disk_caption = False, ""
+            self._refresh_chip()
+            self._refresh_landing_preview()
             return
 
         if not path_exists:
             self.lb_disk_state.setText("✖ 该路径不存在。插上硬盘后点「重新检测」")
             theme.set_state(self.lb_disk_state, "warn")
             self.btn_disk_mark.setVisible(False)
+            self._disk_ok, self._disk_caption = False, ""
         elif not mounted:
             self.lb_disk_state.setText("✖ 该路径不是已挂载的设备目录（数据会写在本机磁盘上）")
             theme.set_state(self.lb_disk_state, "warn")
             self.btn_disk_mark.setVisible(False)
+            self._disk_ok, self._disk_caption = False, ""
         elif probe.require_volume_id and not has_marker:
             self.lb_disk_state.setText(
                 f"✖ 该盘不是数据盘（缺少标识文件 {probe.volume_marker_path()}）")
@@ -521,6 +824,7 @@ class ActionsMixin:
             # 而现场既不知道文件名对不对、也不确定写完要怎么确认，所以做成一个
             # 按钮：点一下就建，然后立刻重测，状态当场变绿。
             self.btn_disk_mark.setVisible(True)
+            self._disk_ok, self._disk_caption = False, ""
         else:
             parts = ["✔ 盘已就绪"]
             if fs:
@@ -530,8 +834,93 @@ class ActionsMixin:
             self.lb_disk_state.setText(" · ".join(parts))
             theme.set_state(self.lb_disk_state, "ok")
             self.btn_disk_mark.setVisible(False)
+            self._disk_ok = True
+            # 芯片上**常显**可用空间：29GB 的盘录满这件事，
+            # 现场必须不点开面板就知道（省掉它等于把"盘快满了"藏起来）。
+            self._disk_caption = f"{free / 1024 ** 3:.0f}GB 可用" if free else "已就绪"
 
         self.btn_disk_recheck.setVisible(True)
+        # 状态与落点都从**探测这一处**统一出去。分头在别处刷必然漏掉某一态
+        # —— 漏「路径不存在」那条时，芯片会显示"就绪"而面板是红字，界面自相矛盾。
+        self._refresh_chip()
+        self._refresh_landing_preview()
+
+    def _refresh_landing_preview(self) -> None:
+        """面板底部的「将保存到」预览。
+
+        这是 v6.4.3 三层落点（序列号 / 日期 / bag 名）的直接收益：导出前就
+        把盘上的最终位置摆出来。现场不用导出完再去盘上翻目录找文件。
+
+        只在选了硬盘且路径已填时显示 —— 没有挂载点时预览是空的，
+        给一块空白框不如不给。
+        """
+        uses_disk = self.cb_export_target.currentData() in ("disk", "both")
+        mount = self.ed_disk_mount.text().strip() if uses_disk else ""
+        if not uses_disk or not mount:
+            self.lb_landing_preview.setVisible(False)
+            return
+        try:
+            # 复用逻辑层那套分层规则（`_disk_subpath`），不在这儿另写一遍
+            # —— 两处各算一次的话，改了一处另一处就会说错话，
+            # 而界面说错落点的后果正是"人按界面去找、找不到"。
+            #
+            # 落点里那个 bag 名**故意写成占位**：真实的 bag 名要到导出那一刻
+            # 才有，而那一刻之前界面不该替它假定一个名字。
+            from ...core_data import DataUploader
+            span = DataUploader(self.config)._disk_subpath(self.config.get_bag_dir())
+        except Exception as exc:
+            logger.warning(f"生成落点预览失败：{exc}")
+            self.lb_landing_preview.setVisible(False)
+            return
+        self.lb_landing_preview.setText(f"将保存到\n{mount}/{span}/<本次采集名>/")
+        self.lb_landing_preview.setVisible(True)
+
+    def _start_disk_probe_timer(self) -> None:
+        """低频探测：让芯片上的状态**跟着盘的实际状态变**。
+
+        ## 为什么需要定时器
+
+        芯片在**默认态**就显示状态（这是这一版的核心），而现场是"盘插上/
+        拔掉"这种物理动作 —— 不可能指望用户点一下才知道。原来的实现只在
+        展开面板那一刻探一次，芯片上的状态会一直是第一次探出来的结果。
+
+        ## 为什么只在变化时记日志
+
+        每3s 记一条的话，日志区会被「盘已就绪」刷满，**真正的故障
+        （掉线、拔盘、写失败）会被淹没** —— 而那些才是要回头查的。
+        所以 `_disk_ok` / `_disk_caption` 变了才记。
+        """
+        if getattr(self, "_disk_timer", None) is not None:
+            return
+        self._last_disk_ok = None
+        self._last_disk_caption = None
+        timer = QTimer(self)
+        timer.setInterval(3000)
+        timer.timeout.connect(self._tick_disk_probe)
+        timer.start()
+        self._disk_timer = timer
+
+    def _tick_disk_probe(self) -> None:
+        """定时探一次，只在状态真的变了才说话。"""
+        if self.cb_export_target.currentData() not in ("disk", "both"):
+            return
+        if not self.ed_disk_mount.text().strip():
+            return
+        # 探测本身会把面板里的状态文案与按钮刷好（它就是那一处的真相来源），
+        # 但探测期间**不该弹窗** —— 用户没点任何东西。
+        before = (getattr(self, "_disk_ok", None), getattr(self, "_disk_caption", None))
+        try:
+            self._probe_disk_mount(quiet=True)
+        except Exception as exc:
+            logger.debug(f"定时探测挂载点失败：{exc}")
+            return
+        after = (getattr(self, "_disk_ok", None), getattr(self, "_disk_caption", None))
+        if after == before:
+            return
+        if after[0]:
+            self.append(f"移动硬盘已就绪：{after[1]}")
+        else:
+            self.append(f"⚠ 移动硬盘状态变化：{self.lb_disk_state.text()}")
 
     def on_create_volume_marker(self) -> None:
         """在移动硬盘根目录创建盘标识文件。
