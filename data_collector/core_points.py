@@ -252,14 +252,30 @@ class PointRecorder:
         return record
 
     def update(self, index: int, label: str, label_id=None, note: str = "") -> bool:
-        """改一个点的标签/备注（时间不可改 —— 时间才是打点的本体）。"""
+        """改一个点的标签/备注（时间不可改 —— 时间才是打点的本体）。
+
+        返回值只看**记录本身**改没改成，不看 CSV 写没写成功：
+        bag 目录要等脚本建出来，录制刚开始的十几秒内它可能还不存在；那时
+        改动已经落在内存里，界面必须显示新标签 —— 否则操作员明明改了、
+        界面却像没反应，就会以为功能坏了反复点。把"落盘失败"讲清楚就够了
+        （`last_error` 会说明），不该把整次修改判为失败。
+        """
         for position, record in enumerate(self.records):
             if record.index != index:
                 continue
             self.records[position] = replace(
                 record, label=str(label or "").strip(), label_id=label_id,
                 note=str(note or "").strip())
-            return self._rewrite()
+            if not self._rewrite():
+                # 改动已在内存里，只是没落盘。攒进 pending，下次打点或收尾时补写。
+                logger.warning(
+                    f"打点 #{index} 的改动暂未落盘（{self.last_error}），"
+                    f"将在目录就绪后补写")
+                for pending in self._pending:
+                    if pending.index == index:
+                        self._pending.remove(pending)
+                self._pending.append(self.records[position])
+            return True
         return False
 
     def remove(self, index: int) -> bool:
@@ -273,7 +289,10 @@ class PointRecorder:
             return False
         self.records = [replace(record, index=position + 1)
                         for position, record in enumerate(kept)]
-        return self._rewrite()
+        # 与 update 同一口径：删掉了就算成功，落盘失败只记 last_error
+        if not self._rewrite():
+            logger.warning(f"删除后的重写暂未落盘（{self.last_error}）")
+        return True
 
     def set_records(self, records: Sequence[PointRecord]) -> None:
         """整体替换（测试与"恢复会话"用）。会重排序号并重写 CSV。"""

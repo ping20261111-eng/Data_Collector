@@ -154,6 +154,14 @@ class DataOpsMixin:
 
     @guard_slot
     def on_stop_record(self):
+        # 进程可能已经自行退出（脚本崩了/被外部杀掉），此时点「停止录制」要能
+        # 把界面收干净，而不是弹「停止失败」—— 操作员确实开过录制，也确实结束了，
+        # 界面还停在"录制中"才是真bug。这里按"有没有在录/有没有录过"判断，
+        # 不按"stop() 有没有真的杀掉进程"判断。
+        was_recording = self.recorder.is_active()
+        # 用 getattr：这个属性由 RecorderManager.start() 写入，但界面不该假定
+        # 它一定存在（替身/旧会话/异常路径下都可能没有）。读不到就当没有会话。
+        had_session = getattr(self.recorder, "started_at", None) is not None
         if self.recorder.stop():
             self.append("录制已停止")
             self.record_timer.stop()
@@ -176,6 +184,18 @@ class DataOpsMixin:
                 self.record_start_time = None
 
             QMessageBox.information(self, "提示", "录制已停止")
+        elif was_recording or had_session:
+            # 进程自己没了，但这次录制确实开过：收尾打点、复位按钮，如实说明
+            self.append("录制进程已自行退出，正在收尾")
+            self.record_timer.stop()
+            self.record_status_label.setText("已停止")
+            theme.set_state(self.record_status_label, "none")
+            self._finish_points()
+            self._set_record_button("idle")
+            self.record_start_time = None
+            QMessageBox.information(
+                self, "提示", "录制进程此前已退出，本次录制已结束。\n"
+                             "若数据不完整，请检查 bag 目录并重新录制。")
         else:
             self.show_error("停止失败", "没有活动的录制任务")
 
@@ -307,9 +327,11 @@ class DataOpsMixin:
 
     @guard_slot
     def on_view_data(self):
-        if not ensure_remote_password(self.uploader, self):
-            self.append("已取消：未提供远端密码（查看数据需要读取远端目录）")
-            return
+        # **不预先问远端密码。** 这个对话框的列表全部来自本地
+        # （`get_bag_folders()` / `get_log_files()`），打开它不需要连任何服务器。
+        # 原来在这里先问一次密码，离线现场连"看一眼本地录了什么"都做不到 ——
+        # 问密码这件事真正需要的地方是 `open_remote_browser`（浏览远端目录），
+        # 那里问才问在了刀刃上。
         dlg = DataViewDialog(self.uploader, self.log_fetcher, self)
         dlg.setModal(False)
         dlg.show()

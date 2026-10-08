@@ -216,6 +216,11 @@ class RecorderManager:
             self.last_code = ErrorCode.NOT_FOUND
             self.last_error = "已有录制任务正在进行"
             return False
+        # 上一次录制若已自行退出（脚本秒退、被外部杀掉、机器重启残留），current_proc
+        # 里还留着那个**已死的** Popen。不先收干净就开新的一次，会把上一次的
+        # _started_at 带过来：录制起点的基准时间被污染成旧值 —— 看门狗把上一场的
+        # 旧文件当成新产出，形同虚设；界面状态也与实际进程对不上。
+        self._reap_dead_proc("启动新录制前")
         try:
             self.current_proc = self.launcher.launch_record(
                 script_type, name, desc, label, action_id
@@ -245,13 +250,60 @@ class RecorderManager:
         self._started_at = time.time()
         return True
 
+    def _reap_dead_proc(self, why: str = "") -> bool:
+        """回收**已经退出**的录制进程句柄，并清掉本次录制的残留状态。
+
+        为什么必须做：`current_proc` 是一个 Popen 引用，脚本自行退出后它并不会
+        消失，只是 `poll()` 开始返回退出码。不清的后果有两处一起坏：
+
+        1. `is_active()` 靠 `poll() is None` 判断，看起来没问题；但 `_started_at`
+           还停在上一次录制的中点，下一次 `health()` 会拿它当"何时算新数据"的
+           基准 —— 旧基线比新录制早，于是**每个文件都算"新数据"**，
+           看门狗形同虚设，"进程活着但没落盘"这种事故再也拦不住。
+        2. 进程注册表里挂着这个死进程的 Popen，`terminate()` 的兜底逻辑会对一个
+           已经结束的 pid 发信号，日志里出现看不懂的报错。
+
+        返回是否真的回收了东西（便于测试与日志）。
+        """
+        proc = self.current_proc
+        if proc is None or proc.poll() is None:
+            return False
+        code = proc.poll()
+        logger.info(f"回收已退出的录制进程（PID={getattr(proc, 'pid', '?')} "
+                    f"退出码={code}）{('：' + why) if why else ''}")
+        # 从注册表里摘掉，别让后续的按名终止/巡检一直看见它
+        pm = getattr(self.launcher, "pm", None)
+        if pm is not None:
+            try:
+                pm.unregister(proc)
+            except Exception as exc:                    # noqa: BLE001
+                logger.debug(f"从进程注册表摘除录制进程失败（可忽略）：{exc}")
+        self.current_proc = None
+        self._started_at = None
+        return True
+
     def stop(self) -> bool:
+        """停止录制。返回是否**真的**停掉了一个正在跑的录制。
+
+        进程已经自行退出时也要把状态收干净：否则 `_started_at` 会一直挂着上一场的
+        值，下一次录制把它当成自己的基准（见 `_reap_dead_proc`）。
+        这里返回 False 是如实汇报"没有可停的录制"，界面据此提示即可。
+        """
         if self.current_proc and self.current_proc.poll() is None:
             from .core import terminate
-            terminate(self.current_proc)
+            proc = self.current_proc
+            terminate(proc)
+            pm = getattr(self.launcher, "pm", None)
+            if pm is not None:
+                try:
+                    pm.unregister(proc)
+                except Exception as exc:                # noqa: BLE001
+                    logger.debug(f"从进程注册表摘除录制进程失败（可忽略）：{exc}")
             self.current_proc = None
             self._started_at = None
             return True
+        # 走到这里说明没有活着的录制：若有残留句柄一并回收，避免污染下一次
+        self._reap_dead_proc("停止时发现进程已退出")
         return False
 
     def is_active(self) -> bool:
@@ -270,12 +322,19 @@ class RecorderManager:
     # ---------- 录制看门狗 ----------
     @staticmethod
     def _files_since(root: Path, since: float) -> Tuple[int, float]:
-        """统计 root 下在 since 之后被写过的文件数，以及最近一次写入的时间。"""
+        """统计 root 下在 since 之后被写过的**文件**数，以及最近一次写入的时间。
+
+        只数文件、**跳过目录**：录制脚本会先建出 bag 目录再往里写数据，
+        若把新建目录本身算作产出，"脚本起来了但没落盘"会被判成正在产出 ——
+        那样 health() 就失去了它唯一要拦的那种事故。
+        """
         count, newest = 0, 0.0
         if not root.is_dir():
             return count, newest
         for path in root.rglob("*"):
             try:
+                if path.is_dir():
+                    continue
                 mtime = path.stat().st_mtime
             except OSError:
                 continue          # 录制中被移走/重命名的条目，忽略即可
@@ -686,6 +745,7 @@ class DataUploader:
                 remote.write(buf)
                 done += len(buf)
                 callback(done, total)
+
 
     # ---------- 打包 + 上传（统一入口） ----------
     def _archive_name(self, folder: Path) -> str:

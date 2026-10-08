@@ -679,9 +679,15 @@ class PointDialog(QDialog):
             theme.set_state(self.label_task, "warn")
 
     def _refresh_records(self):
-        """已打点列表：等宽单行读数，列对齐靠等宽字体（序号 / 时刻 / 相对秒 / 标签）。"""
+        """已打点列表：等宽单行读数，列对齐靠等宽字体（序号 / 时刻 / 相对秒 / 标签）。
+
+        重建列表会丢选中状态。改完标签后操作员往往还要接着改下一条 —— 这里把
+        原先选中的序号恢复回去，避免"改一次就得重新点一次选中"。
+        """
+        keep = self._selected_index()
         self.records_list.blockSignals(True)
         self.records_list.clear()
+        restore = None
         for record in self.recorder.records:
             text = (f"#{record.index:<2} {record.clock_ms}"
                     f"  +{record.rel_seconds:>6.1f}s  {record.label or '（未填标签）'}")
@@ -695,7 +701,11 @@ class PointDialog(QDialog):
                              + (f"\n备注 {record.note}" if record.note else "")
                              + "\n\n选中这一行可以用右侧的按钮改或删")
             self.records_list.addItem(entry)
+            if keep is not None and record.index == keep:
+                restore = self.records_list.count() - 1
         self.records_list.blockSignals(False)
+        if restore is not None:
+            self.records_list.setCurrentRow(restore)
         self.records_list.scrollToBottom()
 
         self.records_title.setText(f"本次已打点（{self.recorder.count}）")
@@ -974,6 +984,11 @@ class PointEditDialog(QDialog):
                                     self.edit_note.text()):
             self._set_status(self.recorder.last_error or "更新失败", "danger")
             return
+        # 记录已改成功；目录还没出现时改动会暂存待补写，如实说一声而不是静默
+        if self.recorder.last_error:
+            self._set_status(f"已更新（{self.recorder.last_error}）", "warn")
+        else:
+            self._set_status("已更新", "ok")
         self.saved = True
         self.accept()
 
