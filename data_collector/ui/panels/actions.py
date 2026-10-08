@@ -377,6 +377,17 @@ class ActionsMixin:
         self.lb_disk_state.setObjectName("FactValue")
         row.addWidget(self.lb_disk_state)
 
+        # 只在「盘已挂载但缺标识文件」时出现（见 _probe_disk_mount）。
+        # 放在状态文案与「重新检测」之间：文案说清缺什么，按钮紧跟着就是解法。
+        self.btn_disk_mark = QPushButton("创建标识")
+        self.btn_disk_mark.setProperty("variant", "ghost-compact")
+        self.btn_disk_mark.setToolTip(
+            "在移动硬盘根目录创建一个空的标识文件，确认这块盘就是数据盘。\n"
+            "用于防止把数据写进插错的盘；该文件不含数据，可随时删除。")
+        self.btn_disk_mark.clicked.connect(self.on_create_volume_marker)
+        self.btn_disk_mark.setVisible(False)
+        row.addWidget(self.btn_disk_mark)
+
         self.btn_disk_recheck = QPushButton("重新检测")
         self.btn_disk_recheck.setProperty("variant", "ghost-compact")
         self.btn_disk_recheck.setToolTip("盘是后来才插上的时候点它")
@@ -468,6 +479,9 @@ class ActionsMixin:
             self.lb_disk_state.setText("请填写移动硬盘挂载点")
             theme.set_state(self.lb_disk_state, "warn")
             self.btn_disk_recheck.setVisible(False)
+            # 上一轮探测若显示过"创建标识"，这里必须一并收掉：
+            # 按钮是"针对某个具体挂载点"的出路，路径都空了它就没有指代对象。
+            self.btn_disk_mark.setVisible(False)
             return
 
         try:
@@ -487,18 +501,26 @@ class ActionsMixin:
             self.lb_disk_state.setText(f"探测失败：{exc}")
             theme.set_state(self.lb_disk_state, "warn")
             self.btn_disk_recheck.setVisible(True)
+            # 探测失败时不能提供"创建标识"——那等于在不知道盘状态时往盘上写东西
+            self.btn_disk_mark.setVisible(False)
             return
 
         if not path_exists:
             self.lb_disk_state.setText("✖ 该路径不存在。插上硬盘后点「重新检测」")
             theme.set_state(self.lb_disk_state, "warn")
+            self.btn_disk_mark.setVisible(False)
         elif not mounted:
             self.lb_disk_state.setText("✖ 该路径不是已挂载的设备目录（数据会写在本机磁盘上）")
             theme.set_state(self.lb_disk_state, "warn")
+            self.btn_disk_mark.setVisible(False)
         elif probe.require_volume_id and not has_marker:
             self.lb_disk_state.setText(
                 f"✖ 该盘不是数据盘（缺少标识文件 {probe.volume_marker_path()}）")
             theme.set_state(self.lb_disk_state, "warn")
+            # 现场第一次用时盘上必然没有这个文件。原来只有一句"请手动创建"，
+            # 而现场既不知道文件名对不对、也不确定写完要怎么确认，所以做成一个
+            # 按钮：点一下就建，然后立刻重测，状态当场变绿。
+            self.btn_disk_mark.setVisible(True)
         else:
             parts = ["✔ 盘已就绪"]
             if fs:
@@ -507,5 +529,77 @@ class ActionsMixin:
                 parts.append(f"可用 {free / 1024 ** 3:.1f}GB")
             self.lb_disk_state.setText(" · ".join(parts))
             theme.set_state(self.lb_disk_state, "ok")
+            self.btn_disk_mark.setVisible(False)
 
         self.btn_disk_recheck.setVisible(True)
+
+    def on_create_volume_marker(self) -> None:
+        """在移动硬盘根目录创建盘标识文件。
+
+        ## 为什么这道检查要保留，而不是直接放行
+
+        `volume_id_file`（默认 `.nerv_volume`）防的是**把数据写进错盘**：
+        现场桌上常有若干 U 盘 / 移动盘，工程师选错一个，这批数据就散在
+        一台没人认领的机器上，而当时不会有任何人察觉。缺标识就放行，
+        等于把这个唯一的确认环节关掉—— 代价远大于多点一次鼠标。
+
+        ## 为什么要再确认一次
+
+        这一次写入是**唯一一处程序主动往盘上写东西**的地方（其余都是写数据），
+        而它写的是盘根目录 —— 一个被用户当成"盘里没有我的东西"的地方。
+        所以确认框里必须出现完整路径：让用户看清"到底要动哪个盘的哪"，
+        而不是只问一句"确定吗"。
+
+        **写完立刻重测**（而不是提示"已创建，请点重新检测"）：让用户看到
+        状态从红变绿，闭环在自己眼前完成，不需要他判断"到底成功没有"。
+        """
+        from ...disk_export import DiskExportTarget      # 延迟导入，避免加载期耦合
+
+        mount = self.ed_disk_mount.text().strip()
+        settings = self.config.get_export_settings()
+        probe = DiskExportTarget(
+            mount_point=mount,
+            volume_id_file=settings.get("volume_id_file", ".nerv_volume"),
+            require_volume_id=bool(settings.get("require_volume_id")),
+        )
+        marker = probe.volume_marker_path()
+
+        # 前置校验放在**写入之前**逐条判，而不是让写操作去撞文件系统：
+        # 撞出来的错是 errno，现场看不懂，而这里每一条都能说清"为什么不行"。
+        if not mount or not probe.mount_point.exists():
+            QMessageBox.warning(self, "无法创建", f"路径不存在：{mount or '(空)'}")
+            return
+        if not probe.is_mounted():
+            QMessageBox.warning(
+                self, "无法创建",
+                f"{mount} 不是已挂载的设备目录。\n"
+                f"在普通目录里建标识文件没有意义——那说明硬盘根本没挂上，"
+                f"数据会写进本机磁盘。")
+            return
+        if marker and marker.exists():
+            self._probe_disk_mount()
+            return
+
+        answer = QMessageBox.question(
+            self, "确认创建盘标识",
+            f"将在移动硬盘根目录创建一个空文件：\n\n    {marker}\n\n"
+            f"用于确认「这块盘就是数据盘」，防止把数据写进插错的盘。\n"
+            f"该文件不含任何数据，可以随时删除。\n\n确认创建？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer != QMessageBox.Yes:
+            return
+
+        try:
+            marker.touch(exist_ok=True)
+        except OSError as exc:
+            # 不静默：这正是"盘是只读 / 已满 / 挂载掉线"三类问题的汇合点，
+            # 原文带上 errno 现场才能判断是换盘还是修权限。
+            QMessageBox.critical(
+                self, "创建失败",
+                f"无法创建标识文件：\n{marker}\n\n{exc}\n\n"
+                f"常见原因：盘已写满、挂载为只读、挂载点掉线。")
+            logger.warning(f"创建盘标识失败：{marker}（{exc}）")
+            return
+
+        self.append(f"已创建盘标识文件：{marker}")
+        self._probe_disk_mount()

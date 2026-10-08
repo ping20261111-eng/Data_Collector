@@ -50,9 +50,11 @@ class _Recorder:
         self.server_calls = []
 
     def as_disk(self, uploader, ok=True):
-        def _call(folder_path, remote_subpath="", progress_cb=None,
-                  progress_percent=None):
-            self.disk_calls.append((Path(folder_path), remote_subpath))
+        # 签名与生产代码保持一致（v6.4.1起 `_export_to_disk` **不收** remote_subpath：
+        # 磁盘落点恒为挂载点下的 bag 名目录）。若这里保留那个形参，
+        # 守卫就会接受一个已经不存在的参数 —— 有人把 subpath 加回去也照样绿。
+        def _call(folder_path, progress_cb=None, progress_percent=None):
+            self.disk_calls.append((Path(folder_path), None))
             if not ok:
                 uploader.last_error = "拔盘了"
                 uploader.last_code = ErrorCode.LOCAL_IO

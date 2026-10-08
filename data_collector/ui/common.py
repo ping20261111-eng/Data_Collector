@@ -6,6 +6,7 @@
 import os
 import re
 import subprocess
+from typing import Optional
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QCheckBox, QMessageBox, QTextEdit,
                              QGroupBox, QLabel, QDialog, QLineEdit, QComboBox,
@@ -38,6 +39,7 @@ __all__ = [
     "CHARGING_MARKERS",
     "LOW_BATTERY_CRITICAL_PERCENT",
     "LOW_BATTERY_PERCENT",
+    "REMOTE_TARGETS",
     "SP",
     "TELEOP_STARTUP_TIMEOUT_MS",
     "_as_float",
@@ -45,13 +47,20 @@ __all__ = [
     "_main_program_running",
     "_play_bag_folder",
     "_warn_if_main_program_running",
+    "describe_export_target",
     "ensure_remote_password",
     "FIELD_NAMES",
     "file_link",
     "lost_source_fields",
     "make_panel_head",
     "module_state_texts",
+    "remote_subpath_arg",
+    "resolve_upload_subpath",
 ]
+
+#: `resolve_upload_subpath` 的"没有远端"返回值。见该函数 docstring 的说明：
+#: 不能用 `""`，因为它在 server 侧是合法值（远端根目录）。
+_NO_REMOTE = "\x00no-remote"
 
 
 SP = theme.SPACING
@@ -131,6 +140,82 @@ def ensure_remote_password(uploader, parent=None) -> bool:
     if log:
         log("已记录本次会话的远端密码（仅内存，未写入磁盘）")
     return True
+
+
+#: 这些目标需要问远端密码。`disk` 不在其中——它一条SSH 都不建，
+#: 问密码是纯粹的骚扰（离线现场根本没有人知道服务器密码，却每次都要被问一次）。
+REMOTE_TARGETS = ("server", "both")
+
+
+def resolve_upload_subpath(uploader, parent=None) -> Optional[str]:
+    """上传前问清楚"传到哪儿"，返回远端子路径；返回 None 表示用户取消。
+
+    ## 为什么这道分流必须在界面层，而不能只靠逻辑层
+
+    `core_data.upload_bag_folder` 已经在按 `export_target` 分流了，但界面在
+    进入它**之前**还有两道远端专属的闸门：问密码、弹远端目录选择器。
+    `RemoteDirectoryDialog` 构造完就会去列远端目录 —— 离线现场连不上，
+    用户看到的是一个空对话框，选不了也退不出干净。**于是无论逻辑层分流
+    写得多对，disk 目标都走不到它。** 分流放在这里，是因为"要不要问远端"
+    这个问题本身就属于界面职责：它问的是"你在跟谁说话"。
+
+    ## 为什么用 sentinel 而不是简单的 subpath
+
+    `disk` 目标下**没有远端子路径**这个概念，而 `""` 在 server 侧是合法取值
+    （表示远端根目录）。用一个独一无二的 `_NO_REMOTE` 把它和"用户选了根目录"
+    分开，否则两个入口里都会写出`subpath or "(根目录)"` 这种在 disk 下
+    明显不对的话。`None` 保留给"用户取消"，与既有调用方语义一致。
+
+    ## 为什么要区分"取消"与"磁盘不可用"
+
+    现场真正会遇到的困难不是"路径写错"（那个由 `_probe_disk_mount` 在
+    输入时就报红），而是"路径对、盘也对，但少一个标识文件"。那属于
+    配置问题，应该在这里给一次**可直接照做的说明**，而不是弹密码框 ——
+    弹了密码框用户只会以为"要联网"，然后更困惑。
+    """
+    target = getattr(uploader, "_export_target", lambda: "server")()
+    log = getattr(parent, "append_log", None) or getattr(parent, "append", None)
+
+    if target not in REMOTE_TARGETS:
+        # `disk`：不联网、不问密码、不弹远端浏览器。子路径交回None，
+        # 磁盘侧会用自己的规则（挂载点下的 bag 名目录）决定落点。
+        if log:
+            log("导出目标为移动硬盘：本次不连接远端服务器，也不需要远端密码")
+        return _NO_REMOTE
+
+    if not ensure_remote_password(uploader, parent):
+        return None
+    # 惰性导入：`remote_browser` 在模块顶层 `from .common import schedule_once`，
+    # 顶层反向导入会成环。
+    from .remote_browser import RemoteDirectoryDialog
+
+    remote_dlg = RemoteDirectoryDialog(uploader, parent, select_mode=True)
+    if remote_dlg.exec_() != QDialog.Accepted:
+        return None
+    subpath = remote_dlg.get_selected_subpath()
+    if subpath is None:
+        return None
+    return subpath
+
+
+def remote_subpath_arg(subpath: Optional[str]) -> str:
+    """把 `resolve_upload_subpath` 的返回值转成能传给 uploader 的远端子路径。
+
+    sentinel（disk 目标）转成 `""`。对磁盘侧它会被完全忽略，磁盘侧按
+    bag 名建目录；对 `both` 目标它本来就该是远端选出来的那个子路径。
+    """
+    return "" if subpath == _NO_REMOTE else (subpath or "")
+
+
+def describe_export_target(uploader) -> str:
+    """给日志区用的一句话目标说明（导出目标不同，落点完全不同）。"""
+    target = getattr(uploader, "_export_target", lambda: "server")()
+    if target == "disk":
+        settings = uploader.config.get_export_settings() if uploader.config else {}
+        return f"移动硬盘 {settings.get('mount_point') or '(未填挂载点)'}"
+    if target == "both":
+        return "移动硬盘 + 远端服务器"
+    return f"远端服务器 {uploader.remote_user}@{uploader.remote_host}"
 
 
 TELEOP_STARTUP_TIMEOUT_MS = 90_000

@@ -8,7 +8,7 @@ import re
 import subprocess
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QCheckBox, QMessageBox, QTextEdit,
-                             QGroupBox, QLabel, QDialog, QLineEdit, QComboBox,
+                             QGroupBox, QLabel, QLineEdit, QComboBox,
                              QInputDialog, QListWidget, QListWidgetItem,
                              QAbstractItemView, QProgressBar, QFileDialog, QMenu,
                              QFrame, QSizePolicy, QApplication)
@@ -31,9 +31,9 @@ from ...core_data import RecorderManager, DataUploader, LogFetcher
 from ...core_data import UploadCancelledError
 
 from ..safety import guard_slot
-from ..common import (ensure_remote_password)
+from ..common import (describe_export_target, remote_subpath_arg,
+                      resolve_upload_subpath)
 from ..threads import (UploadThread, FetchLogThread)
-from ..remote_browser import (RemoteDirectoryDialog)
 
 
 
@@ -54,17 +54,13 @@ class UploadMixin:
         if hasattr(self, 'upload_in_progress') and self.upload_in_progress:
             self.on_cancel_upload()
             return
-        # 远端密码只在本次会话里问一次；用户取消就直接不进入上传流程
-        if not ensure_remote_password(self.uploader, self):
-            self.append("已取消上传：未提供远端密码")
-            return
-        remote_dlg = RemoteDirectoryDialog(self.uploader, self, select_mode=True)
-        if remote_dlg.exec_() != QDialog.Accepted:
-            return
-        subpath = remote_dlg.get_selected_subpath()
+        # 传到哪儿由导出目标决定（server/both 才问密码并选远端目录；
+        # disk 一条 SSH 都不建）。返回 None=用户取消，直接中止。
+        subpath = resolve_upload_subpath(self.uploader, self)
         if subpath is None:
+            self.append("已取消上传")
             return
-        self.append(f"开始上传数据，远程子路径: {subpath or '(根目录)'}")
+        self.append(f"开始导出数据，目标：{describe_export_target(self.uploader)}")
         self.btn_upload.setEnabled(True)
         self.btn_upload.setText("取消上传")
         theme.set_variant(self.btn_upload, "danger")
@@ -80,7 +76,8 @@ class UploadMixin:
 
         self.upload_thread = UploadThread(
             self.uploader,
-            lambda **kw: self.uploader.upload_latest_bag(subpath, **kw),
+            lambda **kw: self.uploader.upload_latest_bag(
+                remote_subpath_arg(subpath), **kw),
             progress_msg)
         self.upload_thread.progress_signal.connect(self.update_upload_progress)
         self.upload_thread.finished.connect(self.on_upload_finished)

@@ -914,13 +914,27 @@ class DataUploader:
             warn_file_bytes=int(settings.get("warn_file_bytes", 3_800_000_000)),
         )
 
-    def _export_to_disk(self, folder_path: Path, remote_subpath: str = "",
+    def _export_to_disk(self, folder_path: Path,
                         progress_cb=None, progress_percent=None) -> bool:
         """把一次采集的数据写到本地挂载的移动硬盘。
 
         与远端路径的差异是**刻意的**（见 `disk_export` 的模块说明）：不建 SSH、
         不断点续传、不算远端空间。打包器共用 `_pack_folder`——它接受任意文件对象，
         所以"边打包边写盘"不需要第二套实现。
+
+        ## 落点为什么不用远端子路径
+
+        落点恒为 `挂载点/<bag 名>/<bag 名>.zip`。早先这里接收 `remote_subpath`，
+        那是**远端目录树的相对路径**，语义是"在服务器的哪个任务目录下"。
+        把它套到移动硬盘上有两个具体的坏处：
+
+        1. 现场看到的是 `移动硬盘/robot/linen/2026-10-08/xxx.zip` 这种层级，
+           要靠猜才知道哪一层是自己要的；拔盘交给别人时更没人认得。
+        2. **它让 disk 目标无法离线**。那个子路径原本来自远端目录选择器，
+           而选择器要连 SFTP 才能列出目录 —— 于是"只写硬盘"这件事在
+           实现上仍然依赖远端可用。参数去掉，这条依赖才真的断掉。
+
+        每次采集一个 bag 名子目录，天然不会互相覆盖。
         """
         self.upload_cancelled = False
         self.last_error = ""
@@ -948,13 +962,19 @@ class DataUploader:
 
         archive_name = self._archive_name(folder)
         est_size = self._estimate_archive_size(total_size, len(entries), self.transfer_format)
-        subpath = remote_subpath or folder.name
+        # 落点恒为挂载点下的 bag 名目录（理由见方法 docstring）
+        subpath = folder.name
 
         # ---------- 导出前四道检查，按序执行 ----------
         # 顺序不是随手排的：前一道是"这个盘能不能用"，后一道才是"这批数据放不放得下"。
         # 反过来先报"空间不足"，而盘根本没挂载的话，这个提示会指向错误的方向。
+        #
+        # `prepare` 的返回值直接留用，**不要在写入前再调一次**：它内部会重跑
+        # `check_volume`（挂载点 → 盘标识）。调第二次不只是白跑一遍—— 若盘恰好在
+        # 两次之间被拔，第二次会报"创建目录时断开"，而目录其实第一次就建好了，
+        # 现场会照着这个提示去查一个已经过去的故障。
         try:
-            disk.prepare(subpath, total_bytes=est_size)      # ① 挂载点 ② 盘标识 ③ 空间
+            target_dir = disk.prepare(subpath, total_bytes=est_size)   # ① 挂载点 ② 盘标识 ③ 空间
         except AppError as exc:
             return self._fail(exc.code, exc.message)
 
@@ -1004,7 +1024,6 @@ class DataUploader:
             )
 
         try:
-            target_dir = disk.prepare(subpath)
             disk.write_stream(
                 target_dir, archive_name, producer,
                 progress_cb=progress_cb, progress_percent=progress_percent,
@@ -1161,12 +1180,11 @@ class DataUploader:
         target = self._export_target()
         if target in ("disk", "both"):
             if target == "disk":
-                return self._export_to_disk(folder_path, remote_subpath,
-                                            progress_cb, progress_percent)
+                # 不传 remote_subpath：磁盘侧落点由自己的规则决定（挂载点下的 bag 名目录）
+                return self._export_to_disk(folder_path, progress_cb, progress_percent)
             # both：先磁盘后服务器。顺序理由是磁盘侧是"把数据带走"的最后一环，
             # 现场最关心的就是它；先做它可以在网络异常时仍拿到本地副本。
-            disk_ok = self._export_to_disk(folder_path, remote_subpath,
-                                           progress_cb, progress_percent)
+            disk_ok = self._export_to_disk(folder_path, progress_cb, progress_percent)
             if not disk_ok:
                 return False
             return self._upload_bag_folder_to_server(

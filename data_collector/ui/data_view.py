@@ -28,7 +28,9 @@ from ..core_data import RecorderManager, DataUploader, LogFetcher
 from ..core_data import UploadCancelledError
 
 
-from .common import (SP, ensure_remote_password, make_panel_head, _warn_if_main_program_running, _play_bag_folder)
+from .common import (SP, describe_export_target, ensure_remote_password,
+                    make_panel_head, remote_subpath_arg, resolve_upload_subpath,
+                    _warn_if_main_program_running, _play_bag_folder)
 from .threads import (UploadThread, LocalTaskThread)
 from .remote_browser import (RemoteDirectoryDialog)
 
@@ -350,15 +352,12 @@ class DataViewDialog(QDialog):
         folder_path = self._get_selected_bag()
         if not folder_path:
             return
-        if not ensure_remote_password(self.uploader, self):
-            self.append_log("已取消上传：未提供远端密码")
-            return
-        remote_dlg = RemoteDirectoryDialog(self.uploader, self, select_mode=True)
-        if remote_dlg.exec_() != QDialog.Accepted:
-            return
-        subpath = remote_dlg.get_selected_subpath()
+        # 与「上传数据」按钮走同一个分流点：disk 目标不问密码、不连远端
+        subpath = resolve_upload_subpath(self.uploader, self)
         if subpath is None:
+            self.append_log("已取消上传")
             return
+        self.append_log(f"开始导出数据，目标：{describe_export_target(self.uploader)}")
 
         # --- 新增：显示父窗口的进度控件 ---
         if self.parent() and hasattr(self.parent(), 'show_upload_progress'):
@@ -379,7 +378,8 @@ class DataViewDialog(QDialog):
 
         self.upload_thread = UploadThread(
             self.uploader,
-            lambda **kw: self.uploader.upload_specific_bag(folder_path, subpath, **kw),
+            lambda **kw: self.uploader.upload_specific_bag(
+                folder_path, remote_subpath_arg(subpath), **kw),
             progress_msg)
         if self.parent() and hasattr(self.parent(), "update_upload_progress"):
             self.upload_thread.progress_signal.connect(self.parent().update_upload_progress)

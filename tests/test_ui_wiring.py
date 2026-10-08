@@ -653,6 +653,108 @@ def test_an_unmounted_path_is_flagged_right_away(status_env):
     assert win.btn_disk_recheck.isVisibleTo(win) is True, "要能重新检测（盘可能是后来插上的）"
 
 
+def test_missing_volume_marker_offers_a_one_click_fix(status_env, monkeypatch, tmp_path):
+    """缺盘标识时给出**可点的出路**，而不是只甩一句"请手动创建"。
+
+    现场第一次用移动硬盘时盘上必然没有这个文件，原来那句提示等于让人
+    去猜文件名、再去猜怎么确认写成功了。按钮点完立刻重测，状态当场变绿。
+    """
+    win, cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+
+    mount = tmp_path / "disk"
+    mount.mkdir()
+    # 探测只需要"是个目录"，不要求真是挂载点 —— 那是点击时的校验
+    monkeypatch.setattr("data_collector.disk_export.DiskExportTarget.is_mounted",
+                        lambda self: True)
+    monkeypatch.setattr("data_collector.disk_export.DiskExportTarget.filesystem_type",
+                        lambda self: "exfat")
+    win.ed_disk_mount.setText(str(mount))
+    win.on_disk_mount_edited()
+
+    assert "标识文件" in win.lb_disk_state.text()
+    assert win.btn_disk_mark.isVisibleTo(win) is True, "缺标识时要给出路"
+
+
+def test_creating_the_marker_flips_the_state_to_ready(status_env, monkeypatch, tmp_path):
+    """点「创建标识」→ 文件真的建出来 + 状态当场变绿（闭环在用户眼前完成）。"""
+    from PyQt5.QtWidgets import QMessageBox
+
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+
+    mount = tmp_path / "disk"
+    mount.mkdir()
+    monkeypatch.setattr("data_collector.disk_export.DiskExportTarget.is_mounted",
+                        lambda self: True)
+    monkeypatch.setattr("data_collector.disk_export.DiskExportTarget.filesystem_type",
+                        lambda self: "exfat")
+    monkeypatch.setattr(QMessageBox, "question", staticmethod(lambda *a, **k: QMessageBox.Yes))
+
+    win.ed_disk_mount.setText(str(mount))
+    win.on_disk_mount_edited()
+    win.on_create_volume_marker()
+
+    assert (mount / ".nerv_volume").exists(), "标识文件没建出来"
+    assert "盘已就绪" in win.lb_disk_state.text(), \
+        f"建完没有当场变绿：{win.lb_disk_state.text()}"
+    assert win.btn_disk_mark.isVisibleTo(win) is False, "就绪后不该还摆着出路按钮"
+
+
+def test_creating_the_marker_is_refused_on_an_unmounted_path(status_env, monkeypatch, tmp_path):
+    """普通目录（不是挂载点）**不许**建标识。
+
+    在这里放行等于亲手拆掉防插错盘那道检查：数据会落进本机磁盘，
+    而盘上没有标识文件说明"这个位置从未被确认过"。
+    """
+    from PyQt5.QtWidgets import QMessageBox
+
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+
+    plain = tmp_path / "just-a-dir"
+    plain.mkdir()
+    # 探测时假装是盘，好让流程先走到"缺标识"这一步、按钮露出来；
+    # 随后的点击必须按**真实**判断拒绝它 —— 那才是这个用例要考的东西。
+    monkeypatch.setattr("data_collector.disk_export.DiskExportTarget.is_mounted",
+                        lambda self: True)
+    monkeypatch.setattr("data_collector.disk_export.DiskExportTarget.filesystem_type",
+                        lambda self: "ext4")
+    win.ed_disk_mount.setText(str(plain))
+    win.on_disk_mount_edited()
+    assert win.btn_disk_mark.isVisibleTo(win) is True, "前置不成立：按钮没出现"
+
+    # 恢复真实的挂载点判断：tmp_path 下的普通目录不是挂载点
+    monkeypatch.undo()      # ← 关键：撤掉上面那两个"假装就绪"的 patch
+    monkeypatch.setattr("data_collector.disk_export.DiskExportTarget.filesystem_type",
+                        lambda self: "ext4")
+
+    warned = []
+    monkeypatch.setattr(QMessageBox, "warning",
+                        staticmethod(lambda *a, **k: warned.append(a[2] if len(a) > 2 else "")))
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.Yes))
+
+    win.on_create_volume_marker()
+
+    assert not (plain / ".nerv_volume").exists(), "不该在普通目录里建标识"
+    assert warned, "拒绝时必须给出原因，不能静默"
+
+
+def test_the_fix_button_disappears_when_the_path_is_emptied(status_env):
+    """路径清空后按钮要跟着收掉 —— 它是"针对某个挂载点"的出路。"""
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.ed_disk_mount.setText("/media/x")
+    win.on_disk_mount_edited()
+    win.btn_disk_mark.setVisible(True)
+
+    win.ed_disk_mount.setText("")
+    win.on_disk_mount_edited()
+
+    assert win.btn_disk_mark.isVisibleTo(win) is False
+
+
 def test_going_back_to_server_hides_the_row_but_keeps_the_path(status_env):
     """切回服务器：行收起来，但**已填的挂载点要留着** —— 下次切回来不用重填。"""
     win, cm, _status = status_env
