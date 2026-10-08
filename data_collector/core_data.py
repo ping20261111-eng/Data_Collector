@@ -7,6 +7,7 @@ import tempfile
 import time
 import zipfile
 import hashlib
+from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Callable, Tuple
 
@@ -243,6 +244,12 @@ class RecorderManager:
             self.last_code = ErrorCode.NOT_FOUND
             self.last_error = "已有录制任务正在进行"
             return False
+        # 上一次录制若已自行退出（脚本秒退、被外部杀掉、机器重启残留），current_proc
+        # 里还留着那个**已死的** Popen。不先收干净就开新的一次，会把上一次的
+        # _started_at / _manifest_dir 带过来：录制起点的基准时间被污染成旧值，
+        # manifest 也会写到上一个 bag 目录里 —— 现场表现就是"第二次录不停"
+        # （stop 时按旧 manifest 收尾，界面状态与实际进程对不上）。
+        self._reap_dead_proc("启动新录制前")
         try:
             self.current_proc = self.launcher.launch_record(
                 script_type, name, desc, label, action_id
@@ -271,6 +278,40 @@ class RecorderManager:
         self.last_error = ""
         self._started_at = time.time()
         self._begin_manifest(name, desc, script_type)
+        return True
+
+    def _reap_dead_proc(self, why: str = "") -> bool:
+        """回收**已经退出**的录制进程句柄，并清掉本次录制的残留状态。
+
+        为什么必须做：`current_proc` 是一个 Popen 引用，脚本自行退出后它并不会
+        消失，只是 `poll()` 开始返回退出码。不清的后果有三处一起坏：
+
+        1. `is_active()` 靠 `poll() is None` 判断，看起来没问题；但 `_started_at`
+           还停在上一次录制的中点，下一次 `health()` 会拿它当"何时算新数据"的
+           基准 —— 旧基线比新录制早，于是**每个文件都算"新数据"**，
+           看门狗形同虚设，"进程活着但没落盘"这种事故再也拦不住。
+        2. `_manifest_dir` 指向上一次的 bag 目录，第二次录制的 manifest 会写错地方。
+        3. 进程注册表里挂着这个死进程的 Popen，`terminate()` 的兜底逻辑会对一个
+           已经结束的 pid 发信号，日志里出现看不懂的报错。
+
+        返回是否真的回收了东西（便于测试与日志）。
+        """
+        proc = self.current_proc
+        if proc is None or proc.poll() is None:
+            return False
+        code = proc.poll()
+        logger.info(f"回收已退出的录制进程（PID={getattr(proc, 'pid', '?')} "
+                    f"退出码={code}）{('：' + why) if why else ''}")
+        # 从注册表里摘掉，别让后续的按名终止/巡检一直看见它
+        pm = getattr(self.launcher, "pm", None)
+        if pm is not None:
+            try:
+                pm.unregister(proc)
+            except Exception as exc:                    # noqa: BLE001
+                logger.debug(f"从进程注册表摘除录制进程失败（可忽略）：{exc}")
+        self.current_proc = None
+        self._started_at = None
+        self._manifest_dir = None
         return True
 
     # ---------- manifest（录制连续性） ----------
@@ -342,13 +383,29 @@ class RecorderManager:
             return None
 
     def stop(self) -> bool:
+        """停止录制。返回是否**真的**停掉了一个正在跑的录制。
+
+        进程已经自行退出时也要把状态收干净：否则 `_started_at` 与 `_manifest_dir`
+        会一直挂着上一场的值，下一次录制把它们当成自己的基线（见 `_reap_dead_proc`）。
+        这里返回 False 是如实汇报"没有可停的录制"，界面据此提示即可。
+        """
         if self.current_proc and self.current_proc.poll() is None:
             from .core import terminate
-            terminate(self.current_proc)
+            proc = self.current_proc
+            terminate(proc)
+            pm = getattr(self.launcher, "pm", None)
+            if pm is not None:
+                try:
+                    pm.unregister(proc)
+                except Exception as exc:                # noqa: BLE001
+                    logger.debug(f"从进程注册表摘除录制进程失败（可忽略）：{exc}")
             self.current_proc = None
             self.finalize_manifest()
             self._started_at = None
+            self._manifest_dir = None
             return True
+        # 走到这里说明没有活着的录制：若有残留句柄一并回收，避免污染下一次
+        self._reap_dead_proc("停止时发现进程已退出")
         return False
 
     def is_active(self) -> bool:
@@ -924,9 +981,9 @@ class DataUploader:
 
         ## 落点为什么不用远端子路径
 
-        落点恒为 `挂载点/<bag 名>/<bag 名>.zip`。早先这里接收 `remote_subpath`，
-        那是**远端目录树的相对路径**，语义是"在服务器的哪个任务目录下"。
-        把它套到移动硬盘上有两个具体的坏处：
+        落点是 `挂载点/<序列号>/<采集日期>/<bag 名>/<bag 名>.zip`。早先这里
+        接收 `remote_subpath`，那是**远端目录树的相对路径**，语义是
+        "在服务器的哪个任务目录下"。把它套到移动硬盘上有两个具体的坏处：
 
         1. 现场看到的是 `移动硬盘/robot/linen/2026-10-08/xxx.zip` 这种层级，
            要靠猜才知道哪一层是自己要的；拔盘交给别人时更没人认得。
@@ -934,7 +991,8 @@ class DataUploader:
            而选择器要连 SFTP 才能列出目录 —— 于是"只写硬盘"这件事在
            实现上仍然依赖远端可用。参数去掉，这条依赖才真的断掉。
 
-        每次采集一个 bag 名子目录，天然不会互相覆盖。
+        序列号那一层是 v6.4.3 加的：**同一块盘会被多台机器轮着插**，
+        不分层的话两台机器的数据混在一根目录里，盘上看不出来。
         """
         self.upload_cancelled = False
         self.last_error = ""
@@ -962,8 +1020,8 @@ class DataUploader:
 
         archive_name = self._archive_name(folder)
         est_size = self._estimate_archive_size(total_size, len(entries), self.transfer_format)
-        # 落点恒为挂载点下的 bag 名目录（理由见方法 docstring）
-        subpath = folder.name
+        # 落点：挂载点/<序列号>/<采集日期>/<bag 名>/（理由见 `_disk_subpath`）
+        subpath = f"{self._disk_subpath(folder)}/{folder.name}"
 
         # ---------- 导出前四道检查，按序执行 ----------
         # 顺序不是随手排的：前一道是"这个盘能不能用"，后一道才是"这批数据放不放得下"。
@@ -990,7 +1048,10 @@ class DataUploader:
             if progress_cb:
                 progress_cb(message)
         if progress_cb:
-            progress_cb(f"目标：移动硬盘 {disk.mount_point}（{disk.filesystem_type() or '文件系统未知'}）")
+            progress_cb(
+                f"目标：移动硬盘 {disk.mount_point}"
+                f"（{disk.filesystem_type() or '文件系统未知'}）\n"
+                f"保存位置：{disk.mount_point}/{subpath}/")
 
         def running() -> bool:
             return not self.upload_cancelled
@@ -1027,6 +1088,9 @@ class DataUploader:
             disk.write_stream(
                 target_dir, archive_name, producer,
                 progress_cb=progress_cb, progress_percent=progress_percent,
+                # **必须传总量**：`write_stream` 要用它把已写字节换算成百分比。
+                # 不传的话它只发文字进度、不发百分比（发一个错的数字比不发更糟）。
+                total_bytes=est_size,
             )
         except AppError as exc:
             # 拔盘/空间/IO 都已是带码异常，原样保留码，界面才能给对建议
@@ -1037,6 +1101,11 @@ class DataUploader:
         if self.verify_content:
             try:
                 written = target_dir / archive_name
+                # 校验要**把刚写完的归档整个再读一遍**（几 GB 的盘就是几秒），
+                # 而进度条此刻已经是 100%。不说的话，现场看到的就是
+                # "满格了但程序还在动"—— 与其让那几秒显得像卡住，不如如实讲。
+                if progress_cb:
+                    progress_cb("正在校验内容（读取归档文件计算 SHA-256）")
                 write_sha256_sidecar(written, sha256_file(written))
             except OSError as exc:
                 # 边车文件写不出来不算导出失败：数据已经在盘上且已验过内容
@@ -1044,13 +1113,78 @@ class DataUploader:
 
         logger.info(f"已导出到移动硬盘：{target_dir / archive_name}")
         if progress_cb:
-            progress_cb(f"已导出到移动硬盘：{archive_name}")
+            # 日志里给**完整落点层级**，而不是只有文件名 ——
+            # 盘插满几十台机器的数据时，"在哪个目录下"才是现场要找的东西。
+            progress_cb(f"已导出到移动硬盘：{subpath}/{archive_name}")
         return True
 
     # ---------- 打包 + 上传（统一入口） ----------
     def _archive_name(self, folder: Path) -> str:
         suffix = "tar" if self.transfer_format == "tar" else "zip"
         return f"{folder.name}.{suffix}"
+
+    # ---------- 磁盘落点分层（挂载点 / 序列号 / 日期 / bag 名） ----------
+
+    #: 读不到序列号时用它占位。**刻意不静默扁平**：
+    #: 扁平（直接写挂载点根）会让"两台机器的数据混在一根目录"这件事
+    #: 在盘上完全看不出来 —— 而这个盘本来就是多台机器轮着插的。
+    #: 一个显眼的 `unknown-serial` 让这件事在盘上一眼可见。
+    UNKNOWN_SERIAL_DIR = "unknown-serial"
+
+    def _serial_number(self) -> str:
+        """本机序列号（`Product.json` 的 `serial_number`）；读不到用占位名。
+
+        读的是顶栏「序列号」那同一个字段（`ConfigManager.get_product_info`）——
+        顶栏显示什么，落点目录名就是什么，不出现"界面一个样、目录另一个样"。
+        """
+        if self.config is None:
+            return self.UNKNOWN_SERIAL_DIR
+        try:
+            raw = str(self.config.get_product_info().get("serial_number") or "").strip()
+        except Exception as exc:               # 配置层异常不该让导出整体失败
+            logger.warning(f"读取序列号失败，用占位目录名：{exc}")
+            return self.UNKNOWN_SERIAL_DIR
+        return self._safe_dir_name(raw) or self.UNKNOWN_SERIAL_DIR
+
+    @staticmethod
+    def _safe_dir_name(raw: str) -> str:
+        """把序列号变成一个安全的单层目录名。
+
+        序列号要被拼进文件系统路径，所以必须挡住分隔符与相对路径：
+        读到 `../../etc` 这种值时，**拼路径这一步就该失败**，
+        而不是把文件写到挂载点外面去。
+        """
+        cleaned = "".join(ch for ch in raw if ch.isalnum() or ch in "-_")
+        return cleaned.strip("-_")
+
+    @staticmethod
+    def _capture_date(folder: Path) -> str:
+        """采集日期（`YYYY-MM-DD`），取 bag 目录的 mtime。
+
+        ## 为什么用 mtime 而不是"今天"
+
+        现场有一件很平常的事：**今天导出昨天甚至上周录的数据**。
+        按导出日期分层，那批数据会被归进今天 —— 而盘上那天可能有当天的
+        正常采集，两批不同的数据混进同一个目录，现场谁也分不出来。
+
+        mtime 是"这份数据什么时候产生的"，用它分层，
+        "盘上按日期分目录"才真的等于"按采集日期分目录"。
+        补录/重传同一批数据也自然落到同一天，便于核对。
+        """
+        try:
+            stamp = datetime.fromtimestamp(folder.stat().st_mtime)
+        except OSError as exc:
+            logger.warning(f"读取 bag 目录时间失败，按当天分层：{exc}")
+            stamp = datetime.now()
+        return stamp.strftime("%Y-%m-%d")
+
+    def _disk_subpath(self, folder: Path) -> str:
+        """磁盘落点（相对挂载点）：`<序列号>/<YYYY-MM-DD>/`。
+
+        每个采集 bag 一个目录的安排保留在 `prepare` 里（`subpath` 再拼 bag 名），
+        所以同一天多次采集不会互相覆盖。
+        """
+        return f"{self._serial_number()}/{self._capture_date(folder)}"
 
     def _remote_target(self, archive_name: str, remote_subpath: str = "") -> tuple:
         remote_dir = self.remote_base + (f"/{remote_subpath}" if remote_subpath else "")

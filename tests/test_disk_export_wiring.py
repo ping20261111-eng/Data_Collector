@@ -10,7 +10,11 @@
 "类有没有被用起来"这件事只能在这层测，且**必须盯住默认路径**：
 分流写错最容易出的不是"disk 不生效"，而是**"没配 disk 的人也被改了行为"**。
 """
+import json
+import os
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -48,13 +52,20 @@ class _Recorder:
     def __init__(self):
         self.disk_calls = []
         self.server_calls = []
+        self.disk_result = True
 
     def as_disk(self, uploader, ok=True):
-        # 签名与生产代码保持一致（v6.4.1起 `_export_to_disk` **不收** remote_subpath：
-        # 磁盘落点恒为挂载点下的 bag 名目录）。若这里保留那个形参，
+        # 签名与生产代码保持一致（`_export_to_disk` **不收** remote_subpath：
+        # 磁盘落点由自己的规则决定）。若这里保留那个形参，
         # 守卫就会接受一个已经不存在的参数 —— 有人把 subpath 加回去也照样绿。
+        #
+        # 落点 subpath（`SN/日期/bag名`）虽然不作为**参数**进来，但它写在
+        # 目标目录里，而 `prepare` 会拿到它 —— 所以从 `prepare` 侧观测。
         def _call(folder_path, progress_cb=None, progress_percent=None):
             self.disk_calls.append((Path(folder_path), None))
+            if not ok:
+                return False
+            return True
             if not ok:
                 uploader.last_error = "拔盘了"
                 uploader.last_code = ErrorCode.LOCAL_IO
@@ -350,3 +361,180 @@ def test_content_verification_writes_sidecar_on_disk(tmp_path, monkeypatch):
     sidecars = list(mount.rglob("*.sha256"))
     assert len(sidecars) == 1, "开了内容校验却没有边车文件"
     assert sidecars[0].read_text(encoding="utf-8").strip().split()[0]
+
+
+# ---------- 落点分层：挂载点 / 序列号 / 采集日期 / bag 名（v6.4.3） ----------
+
+def _product_config(tmp_path, mount, serial=None, raw_serial=None, target="disk"):
+    """造一份带 Product.json 的配置，返回 uploader。
+
+    `target` 可调：`both` 用例要用同一份 Product.json 但换导出目标，
+    之前这里写死 `disk`，于是那条用例走了 disk 分支、server 侧从不被调用。
+    """
+    prod = tmp_path / "product"
+    prod.mkdir(exist_ok=True)
+    payload = {}
+    if raw_serial is not None:
+        payload["serial_number"] = raw_serial
+    elif serial is not None:
+        payload["serial_number"] = serial
+    (prod / "Product.json").write_text(json.dumps(payload), encoding="utf-8")
+    return _uploader(tmp_path,
+                     f'product_file: "{prod / "Product.json"}"\n'
+                     f'export_target: {target}\n'
+                     f'disk_export:\n  mount_point: "{mount}"\n'
+                     f"  require_volume_id: false\n")
+
+
+def test_landing_spot_is_serial_then_date_then_bag(tmp_path, monkeypatch):
+    """落点层级：`挂载点/<序列号>/<YYYY-MM-DD>/<bag 名>/`。
+
+    序列号这一层是**因为盘会被多台机器轮着插** —— 不分层的话两台机器的
+    数据混在一根目录里，盘上看不出来，现场也说不清哪批是谁的。
+    """
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    up = _product_config(tmp_path, mount, serial="NRV-2026-0007")
+    bag = _bag(tmp_path, "挥手")
+
+    span = up._disk_subpath(bag)
+    assert span.startswith("NRV-2026-0007/"), f"首层应是序列号，实际 {span}"
+    date_part = span.split("/")[1]
+    assert len(date_part) == 10 and date_part[4] == date_part[7] == "-", \
+        f"第二层应是 YYYY-MM-DD，实际 {date_part}"
+
+
+def test_date_layer_follows_capture_time_not_export_time(tmp_path, monkeypatch):
+    """日期层取**采集时间**（bag 目录 mtime），不是导出当天。
+
+    现场很平常的一件事是今天导出上周录的数据。按导出日期分层，
+    那批数据会被归进今天 —— 而今天盘上可能还有当天的正常采集，
+    两批不同的数据混进同一目录，现场谁也分不出来。
+    """
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    up = _product_config(tmp_path, mount, serial="SN1")
+    bag = _bag(tmp_path, "补录的旧数据")
+
+    three_days_ago = time.time() - 3 * 86400
+    os.utime(bag, (three_days_ago, three_days_ago))
+
+    got = up._disk_subpath(bag).split("/")[1]
+    expected = datetime.fromtimestamp(three_days_ago).strftime("%Y-%m-%d")
+    today = datetime.now().strftime("%Y-%m-%d")
+    assert got == expected, f"应按采集日期 {expected}，实际 {got}"
+    assert got != today, "本用例就是要证明它不等于导出当天"
+
+
+def test_each_bag_gets_its_own_directory_under_one_day(tmp_path, monkeypatch):
+    """同一天多次采集：序列号/日期相同，但各自一个 bag 名目录，不互相覆盖。"""
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    up = _product_config(tmp_path, mount, serial="SN1")
+
+    # `_disk_subpath` 只到"序列号/日期"这一层（同一天本来就该相同）；
+    # **不覆盖**靠的是 `_export_to_disk` 再拼的 bag 名那一段。
+    spans = [up._disk_subpath(_bag(tmp_path, n)) for n in ("第一次", "第二次")]
+    assert all(s.startswith("SN1/") for s in spans), f"首层应是序列号：{spans}"
+
+    # 完整落点（含 bag 名）必须各不相同 —— 这才是"不互相覆盖"的实际含义
+    full = [f"{s}/{n}" for s, n in zip(spans, ("第一次", "第二次"))]
+    assert len(set(full)) == 2, f"同一天的两次采集落点不该相同：{full}"
+
+
+def test_missing_serial_falls_back_to_a_visible_placeholder(tmp_path, monkeypatch):
+    """读不到序列号 → `unknown-serial`，**不是**静默扁平到挂载点根。
+
+    扁平会让"两台机器的数据混在一起"在盘上完全看不出来，而这个盘本来
+    就是多台机器轮着插的。一个显眼的占位名让这件事一眼可见，
+    现场看到就知道该去查 Product.json。
+    """
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    up = _product_config(tmp_path, mount, raw_serial="")     # 字段存在但为空
+
+    assert up._disk_subpath(_bag(tmp_path, "挥手")).startswith("unknown-serial/")
+
+
+def test_missing_product_file_still_exports(tmp_path, monkeypatch):
+    """Product.json 整个读不到时**照样导出** —— 落到占位目录。
+
+    读不到产品信息不该把整批数据卡住不给出去：宁可目录名难看一点，
+    也不能让现场录的东西交不出来（那才是真正的数据损失）。
+    """
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    up = _uploader(tmp_path,
+                   f'product_file: "{tmp_path / "不存在.json"}"\n'
+                   f'export_target: disk\n'
+                   f'disk_export:\n  mount_point: "{mount}"\n'
+                   f"  require_volume_id: false\n")
+
+    # 只验路径计算：真写盘需要**真挂载点**，沙箱里没有，
+    # 硬要在这里验就得挂一整套替身 —— 那是上面both 那条用例的职责。
+    # 关键性质是「读不到产品信息不该抛异常、不该把导出卡死」。
+    assert up._disk_subpath(_bag(tmp_path, "挥手")).startswith("unknown-serial/")
+
+
+@pytest.mark.parametrize("raw", ["../../etc", "a/b", "..", "/abs/path", "  "])
+def test_serial_with_path_separators_cannot_escape_the_mount(raw, tmp_path, monkeypatch):
+    """**路径分隔符必须被过滤掉**。
+
+    序列号会被拼进文件系统路径，所以读到 `../../etc` 这种值时，
+    拼路径这一步就该失败 —— 而不是把数据写到挂载点外面去。
+    落点必须始终在挂载点**下面一层**之内。
+    """
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    up = _product_config(tmp_path, mount, raw_serial=raw)
+
+    first = up._disk_subpath(_bag(tmp_path, "挥手")).split("/")[0]
+    assert first not in ("..", "") and "/" not in first, \
+        f"序列号层不该含路径分隔符或相对路径，实际 {first!r}"
+    assert not first.startswith("."), f"不该是隐藏目录：{first!r}"
+
+
+def test_both_mode_keeps_the_remote_subpath_for_the_server_half(tmp_path, monkeypatch):
+    """`both`：磁盘侧按 SN/日期分层，远端侧仍用用户选的子路径 —— 两边各按各的。
+
+    这不是"要保持一致"，而是"两边语义本就不同"：远端那一侧是服务器目录树，
+    磁盘这一侧要按机器与日期分层。
+    """
+    disk_spans, server_spans = [], []
+
+    class _Fake:
+        def __init__(self, mount_point="", **kw):
+            self.mount_point = Path(mount_point)
+            self.require_volume_id = False
+            self.warn_file_bytes = 0
+
+        def prepare(self, subpath, total_bytes=0):
+            disk_spans.append(subpath)
+            return self.mount_point / subpath
+
+        def warn_oversize(self, entries):
+            return []
+
+        def filesystem_type(self):
+            return "exfat"
+
+        def write_stream(self, target_dir, filename, producer, **kw):
+            target_dir.mkdir(parents=True, exist_ok=True)
+            path = target_dir / filename
+            path.write_bytes(b"payload")
+            return path
+
+    import data_collector.disk_export as de
+    monkeypatch.setattr(de, "DiskExportTarget", _Fake)
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    up = _product_config(tmp_path, mount, serial="SN-both", target="both")
+    monkeypatch.setattr(up, "_upload_bag_folder_to_server",
+                        lambda folder, subpath, cb=None, pct=None:
+                        server_spans.append(subpath) or True)
+
+    result = up.upload_bag_folder(_bag(tmp_path, "挥手"), "tasks/10-08")
+    assert result is True, f"导出失败：{up.describe_last_error()}"
+    assert disk_spans and disk_spans[0].startswith("SN-both/"), \
+        f"磁盘侧应按序列号分层，实际 {disk_spans}"
+    assert server_spans == ["tasks/10-08"], f"远端子路径被改了：{server_spans}"

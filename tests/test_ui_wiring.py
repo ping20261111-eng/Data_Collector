@@ -5931,3 +5931,67 @@ def test_posture_ensure_trunk_mode_asks_first_and_reports(status_env, tmp_path, 
     assert dialog._teleop_runs_seen == win.teleop_runs
     dialog.refresh()
     assert dialog.mode_row.isVisibleTo(dialog) is False        # 提示消失
+
+
+def test_viewing_data_never_asks_for_a_remote_password(ui_env, monkeypatch):
+    """点「查看数据」**不许**问远端密码（v6.4.2 修的现场报障）。
+
+    那个对话框的列表全部来自本地 —— `uploader.get_bag_folders()` 与
+    `log_fetcher.get_log_files()`，打开它不连任何服务器。
+    原来入口无条件先问一次密码，于是离线现场连"看一眼本地录了什么"
+    都做不到。而密码真正需要的地方是 `open_remote_browser`（浏览远端目录）。
+    """
+    from PyQt5.QtWidgets import QInputDialog
+
+    win, _cm = ui_env
+    shown = []
+    monkeypatch.setattr(QInputDialog, "getText",
+                        staticmethod(lambda *a, **k: pytest.fail("查看数据不该问远端密码")))
+    monkeypatch.setattr("data_collector.ui.panels.data_ops.DataViewDialog",
+                        lambda *a, **k: shown.append("opened") or type("D", (), {
+                            "setModal": lambda self, v: None,
+                            "show": lambda self: None,
+                        })())
+
+    win.on_view_data()
+
+    assert shown == ["opened"], "对话框应该正常打开"
+
+
+def test_browsing_the_remote_dir_still_asks_for_the_password(
+        ui_env, monkeypatch, tmp_path):
+    """上一条的对照：**远端浏览器仍要问密码**。
+
+    两条一起钉住，才不会有人为了"修好上面那条"把远端功能一起放掉 ——
+    那样会变成"能看本地了，但传不上去"。
+    """
+    from PyQt5.QtWidgets import QInputDialog
+
+    from data_collector.ui import data_view as dv
+
+    win, _cm = ui_env
+    asked = {"n": 0}
+
+    def _pw(uploader, parent=None):
+        asked["n"] += 1
+        return False                      # 用户取消，够用来观察"问过没有"
+
+    monkeypatch.setattr(dv, "ensure_remote_password", _pw)
+    monkeypatch.setattr(QInputDialog, "getText", staticmethod(lambda *a, **k: ("", False)))
+
+    # 用真窗口而不是 `__new__` 绕过 __init__：QDialog 的 `super-class __init__()
+    # was never called` 会在运行时拦下来（PyQt 的保护），而且那条路径测不到真实行为。
+    from data_collector.core_data import DataUploader, LogFetcher
+
+    dlg = dv.DataViewDialog(DataUploader(win.config),
+                            LogFetcher(tmp_path / "logs", win.config), win)
+    try:
+        # 密码取消 → 不该真的弹浏览器（那会挂住离屏环境）
+        monkeypatch.setattr(dv, "RemoteDirectoryDialog",
+                            lambda *a, **k: pytest.fail("密码取消后不该打开远端浏览器"))
+        dlg.open_remote_browser()
+    finally:
+        dlg.close()
+        dlg.deleteLater()
+
+    assert asked["n"] == 1, "浏览远端目录必须问密码"

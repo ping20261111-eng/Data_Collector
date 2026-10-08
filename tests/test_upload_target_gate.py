@@ -24,6 +24,8 @@ v6.4.0 把 `export_target` 的分流点放在 `core_data.upload_bag_folder`，
 """
 import os
 import sys
+import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -52,6 +54,16 @@ def _bag(tmp_path, name="挥手"):
     folder.mkdir()
     (folder / "a.mcap").write_bytes(b"x" * 2048)
     return folder
+
+
+def _today() -> str:
+    """今天的日期层名。
+
+    单独抽出来是因为这些守卫在**收集与运行之间**可能跨过零点 ——
+    凌晨 23:59 收集、00:01 运行时，bag 目录的 mtime 是昨天，
+    而用例里现算的"今天"已经是新的一天。这类失败极难复现。
+    """
+    return datetime.fromtimestamp(time.time()).strftime("%Y-%m-%d")
 
 
 class _Log:
@@ -265,8 +277,10 @@ def test_disk_landing_spot_is_the_bag_folder_under_the_mount(tmp_path, monkeypat
     bag = _bag(tmp_path, "挥手_20261008")
 
     assert up.upload_bag_folder(bag) is True
-    assert recorded == ["挥手_20261008"], \
-        f"落点子目录应是 bag 名，实际 {recorded}"
+    # v6.4.3 起落点是 `<序列号>/<采集日期>/<bag 名>`；这份配置没造Product.json，
+    # 所以序列号是显眼的占位名 `unknown-serial`（读不到产品信息不该把导出卡死）。
+    assert recorded == ["unknown-serial/" + _today() + "/挥手_20261008"], \
+        f"落点应是序列号/日期/bag名，实际 {recorded}"
 
 
 def test_disk_landing_spot_ignores_a_remote_subpath(tmp_path, monkeypatch):
@@ -284,8 +298,11 @@ def test_disk_landing_spot_ignores_a_remote_subpath(tmp_path, monkeypatch):
 
     up.upload_bag_folder(bag, "robot/linen/2026-10-08")
 
-    assert recorded == ["挥手_20261008"], \
-        f"磁盘侧不该采信远端子路径，实际落点 {recorded}"
+    got = recorded[0]
+    assert got == "unknown-serial/" + _today() + "/挥手_20261008", \
+        f"磁盘侧不该采信远端子路径，实际落点 {got}"
+    assert "robot" not in got and "linen" not in got, \
+        f"远端层级渗进了磁盘落点：{got}"
 
 
 def test_each_bag_gets_its_own_directory(tmp_path, monkeypatch):
@@ -298,7 +315,10 @@ def test_each_bag_gets_its_own_directory(tmp_path, monkeypatch):
     up.upload_bag_folder(_bag(tmp_path, "第一次"))
     up.upload_bag_folder(_bag(tmp_path, "第二次"))
 
-    assert recorded == ["第一次", "第二次"]
+    today = _today()
+    assert recorded == [f"unknown-serial/{today}/第一次",
+                        f"unknown-serial/{today}/第二次"], \
+        f"同一天的两次采集应各有落点，实际 {recorded}"
 
 
 def test_both_keeps_the_remote_subpath_for_the_server_half(tmp_path, monkeypatch):
@@ -340,7 +360,10 @@ def test_both_keeps_the_remote_subpath_for_the_server_half(tmp_path, monkeypatch
                         server_spans.append(subpath) or True)
 
     assert up.upload_bag_folder(_bag(tmp_path, "挥手"), "tasks/10-08") is True
-    assert disk_spans == ["挥手"], f"磁盘侧应只用 bag 名，实际 {disk_spans}"
+    # 磁盘侧：序列号/日期/bag名（语义是"哪台机器、哪天、哪一批"）
+    assert disk_spans == [f"unknown-serial/{_today()}/挥手"], \
+        f"磁盘侧落点不对：{disk_spans}"
+    # 远端侧：用户选的子路径原样传下去（语义是"服务器目录树上的位置"）
     assert server_spans == ["tasks/10-08"], f"远端子路径被丢了：{server_spans}"
 
 

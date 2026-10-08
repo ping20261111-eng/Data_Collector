@@ -205,18 +205,30 @@ class DiskExportTarget:
     def write_stream(self, target_dir: Path, filename: str,
                      producer: Callable[[Callable[[bytes], None]], None],
                      progress_cb: Optional[Callable[[str], None]] = None,
-                     progress_percent: Optional[Callable[[int], None]] = None) -> Path:
-        """让 `producer` 往目标文件写，由本方法负责原子性与拔盘处理。
+                     progress_percent: Optional[Callable[[int], None]] = None,
+                     total_bytes: int = 0) -> Path:
+        """让`producer` 往目标文件写，由本方法负责原子性与拔盘处理。
 
         **先写临时文件再 rename**：移动硬盘随时可能被拔，直接写最终文件名的话，
         中途断开会在盘上留下一个"看起来是正常包、实际是半截"的文件 ——
         它会被下游按文件名取走，比直接失败危险得多。
         rename 在同一文件系统内是原子的，所以要么看不到这个文件，
         要么看到的就是完整的。
+
+        ## `progress_percent` 收的是**百分比**，不是字节数
+
+        这里曾经直接发`int(written / 1024 / 1024)`（已写入的 MB 数）。
+        而界面 `update_upload_progress` 会 `min(100, value)` —— 于是
+        3MB 的包瞬间显示 100%，8000MB 的包传到 100MB 就满格。
+        **"传输完成"这两个字与真实进度彻底脱钩**：现场看到满格就去拔盘，
+        数据还没写完。百分比必须由总量换算（`total_bytes`），不能由已写量直接充当。
         """
         final_path = target_dir / filename
         tmp_path = target_dir / (filename + ".partial")
         written = 0
+        # 总量未知时**不发百分比**（发了也是错的），只发文字进度 ——
+        # 这比发一个看似合理实则错误的数字诚实。
+        total = max(int(total_bytes or 0), 0)
 
         try:
             with open(tmp_path, "wb") as out:
@@ -227,8 +239,10 @@ class DiskExportTarget:
                     written += len(chunk)
                     if progress_cb and written % (16 * 1024 * 1024) < len(chunk):
                         progress_cb(f"正在写入移动硬盘：{_mb(written)}")
-                    if progress_percent:
-                        progress_percent(int(written / 1024 / 1024))
+                    if progress_percent and total:
+                        # 卡在 99 而不是 100：rename 之前文件还不算写完。
+                        # 提前报 100 会让"满格"这个信号失去意义（现场会以为可以拔盘了）。
+                        progress_percent(min(99, int(written * 100 / total)))
 
                 producer(sink)
         except OSError as exc:

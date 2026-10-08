@@ -208,8 +208,11 @@ class DataViewDialog(QDialog):
         return row
 
     def open_remote_browser(self):
+        # 这是本对话框里**唯一**真正需要远端密码的动作（浏览服务器上的目录）。
+        # 其余功能（看本地 bag、看本地日志、播放、导出到移动硬盘）都不联网，
+        # 所以问密码只放在这里，而不是打开对话框就先问一遍。
         if not ensure_remote_password(self.uploader, self):
-            self.append_log("已取消：未提供远端密码")
+            self.append_log("已取消：未提供远端密码（浏览远端目录需要）")
             return
         dlg = RemoteDirectoryDialog(self.uploader, self, select_mode=False)
         dlg.exec_()
