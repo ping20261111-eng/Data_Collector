@@ -120,6 +120,11 @@ class ExportTargetMixin:
         self.chip_export_target.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.chip_export_target.setPopupMode(QToolButton.InstantPopup)
         self.chip_export_target.setCursor(Qt.PointingHandCursor)
+        # **高度钉死 30**：QSS 的 `border-radius` 超过控件高度的一半时会被**整条忽略**
+        # （画成方角），而芯片的药丸半径是 15 —— 只有高度恰好 30 时才是完美胶囊。
+        # 高度本来由"字号 + 内距"撑出来，改个字号就会漂，漂到 <30 就退回方角，
+        # 所以钉死它，让半径与高度永远配套（守卫会复核这条关系）。
+        self.chip_export_target.setFixedHeight(30)
         # 不用 `setMenu(InstantPopup)`：`QMenu` 给 `QWidgetAction` 的高度**不够**
         # （实测 holder 只有 276px，内容需要 426px），内部布局被压扁 ——
         # 后面的控件 geometry 停在 (0,0,640,480)（= 从未被排布），

@@ -121,13 +121,29 @@ SPACING = {"sp1": 4, "sp2": 8, "sp3": 12, "sp4": 16, "sp5": 24, "sp6": 32, "sp7"
 # Qt 会把它直接画成**圆形**（实测）—— 而复选框该是圆角方块、单选才是圆。
 # B 方案把 r1 从 2 放大到 8 时，漏了小控件这一处。
 #
-# ⚠️ `pill` **不能给 999**：Qt 的 QSS 对过大的 `border-radius` **直接忽略**
-#    （不是把它截断到一半），实测同一个 103×31 的控件上
-#    `4/8/15/16px` 都画出圆角，`20px` 及以上**全部退回方角**。
-#    所以 999 等于"没有圆角"—— 全项目所有本该是药丸的地方（幽灵按钮、徽章、
-#    芯片）此前实际都是方角。这是 B 方案引入这个值时留下的问题。
-#    16 是在 31px 高的控件上既生效、又刚好是完美胶囊（= 高度一半）的值。
-RADIUS = {"r0": 4, "r1": 8, "r2": 12, "r3": 16, "pill": 16}
+# ⚠️ **药丸半径必须与控件高度配套** —— Qt 的 QSS 对 `border-radius` 有一条硬规则：
+#
+#     半径 > ⌊控件高度 / 2⌋  →  **整条声明被忽略**（不是截断到一半）→ 画成方角
+#
+#   实测（`render(..., DrawChildren)` 量四角，逐高度扫最大可用半径）：
+#
+#     高度   24  26  28  30  31  32  34  36
+#     上限   12  13  14  15  15  16  17  18      ← 恰好是 ⌊高度/2⌋
+#
+#   所以**一个常量不可能对所有高度都是药丸**：同一个 16，在 h=32 的幽灵钮上是
+#   完美胶囊，在 h=27 的徽章和 h=31 的芯片上却直接退回方角。
+#   （v6.4.5 把 `pill` 从 999 改成 16 时没意识到这条，于是"改了还是方角"——
+#     现场就在导出目标芯片上看到了这个方角。）
+#
+#   → 因此按**高度分档命名**：令牌名里的数字就是它配套的控件高度，
+#     半径 = ⌊那个高度/2⌋。守卫 `test_every_pill_radius_fits_its_height`
+#     拿真实控件高度复核，再出这种事会当场报红。
+RADIUS = {
+    "r0": 4, "r1": 8, "r2": 12, "r3": 16,
+    "pill_27": 13,   # 徽章 / 急停状态标签（实测高 27）
+    "pill_30": 15,   # 导出目标芯片（代码里 setFixedHeight(30)，半径恰为半高）
+    "pill_32": 16,   # 幽灵钮 / 紧凑钮 / 危险钮 / 急停复位（实测高 32）
+}
 
 #: 弹出层（菜单 / 下拉列表 / 悬停提示）的**布局尺寸**：全站弹层共用这几个数，只写一次。
 #: 圆角、底色、描边走既有令牌（`r2` / `popup` / `popup_line`），这里只放尺寸。
@@ -287,7 +303,7 @@ QPushButton#EstopFace:pressed { background-color: ${danger_deep}; }
 QPushButton#EstopRelease {
     background-color: ${surface2};
     border: 1px solid ${line_strong};
-    border-radius: ${pill}px;
+    border-radius: ${pill_32}px;
     color: ${muted};
     padding: 10px 12px;
     font-size: ${fs_sm}px;
@@ -301,7 +317,7 @@ QLabel#EstopState {
     color: ${muted2};
     background-color: ${surface2};
     border: 1px solid ${line};
-    border-radius: ${pill}px;
+    border-radius: ${pill_27}px;
     padding: 4px 10px;
 }
 QLabel#EstopState[state="engaged"] {
@@ -493,7 +509,7 @@ QLabel#Badge {
     color: ${muted};
     background-color: ${surface2};
     border: 1px solid ${line};
-    border-radius: ${pill}px;
+    border-radius: ${pill_27}px;
     padding: 4px 10px;
 }
 QLabel#Badge[state="accent"] {
@@ -651,7 +667,7 @@ QPushButton[variant="warn"]:hover { background-color: ${warn_soft}; }
 QPushButton[variant="ghost"] {
     background-color: transparent;
     border: 1px solid ${line_strong};
-    border-radius: ${pill}px;
+    border-radius: ${pill_32}px;
     color: ${muted};
     padding: 6px 14px;
     font-size: ${fs_sm}px;
@@ -668,7 +684,7 @@ QPushButton[variant="ghost"]:hover { color: ${text}; border-color: ${muted2}; }
 QToolButton#ExportChip {
     background-color: ${surface2};
     border: 1px solid ${line};
-    border-radius: ${pill}px;
+    border-radius: ${pill_30}px;
     padding: 5px 10px 5px 11px;
     font-size: ${fs_base}px;
     color: ${muted};
@@ -791,7 +807,7 @@ QLabel#LandingPreview {
 QPushButton[variant="ghost-compact"] {
     background-color: transparent;
     border: 1px solid ${line_strong};
-    border-radius: ${pill}px;
+    border-radius: ${pill_32}px;
     color: ${muted};
     padding: 6px 8px;
     font-size: ${fs_sm}px;
@@ -803,7 +819,7 @@ QPushButton[variant="ghost-compact"]:hover { color: ${text}; border-color: ${mut
 QPushButton[variant="ghost-danger"] {
     background-color: transparent;
     border: 1px solid ${line_strong};
-    border-radius: ${pill}px;
+    border-radius: ${pill_32}px;
     color: ${danger};
     padding: 6px 14px;
     font-size: ${fs_sm}px;
@@ -1104,7 +1120,6 @@ def build_stylesheet(mode: str = "dark") -> str:
     values["r1"] = str(RADIUS["r1"])
     values["r2"] = str(RADIUS["r2"])
     values["r3"] = str(RADIUS["r3"])
-    values["pill"] = str(RADIUS["pill"])
     values.update({f"popup_{k}": str(v) for k, v in POPUP.items()})
     values["font_sans"] = FONT_SANS
     values["font_mono"] = FONT_MONO

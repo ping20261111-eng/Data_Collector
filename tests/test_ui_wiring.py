@@ -6316,26 +6316,55 @@ def test_the_panel_is_a_popup_not_a_menu(status_env):
         "面板最小宽被调小了 —— 状态说明会折行"
 
 
-def test_pill_radius_stays_within_what_qt_accepts():
-    """`pill` 令牌**不能给超大的值** —— 过大的 `border-radius` 会被 Qt 直接忽略。
+def test_every_pill_radius_fits_its_height(status_env):
+    """**药丸半径必须 ≤ ⌊控件高度/2⌋** —— 否则 Qt 把整条 `border-radius` 忽略、画成方角。
 
-    实测（同一个 103×31 的控件）：
-      `4 / 8 / 15 / 16px` → 画出圆角；
-      `20 / 30 / 50 / 100 / 999px` → **全部退回方角**。
+    实测（逐高度扫最大可用半径）：24→12、26→13、28→14、**30→15**、**31→15**、32→16、34→17
+    —— 恰好是 ⌊高度/2⌋。所以**一个常量不可能对所有高度都是药丸**：同一个 16，在 h=32 的
+    幽灵钮上是完美胶囊，在 h=27 的徽章和 h=31 的芯片上却直接退回方角。
+    （v6.4.5 把 `pill` 从 999 改成 16 时没意识到这条 → "改了还是方角"，
+      现场就在导出目标芯片上看到了这个方角。）
 
-    也就是说 `pill=999` 等于"根本没有圆角"：全项目所有本该是药丸的地方
-    （幽灵按钮、徽章、导出芯片）此前实际都是方角。
-    这条守卫把上限钉住，免得以后有人"为了更圆"再往大改。
+    所以药丸令牌按**高度分档命名**：名字里的数字就是它配套的控件高度，半径 = 那个高度的一半。
+    这条守卫两头都钉：① 令牌值与它的高度名自洽；② 拿**真实控件高度**复核。
     """
+    from PyQt5.QtWidgets import QPushButton
+
     from data_collector import theme
 
-    assert theme.RADIUS["pill"] <= 16, (
-        f"pill={theme.RADIUS['pill']} 超过 Qt 能接受的上限（实测 16 可以、20 不行）；"
-        f"给更大值等于**取消圆角**，画出来是方角而不是药丸"
+    win, _cm, _status = status_env
+
+    # ① 令牌名里的数字就是配套高度，半径必须恰好是它的一半
+    for token in ("pill_27", "pill_30", "pill_32"):
+        height = int(token.split("_")[1])
+        assert theme.RADIUS[token] == height // 2, (
+            f"{token}={theme.RADIUS[token]} 与它声明配套的高度 {height} 不符"
+            f"（应为 {height // 2}）—— 半径超过半高会被 Qt 整条忽略、画成方角"
+        )
+
+    # ② 真实控件：半径不许超过实测高度的一半
+    pairs = [("pill_30", win.chip_export_target, "导出目标芯片")]
+    for w in win.findChildren(QPushButton):
+        variant = w.property("variant")
+        if variant in ("ghost", "ghost-compact", "ghost-danger"):
+            pairs.append(("pill_32", w, f"幽灵钮[{variant}]"))
+    assert len(pairs) >= 2, "没找到足够的药丸控件 —— 这条守卫可能空转了"
+    for token, widget, name in pairs:
+        radius, height = theme.RADIUS[token], widget.height()
+        assert radius <= height // 2, (
+            f"{name}：令牌 {token}={radius} 超过高度 {height} 的一半（上限 {height // 2}）"
+            f" —— Qt 会忽略整条 border-radius，画成方角"
+        )
+
+    # ③ 芯片要的是**完美胶囊**（设计稿的形状）：半径恰为半高
+    chip = win.chip_export_target
+    assert theme.RADIUS["pill_30"] == chip.height() // 2, (
+        f"芯片高 {chip.height()}，胶囊半径应为 {chip.height() // 2}，"
+        f"实际 {theme.RADIUS['pill_30']}（不足就不是胶囊）"
     )
+
     assert theme.RADIUS["r0"] < theme.RADIUS["r1"], \
         "r0（小方块圆角）必须比 r1（卡片圆角）小，否则 15px 的复选框会被画成圆"
-
 
 # ---------- 导出目标面板 v6.4.6：bug1 的两半 + 视觉规格 ----------
 
