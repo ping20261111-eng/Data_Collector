@@ -9,7 +9,8 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QAbstractItemView, QProgressBar, QFileDialog, QMenu,
                              QFrame, QSizePolicy, QApplication,
                              QStyle, QStyleOptionFrame)
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QRect
+from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QRect,
+                          QRectF)
 from PyQt5.QtGui import QColor, QFont, QPainter, QPalette, QPen, QPolygon
 from PyQt5.Qt import QDesktopServices
 import time
@@ -319,3 +320,95 @@ class StatusGlyph(QWidget):
         painter.setPen(Qt.NoPen)
         painter.setBrush(color)
         painter.drawEllipse(QRect(6, 10, 1, 1))     # 感叹号的点
+
+
+class RadioDot(QWidget):
+    """16px 单选指示器：空环（未选）/ 环 + 实心点（选中），全部自绘。
+
+    ## 为什么自绘而不是 QSS
+
+    QSS 的 `QRadioButton::indicator` 只有「边框 + 底色」两个通道，而底色会
+    **填满整个方块** —— 「外环 + 中心小点」这个形状在 QSS 里表达不出来。
+    上一版用 `border: 4px solid accent` 去凑那个点，结果画出来是一个
+    **方块套方块**（现场截图里最刺眼的那处），与未选态的「细边小圆」形状对不上：
+    同一个控件，选与不选是两种形状。
+
+    项目里已有 `StatusGlyph` / `BatteryIndicator` 两个自绘控件的先例，三条纪律
+    照它们走：取色必须在 try 内、异常绝不外放、`finally: painter.end()`
+    （paintEvent 中途退出会让 QPainter 来不及 end()，进程以段错误收场）。
+
+    ## 为什么设 `WA_TransparentForMouseEvents`
+
+    它住在卡片里，只负责"显示选中与否"，**点击该由整张卡片承担**。
+    如果它自己吃鼠标事件，点在它头上的那一下就到不了卡片 ——
+    又得回到"给每个子控件都装事件过滤器"那套补丁。让事件直接穿过去最省事。
+    """
+
+    SIZE = 16          #: 外径
+    RING = 1.5         #: 环宽（1px 在现场屏幕上偏弱，2px 又显笨）
+    CORE = 8           #: 选中时中心实心点的直径
+
+    def __init__(self, checked: bool = False, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._checked = bool(checked)
+        self._hover = False
+        self._mode = "light"
+
+    def set_checked(self, checked: bool) -> None:
+        checked = bool(checked)
+        if checked == self._checked:
+            return
+        self._checked = checked
+        self.update()
+
+    def is_checked(self) -> bool:
+        """当前是否选中。守卫用它断言，免得去读私有属性。"""
+        return self._checked
+
+    def set_hover(self, hover: bool) -> None:
+        """鼠标是否停在所属卡片上（由卡片驱动，QSS 管不到这一步）。"""
+        hover = bool(hover)
+        if hover == self._hover:
+            return
+        self._hover = hover
+        self.update()
+
+    def set_mode(self, mode: str) -> None:
+        self._mode = mode
+        self.update()
+
+    def paintEvent(self, event):        # noqa: N802 (Qt 命名)
+        painter = QPainter(self)
+        try:
+            colors = theme.palette(self._mode)
+            if self._checked:
+                ring, core = QColor(colors["accent"]), QColor(colors["accent"])
+            elif self._hover:
+                ring, core = QColor(colors["muted2"]), None
+            else:
+                ring, core = QColor(colors["line_strong"]), None
+
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            pen = QPen(ring)
+            pen.setWidthF(self.RING)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            # 环的路径矩形要**内缩半个笔宽**：描边以路径为中心向两侧各扩 pen/2，
+            # 不内缩就会顶到控件边界被裁掉（表现是"环缺一角"，13px 的状态图标
+            # 上次就踩过同一件事）。
+            half = self.RING / 2.0
+            span = self.SIZE - self.RING
+            painter.drawEllipse(QRectF(half, half, span, span))
+
+            if core is not None:
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(core)
+                off = (self.SIZE - self.CORE) / 2.0
+                painter.drawEllipse(QRectF(off, off, self.CORE, self.CORE))
+        except Exception as exc:                     # noqa: BLE001
+            # 同 StatusGlyph：自绘控件的异常绝不能从 paintEvent 漏出去。
+            logger.warning(f"单选指示器绘制失败：{exc}")
+        finally:
+            painter.end()

@@ -11,15 +11,73 @@
 Mixin 只是把"同一批代码"换个文件放，`MainWindow` 那边一行都不用改。
 """
 
+from html import escape as html_escape
+
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
                              QLineEdit, QPushButton, QComboBox, QToolButton,
-                             QRadioButton, QMessageBox, QSizePolicy, QApplication)
-from PyQt5.QtCore import Qt, QPoint, QTimer, QEvent
+                             QMessageBox, QSizePolicy,
+                             QGraphicsDropShadowEffect)
+from PyQt5.QtCore import Qt, QPoint, QTimer
+from PyQt5.QtGui import QColor, QGuiApplication
 
 from ... import theme
 from ...core import logger
 from ..common import SP
-from ..widgets import StatusGlyph
+from ..widgets import RadioDot, StatusGlyph
+
+
+class TargetCard(QWidget):
+    """导出目标面板里的一张卡片：整张可点，hover 时联动指示器。
+
+    ## 为什么要一个控件类，而不是「裸 QWidget + 全局事件过滤器」
+
+    v6.4.4 那版是"给卡片和它的每个子控件都装一个事件过滤器"，
+    靠 `objectName` 逐级往上回溯找归属 —— 能跑，但有两个代价：
+      ① 子控件一增删就得同步改安装点，往卡片里加个图标就漏装一个，
+         表现为"点那一小块没反应"；
+      ② **hover 没法联动指示器**：QSS 的 `:hover` 管不到子控件，
+         而 Qt 的 QSS 不支持"父 hover 影响子"这种选择器。
+
+    改成一个类之后，`enterEvent` / `leaveEvent` 天然覆盖"鼠标落在某个子控件上"
+    的情形（Qt 的 Enter/Leave 语义是**含子控件**的），一个类把两件事都解决了。
+    """
+
+    def __init__(self, value: str, dot, on_click, parent=None):
+        super().__init__(parent)
+        self.setObjectName("TargetOption")
+        self.setProperty("target", value)
+        self.setCursor(Qt.PointingHandCursor)
+        # QSS 的 `:hover` 要有这个属性才会被跟踪 —— 没有它那条规则不生效。
+        self.setAttribute(Qt.WA_Hover, True)
+        self._value = value
+        self._dot = dot
+        self._on_click = on_click
+
+    def enterEvent(self, event):          # noqa: N802 (Qt 命名)
+        self._dot.set_hover(True)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):          # noqa: N802 (Qt 命名)
+        self._dot.set_hover(False)
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event):     # noqa: N802 (Qt 命名)
+        # 显式接受左键按下：Qt 由此建立**到本卡片的隐式 grab**，之后的 release
+        # 一定回到这里 —— 而不是指望"子控件 ignore、事件往上冒泡"那条路。
+        # （卡片里的 QLabel 默认 ignore，冒泡确实能到，但显式接受更稳，
+        #   也让 press / release 一定落在同一个控件上。）
+        if event.button() == Qt.LeftButton:
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):   # noqa: N802 (Qt 命名)
+        # 在卡片内抬起才算"点了这张"：按下后拖到外面松手不算（拖拽取消的通用语义）。
+        if event.button() == Qt.LeftButton and self.rect().contains(event.pos()):
+            self._on_click(self._value)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class ExportTargetMixin:
@@ -130,15 +188,30 @@ class ExportTargetMixin:
         复用它们意味着那批用例一行都不用改。
         """
         panel = QFrame(self, Qt.Popup | Qt.FramelessWindowHint)
-        panel.setObjectName("ExportPanel")
+        panel.setObjectName("ExportPanelShell")
         # 顺序要紧：透明属性必须在**第一次显示之前**设好，
         # 否则窗口已经按不透明建过一次，再设也不生效（四角仍是方块）。
         panel.setAttribute(Qt.WA_TranslucentBackground, True)
         panel.setAutoFillBackground(False)
         self.export_panel = panel
 
-        panel.setMinimumWidth(self.PANEL_MIN_WIDTH)   # 理由见常量的注释
-        body = QVBoxLayout(panel)
+        # 外壳只负责给投影留出绘制空间：**顶层窗口画不出自己 rect 之外**，
+        # 不留边距的话阴影会被直接裁掉（看起来就是"没有阴影"，还查不出原因）。
+        shell = QVBoxLayout(panel)
+        shell.setContentsMargins(*([self.PANEL_SHADOW_MARGIN] * 4))
+
+        card = QFrame()
+        card.setObjectName("ExportPanel")
+        shadow = QGraphicsDropShadowEffect(card)
+        shadow.setBlurRadius(self.PANEL_SHADOW_BLUR)
+        shadow.setOffset(0, self.PANEL_SHADOW_DY)
+        shadow.setColor(QColor(*self.PANEL_SHADOW_RGBA))
+        card.setGraphicsEffect(shadow)
+        shell.addWidget(card)
+        self.export_panel_card = card
+
+        panel.setMinimumWidth(self.PANEL_MIN_WIDTH + 2 * self.PANEL_SHADOW_MARGIN)
+        body = QVBoxLayout(card)
         body.setContentsMargins(14, 12, 14, 12)
         body.setSpacing(SP["sp2"])
 
@@ -149,17 +222,17 @@ class ExportTargetMixin:
         # --- 三个目标选项（卡片式，每项带一句含义） ---
         self.target_option_widgets = {}
         for value, _short, label, hint in self.EXPORT_TARGET_ITEMS:
-            opt = QWidget()
-            opt.setObjectName("TargetOption")
-            opt.setProperty("target", value)
-            opt.setCursor(Qt.PointingHandCursor)
+            # 指示器自绘（RadioDot）：QSS 的 `::indicator` 只有"边框 + 底色"
+            # 两个通道，而底色会填满整个方块 —— 表达不出"外环 + 中心点"。
+            # 上一版用 4px 边框去凑那个点，画出来是方块套方块（现场最刺眼那处）。
+            dot = RadioDot()
+            opt = TargetCard(value, dot, self.on_target_option_clicked)
+            # 内边距：水平 13、垂直 11（QHBoxLayout 的四个参数是 左/上/右/下，
+            # 别按"水平×垂直"去写 —— 写成 (11,13,13,11) 就成了四边都不对称）。
             row = QHBoxLayout(opt)
-            row.setContentsMargins(11, 9, 11, 9)
-            row.setSpacing(10)
-            radio = QRadioButton()
-            radio.setChecked(value == "server")
-            radio.setEnabled(False)          # 只读表示：真正的选择由整张卡片承担
-            row.addWidget(radio, 0, Qt.AlignTop)
+            row.setContentsMargins(13, 11, 13, 11)
+            row.setSpacing(11)
+            row.addWidget(dot, 0, Qt.AlignTop)
             texts = QVBoxLayout()
             texts.setSpacing(1)
             t1 = QLabel(label)
@@ -170,10 +243,10 @@ class ExportTargetMixin:
             texts.addWidget(t1)
             texts.addWidget(t2)
             row.addLayout(texts, 1)
-            opt.installEventFilter(self)
-            for child in opt.findChildren(QWidget):
-                child.installEventFilter(self)
-            self.target_option_widgets[value] = (opt, radio)
+            # 点击由 `TargetCard` 自己处理（mousePress/Release），
+            # 不再给卡片和它的每个子控件逐个装事件过滤器 —— 那套补丁在
+            # 子控件增删时会漏装，而且管不了 hover 与指示器的联动。
+            self.target_option_widgets[value] = (opt, dot)
             body.addWidget(opt)
 
         # --- 分隔：下面那块只在选了硬盘时才有意义 ---
@@ -228,8 +301,17 @@ class ExportTargetMixin:
         panel.adjustSize()                      # 先按内容定尺寸，再算位置
         chip = self.chip_export_target
         top_left = chip.mapToGlobal(QPoint(0, chip.height() + 6))
-        top_left.setX(top_left.x() + chip.width() - panel.width())
-        screen = QApplication.desktop().availableGeometry(chip)
+        # 对齐的是**卡片**的右边缘，不是外壳的：外壳比卡片多一圈投影留白
+        # （PANEL_SHADOW_MARGIN），直接按 panel.width() 对齐会整体左偏那一圈。
+        top_left.setX(top_left.x() + chip.width() - panel.width()
+                      + self.PANEL_SHADOW_MARGIN)
+        # 用 `QGuiApplication.screenAt()`，不再走 `QDesktopWidget` 那条老路：
+        # 它在 Qt 5.15 已废弃。`screenAt` + `primaryScreen` 兜底是现代写法，
+        # 语义与原来一致（芯片落在哪个屏幕上，就按那个屏幕的可用区域兜底）。
+        target_screen = QGuiApplication.screenAt(chip.mapToGlobal(QPoint(0, 0)))
+        if target_screen is None:
+            target_screen = QGuiApplication.primaryScreen()
+        screen = target_screen.availableGeometry()
         if top_left.x() < screen.left():
             top_left.setX(screen.left() + 8)
         if top_left.x() + panel.width() > screen.right():
@@ -238,6 +320,18 @@ class ExportTargetMixin:
             # 下方放不下就翻到芯片上方 —— 总比被屏幕裁掉一截好
             top_left.setY(chip.mapToGlobal(QPoint(0, 0)).y() - panel.height() - 6)
         panel.move(top_left)
+        # **不要在这里直接 `show()`，推到事件循环下一轮**（v6.4.6 修 bug）。
+        # 这个 slot 是 `QToolButton.clicked` 的接收者，而 `clicked` 是在
+        # **鼠标release 的处理过程中**发出的 —— 此刻这次点击还没走完。
+        # 在"点击尚未结束"时显示一个 `Qt.Popup` 窗口，Qt 会让它进入
+        # "等按键全部释放再抓鼠标"的过渡态，现场表现就是
+        # **面板弹出来了，但第一下点选项没反应**（用户会以为是"要先点一下别的"）。
+        # 推到下一轮事件循环，这次点击已经彻底结束，popup 从第一次点击起就是正常的。
+        QTimer.singleShot(0, self._show_export_panel)
+
+    def _show_export_panel(self) -> None:
+        """真正把面板显示出来（由 `_toggle_export_panel` 延后一轮调用）。"""
+        panel = self.export_panel
         panel.show()
         panel.raise_()
 
@@ -330,6 +424,14 @@ class ExportTargetMixin:
     #: 那种情况**保持折行**——为了它把面板撑到 550px 宽并不划算。
     PANEL_MIN_WIDTH = 380
 
+    #: 面板投影：外层留白 / 模糊半径 / 向下偏移 / 颜色（rgba）。
+    #: 留白是必需的 —— 顶层窗口画不出自己 rect 之外，不留就被裁掉。
+    PANEL_SHADOW_MARGIN = 14
+    PANEL_SHADOW_BLUR = 24
+    PANEL_SHADOW_DY = 6
+    #: 32/255 ≈ 12% 黑。够看出"浮起来"，又不抢内容。
+    PANEL_SHADOW_RGBA = (29, 43, 40, 32)
+
     def _sync_export_target_widgets(self, probe: bool = False) -> None:
         """按当前配置回填两个控件。**不发信号**（回填不是用户改的）。"""
         try:
@@ -348,6 +450,16 @@ class ExportTargetMixin:
         self._set_disk_row_visible(target in ("disk", "both"))
         if probe and target in ("disk", "both"):
             self._probe_disk_mount()
+
+        # **回填之后必须补一次卡片的选中态同步**（v6.4.6 修 bug）。
+        # 回填走的是 `blockSignals(True)`，所以 `on_export_target_changed`
+        # → `_sync_option_visuals()` 从头到尾一次都不会跑 —— 三张卡片的
+        # `selected` 属性一直停在"从未设置"（实测值就是 `None`）。
+        # 后果不是"点不动"，而是**面板一打开，三张卡长得一模一样、
+        # 没有一张显示为当前值**，而芯片上明明写着目标名 —— 两边自相矛盾。
+        # 现场的反应就是"挨个点一遍找当前是哪个"，而第一次点的那个
+        # 会把配置改掉（配置本来是 server，一点就变 disk）。
+        self._sync_option_visuals()
 
     def _set_disk_row_visible(self, visible: bool) -> None:
         """挂载点配置块的显隐（只在面板内部用）。
@@ -417,26 +529,6 @@ class ExportTargetMixin:
         self.chip_export_target.setFixedWidth(width)
         self.chip_body.setFixedWidth(width - self.CHIP_PADDING)
 
-    def eventFilter(self, obj, event):     # noqa: N802 (Qt 命名)
-        """点面板里任何一张目标卡片 = 选它。
-
-        Qt 的事件**先给最深处的控件**再往上冒泡。所以过滤器必须装到卡片里
-        **每一个**子控件上（两个 label + 那个只读 radio），只装在卡片本体上
-        的话，只有点在卡片空白处才收得到 —— 实测正是那样：点标题文字没反应。
-        这也是为什么这里遍历 `findChildren` 而不是只判断 `obj` 自己。
-        """
-        if event.type() != QEvent.MouseButtonRelease:
-            return super().eventFilter(obj, event)
-        owner = obj
-        while owner is not None and owner.objectName() != "TargetOption":
-            owner = owner.parentWidget()
-        if owner is None:
-            return super().eventFilter(obj, event)
-        value = owner.property("target")
-        if value and value != self.cb_export_target.currentData():
-            self.on_target_option_clicked(value)
-        return super().eventFilter(obj, event)
-
     def on_target_option_clicked(self, value: str) -> None:
         """面板里点了某张目标卡片。
 
@@ -454,9 +546,9 @@ class ExportTargetMixin:
     def _sync_option_visuals(self) -> None:
         """把三张卡片的选中态与可点性刷成当前值。"""
         current = self.cb_export_target.currentData()
-        for value, (opt, radio) in self.target_option_widgets.items():
+        for value, (opt, dot) in self.target_option_widgets.items():
             selected = value == current
-            radio.setChecked(selected)
+            dot.set_checked(selected)
             opt.setProperty("selected", "true" if selected else "false")
             theme.repolish(opt)
             # 整张卡片可点；选中那张换成箭头光标（点了也不会变，
@@ -626,7 +718,19 @@ class ExportTargetMixin:
             logger.warning(f"生成落点预览失败：{exc}")
             self.lb_landing_preview.setVisible(False)
             return
-        self.lb_landing_preview.setText(f"将保存到\n{mount}/{span}/<本次采集名>/")
+        # 分层着色：**本次会新建的那两层（序列号 / 日期）用强调色**，
+        # 挂载点与占位名用次要色 —— 现场一眼就看得出这次会落到哪一层。
+        colors = theme.palette(theme.active_mode())
+        parts = str(span).split("/")
+        serial = parts[0] if parts else str(span)
+        date = parts[1] if len(parts) > 1 else ""
+        self.lb_landing_preview.setText(
+            f'<span style="color:{colors["muted"]}">将保存到</span><br>'
+            f'<span style="color:{colors["muted2"]}">{html_escape(mount)}/</span>'
+            f'<span style="color:{colors["accent"]}">{html_escape(serial)}</span>'
+            f'<span style="color:{colors["muted2"]}">/</span>'
+            f'<span style="color:{colors["accent"]}">{html_escape(date)}</span>'
+            f'<span style="color:{colors["muted2"]}">/&lt;本次采集名&gt;/</span>')
         self.lb_landing_preview.setVisible(True)
 
     def _start_disk_probe_timer(self) -> None:

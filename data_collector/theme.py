@@ -716,12 +716,34 @@ QToolButton#ExportChip[state="warn"] QLabel#ChipCaption { color: ${warn}; }
 QWidget#TargetOption {
     background-color: ${surface};
     border: 1px solid ${line};
-    border-radius: ${r1}px;
+    /* 圆角用 r2（12px）而不是 r1（8px）：卡片比它内部的小元素（16px 的圆环、
+       8px 圆角的输入框）大一号，嵌套的层次才清楚。 */
+    border-radius: ${r2}px;
 }
-QWidget#TargetOption:hover { border-color: ${muted2}; }
+QWidget#TargetOption:hover {
+    background-color: ${surface2};
+    border-color: ${line_strong};
+}
 QWidget#TargetOption[selected="true"] {
     background-color: ${accent_soft};
-    border-color: ${accent};
+    /* 1.5px 而不是 1px：选中与否是这个面板**唯一**要传达的信息，
+       1px 的描边在现场屏幕上"看不出这张被选中"（实测反馈）。 */
+    border: 1.5px solid ${accent};
+}
+
+/* 卡片里的两行文字。**此前这两条规则根本不存在**（v6.4.6 查出来的），
+   于是标题和说明同色同重 —— 「送到：服务器」和「走 SFTP 送到远端」
+   看起来一样重要，现场扫的时候读不出哪个是选项名、哪个是注解。 */
+QLabel#TargetOptionTitle {
+    background: transparent;
+    color: ${text};
+    font-size: ${fs_base}px;
+    font-weight: 500;
+}
+QLabel#TargetOptionHint {
+    background: transparent;
+    color: ${muted};
+    font-size: ${fs_sm}px;
 }
 
 /* 面板里的挂载点配置块：与整个面板同一张底，不另加灰底 ——

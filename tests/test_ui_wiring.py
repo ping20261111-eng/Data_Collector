@@ -4797,10 +4797,15 @@ def _seed_motion_presets(tmp_path):
 
 
 def _posture_status(status_file, *, trunk=True, arms=True, moving=False,
-                    emergency="解锁", joint=True):
-    """写一份能用的状态文件：躯干 6 轴 + 双臂 7 轴的真实角度（来自 state 话题）。"""
+                    emergency="解锁", joint=True, arms_partial=False):
+    """写一份能用的状态文件：躯干 6 轴 + 双臂 7 轴的真实角度（来自 state 话题）。
+
+    `arms_partial=True` 造"只通了一侧"：左通、右没通（`MODULE_STATE_PARTIAL`）——
+    这一态下单臂下电出口是 v6.4.6 新加的，用例要能复现它。
+    """
     arm_entry = {"has_data": arms, "age_sec": 0.2 if arms else None, "enabled": arms,
-                 "enabled_left": arms, "enabled_right": arms}
+                 "enabled_left": arms,
+                 "enabled_right": (arms and not arms_partial)}
     if arms and joint:
         for side, sign in (("left", 1), ("right", -1)):
             arm_entry[side] = {
@@ -5709,6 +5714,71 @@ def test_posture_module_enable_is_independent_per_module(status_env, tmp_path, m
     assert "未确认" in dialog.result.toPlainText()
 
 
+def test_posture_single_arm_gets_disable_button(status_env, tmp_path, monkeypatch):
+    """只通了一侧时，必须有一个「全部下电」出口（v6.4.6，现场报的）。
+
+    现场症状：机械臂只连上一侧时，模块行按规则显示「上使能」（补没通的那侧），
+    于是**已通的那一侧没有下电出口** —— 只能去关程序或直接断电。
+
+    同时钉住反向：正常两态（全通 / 全断）**不出现**这个按钮 —— 多摆一个出口会把
+    "该点哪个"推回给现场，而这正是当初定"一个模块一个按钮"要避免的。
+    """
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file, trunk=False, arms=True, arms_partial=True)
+    dialog = _open_posture(win, monkeypatch)
+    monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    sent = []
+    monkeypatch.setattr(win.launcher, "set_module_enabled",
+                        lambda module, enabled, timeout=30.0:
+                        sent.append((module, enabled)) or ["已下发"])
+
+    arms_row = dialog.module_rows["arms"]
+    dialog.refresh()
+
+    # 只通一侧：主按钮仍是「上使能」（补齐另一侧），同时出现下电出口
+    assert arms_row.btn.text() == "上使能"
+    assert arms_row.btn_disable.isVisible() is True
+
+    # 点下电 → 走既有的下使能路径（connect false），不新增话题
+    arms_row.btn_disable.click()
+    assert sent == [("arms", False)]
+
+    # 全断 → 主按钮「上使能」，不给下电出口（没东西可下）
+    _refresh_status(dialog, status_file, trunk=False, arms=False)
+    assert dialog.module_rows["arms"].btn_disable.isVisible() is False
+
+    # 全通 → 主按钮本身就是「下使能」，不需要第二个出口
+    _refresh_status(dialog, status_file, trunk=False, arms=True)
+    assert dialog.module_rows["arms"].btn.text() == "下使能"
+    assert dialog.module_rows["arms"].btn_disable.isVisible() is False
+
+
+def test_posture_disable_button_disabled_while_action_busy(status_env, tmp_path, monkeypatch):
+    """使能动作进行中，下电出口与主按钮一起禁掉 —— 两个出口都点会发出互相矛盾的指令。"""
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file, trunk=False, arms=True, arms_partial=True)
+    dialog = _open_posture(win, monkeypatch)
+    monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+
+    stashed = []
+
+    def _hang(module, enabled, timeout=30.0):
+        stashed.append((module, enabled))
+        return ["已下发"]
+
+    monkeypatch.setattr(win.launcher, "set_module_enabled", _hang)
+
+    dialog.refresh()
+    dialog.on_module_action("arms", True)          # 上使能进行中
+
+    assert dialog.module_rows["arms"].btn.isEnabled() is False
+    assert dialog.module_rows["arms"].btn_disable.isEnabled() is False
+
+
 def test_arm_diagram_shows_front_and_side_views_side_by_side():
     """手臂示意图是**正视 + 侧视两块**（现场要求"正视图 + 侧视图，看得更清楚"）。
 
@@ -6265,3 +6335,164 @@ def test_pill_radius_stays_within_what_qt_accepts():
     )
     assert theme.RADIUS["r0"] < theme.RADIUS["r1"], \
         "r0（小方块圆角）必须比 r1（卡片圆角）小，否则 15px 的复选框会被画成圆"
+
+
+# ---------- 导出目标面板 v6.4.6：bug1 的两半 + 视觉规格 ----------
+
+def test_exactly_one_target_card_is_marked_selected_on_open(status_env):
+    """界面刚打开时，**必须恰好一张卡片是选中态** —— 这是 bug1 的第一半。
+
+    回填走的是 `blockSignals(True)`，所以 `on_export_target_changed`
+    → `_sync_option_visuals()` 一次都不会跑，三张卡片的 `selected` 属性一直停在
+    "从未设置"（实测值就是 `None`）。现场表现是：面板一打开三张卡长得一模一样、
+    没有一张显示为当前值，而芯片上明明写着目标名 —— 两边自相矛盾。
+    用户就会挨个点一遍去找当前是哪个，而第一次点的那个会把配置改掉。
+    """
+    win, _cm, _status = status_env
+
+    marked = [v for v, (opt, _d) in win.target_option_widgets.items()
+              if opt.property("selected") == "true"]
+    assert marked == ["server"], (
+        f"打开界面时应恰好一张卡片是选中态（缺省 server），实际 {marked}；"
+        f"三张的属性是 {[ (v, o.property('selected')) for v, (o, _) in win.target_option_widgets.items() ]}"
+    )
+
+
+def test_the_panel_opens_deferred_not_inside_the_click_handler(status_env, monkeypatch):
+    """点芯片后，面板要**等这次点击彻底走完**才显示 —— 这是 bug1 的另一半。
+
+    `QToolButton.clicked` 是在**鼠标 release 的处理过程中**发出的，此刻这次点击
+    还没结束。在"点击尚未结束"时显示一个 `Qt.Popup` 窗口，Qt 会让它进入
+    "等按键全部释放再抓鼠标"的过渡态，现场表现就是**面板弹出来了、但第一下点
+    选项没反应**（用户会误以为"要先点一下别的"）。所以真正的 show 必须推到
+    事件循环下一轮。
+
+    ## 为什么这条守卫不跑事件循环
+
+    它验的是**时序**：`_toggle_export_panel` 有没有把 show 交给
+    `QTimer.singleShot(0, ...)`，而不是自己当场 `show()`。只要观察"有没有挂上
+    那个延迟回调"就够了 —— 把它真跑起来是 Qt 自己的事，没必要在测试里复现一遍。
+
+    而且实测发现：**在这个测试文件里、跑完前面那两百多个界面用例之后，
+    `processEvents()` 会段错误**（连跑三次 100% 复现）。用一条**只取夹具窗口 +
+    调一次 `processEvents()`** 的最小用例放在同一位置，**照样崩**；同一条最小用例
+    放到文件最前面就不崩 —— 也就是说那**与这条用例的代码无关**，是那一串用例
+    累积出来的环境状态（生产代码在独立进程里建/销 25 个窗口、跑同一条调用链，
+    完全不崩）。既然它验的是时序、产品侧也没有可指摘处，
+    就不该把一个会崩的窗口操作留在测试里 —— 那只会给全量测试埋个随机红。
+    """
+    from data_collector.ui.panels import export_target as et
+
+    win, _cm, _status = status_env
+    scheduled = []
+
+    class _FakeTimer:
+        """顶掉真 `QTimer`：只记下"挂了一个怎样的回调"，不真的挂。"""
+        @staticmethod
+        def singleShot(ms, fn):
+            scheduled.append((ms, fn))
+
+    # `export_target` 里的 `QTimer` 是**模块级名字**，换掉它只影响这一段代码。
+    monkeypatch.setattr(et, "QTimer", _FakeTimer)
+    # 窗口定位也挡掉 —— 这条用例不管定位。
+    monkeypatch.setattr(win.export_panel, "adjustSize", lambda *a, **k: None)
+    monkeypatch.setattr(win.export_panel, "move", lambda *a, **k: None)
+
+    win._toggle_export_panel()
+
+    assert win.export_panel.isVisible() is False, "面板不该在 toggle 里就被显示出来"
+    assert scheduled, "面板的显示应该被交给 QTimer.singleShot，而不是当场 show"
+    ms, fn = scheduled[0]
+    assert ms == 0, f"应该推到事件循环下一轮（0ms），实际 {ms}ms"
+    assert callable(fn), "挂起来的那个回调必须是 callable"
+
+
+def test_target_cards_use_the_self_drawn_dot(status_env):
+    """卡片里的指示器必须是**自绘的 RadioDot**，不是 `QRadioButton`。
+
+    QSS 的 `::indicator` 只有"边框 + 底色"两个通道，而底色会填满整个方块 ——
+    "外环 + 中心点"这个形状在 QSS 里表达不出来。上一版用 `border:4px solid accent`
+    去凑那个点，画出来是**方块套方块**，与未选态的"细边小圆"形状完全对不上。
+    """
+    from data_collector.ui.widgets import RadioDot
+
+    win, _cm, _status = status_env
+    for value, (_opt, dot) in win.target_option_widgets.items():
+        assert isinstance(dot, RadioDot), \
+            f"{value} 的指示器不是自绘圆环，而是 {type(dot).__name__}"
+
+
+def test_hovering_a_card_lights_up_its_dot(status_env):
+    """鼠标停在卡片上时指示器要跟着变 —— QSS 做不到这一步，得代码驱动。
+
+    QSS 的 `:hover` 管不到子控件，而 Qt 的 QSS 不支持"父 hover 影响子"这种
+    选择器。所以卡片的 `enterEvent` / `leaveEvent` 里要手动告诉指示器。
+    """
+    from PyQt5.QtCore import QEvent
+
+    win, _cm, _status = status_env
+    opt, dot = win.target_option_widgets["disk"]
+
+    assert dot._hover is False
+    opt.enterEvent(QEvent(QEvent.Enter))
+    assert dot._hover is True, "鼠标进入卡片后指示器没亮"
+    opt.leaveEvent(QEvent(QEvent.Leave))
+    assert dot._hover is False, "鼠标离开卡片后指示器没复位"
+
+
+def test_radio_dot_draws_a_ring_and_a_core(qapp):
+    """圆环三态都要**真能画出来**，且选中态比未选态多一块（中心点）。
+
+    自绘控件的失败方式很隐蔽：paintEvent 中途抛异常时，日志里只有一句
+    "绘制失败"，屏幕上是什么都没有（本项目在 13px 的状态图标上踩过）。
+    所以这里量**不透明像素数**，而不是只看"没报错"。
+
+    用 `render()` 画到 QPixmap 上，**不调 `show()`** —— 离屏环境下 show 顶层
+    控件再跑事件循环会偶发段错误（同一类坑踩过）。
+    """
+    import numpy as np
+    from PyQt5.QtCore import Qt, QPoint
+    from PyQt5.QtGui import QPixmap, QRegion
+    from PyQt5.QtWidgets import QWidget
+
+    from data_collector.ui.widgets import RadioDot
+
+    counts = {}
+    for tag, checked in (("未选", False), ("选中", True)):
+        dot = RadioDot(checked)
+        dot.set_mode("light")
+        pm = QPixmap(dot.size())
+        pm.fill(Qt.transparent)
+        dot.render(pm, QPoint(), QRegion(), QWidget.DrawChildren)
+        img = pm.toImage()
+        ptr = img.bits()
+        ptr.setsize(img.byteCount())        # PyQt5 要显式给长度，否则 voidptr 未知大小
+        arr = np.frombuffer(ptr, np.uint8).reshape(img.height(), img.width(), 4)
+        counts[tag] = int((arr[:, :, 3] > 40).sum())
+        assert counts[tag] > 20, f"{tag}态几乎没画出来（不透明像素 {counts[tag]}）"
+
+    assert counts["选中"] > counts["未选"] + 20, (
+        f"选中态应该多一个中心实心点，实测像素数 未选={counts['未选']} 选中={counts['选中']}"
+    )
+
+
+def test_target_card_style_rules_are_card_level():
+    """卡片视觉规格：圆角是 r2、两条文字规则都在。
+
+    这条钉的是"文字层级"那处缺陷：`TargetOptionTitle` / `TargetOptionHint`
+    两条 QSS 此前**根本不存在**（实测 grep 无匹配），于是标题和说明同色同重 ——
+    「送到：服务器」和「走 SFTP 送到远端」看起来一样重要，扫的时候读不出
+    哪个是选项名。规则一丢，这个毛病会无声无息地回来。
+    """
+    from data_collector import theme
+
+    qss = theme.build_stylesheet("light")
+    assert "QLabel#TargetOptionTitle" in qss, "卡片标题的 QSS 又丢了（标题会退回默认色）"
+    assert "QLabel#TargetOptionHint" in qss, "卡片说明的 QSS 又丢了（说明会和标题同色）"
+
+    idx = qss.find("QWidget#TargetOption {")
+    assert idx >= 0, "找不到卡片的 QSS 规则"
+    block = qss[idx:idx + 260]
+    assert f"border-radius: {theme.RADIUS['r2']}px" in block, (
+        f"卡片圆角应该是 r2({theme.RADIUS['r2']}px)，实测这段是：{block[:160]}"
+    )
