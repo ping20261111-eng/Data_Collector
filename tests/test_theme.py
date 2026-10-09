@@ -30,6 +30,49 @@ def test_stylesheet_has_no_unsubstituted_placeholders():
         leftover = re.findall(r"\$\{?[a-z_]+\}?", qss)
         assert not leftover, f"{mode} 主题里残留未替换的占位符: {leftover[:5]}"
 
+def test_stylesheet_has_balanced_comments():
+    """QSS 注释必须配平 —— 多一个 `*/` 会把后面的说明文字顶成"选择器"。
+
+    实测踩过：往主题里加规则时按"规则体"锚定替换，把上一段注释的 `*/` 留在了它
+    前面 —— 后面那段说明就掉到注释外面，成了非法 QSS（Qt 静默丢弃，样式看着
+    "莫名其妙没生效"）。这里钉住：`/*` 与 `*/` 成对，且不允许「没开就闭」。
+    """
+    for mode in ("dark", "light"):
+        qss = theme.build_stylesheet(mode)
+        opened, closed = qss.count("/*"), qss.count("*/")
+        assert opened == closed, f"{mode} 主题的 QSS 注释不配平：/* {opened} 个，*/ {closed} 个"
+
+        depth = 0
+        for i in range(len(qss)):
+            if qss.startswith("/*", i):
+                depth += 1
+            elif qss.startswith("*/", i):
+                depth -= 1
+                assert depth >= 0, (
+                    f"{mode} 主题里有「没开就闭」的注释，位置 {i}：{qss[max(0, i - 70):i + 20]!r}"
+                )
+        assert depth == 0, f"{mode} 主题里有未闭合的注释（depth={depth}）"
+
+def test_no_selector_is_defined_twice():
+    """同一个选择器不许出现两次 —— 后一条会**静默覆盖**前一条的同名属性。
+
+    实测踩过：给导出面板加「分组标签」样式时顺手改了**共用**的 `PanelTitle`，
+    于是 QSS 里出现两条 `QLabel#PanelTitle` —— 字号/颜色按后者生效，
+    而 `font-family`/`font-weight` 仍从前者漏过来，**一半新一半旧**。
+    这种"看着生效了、其实只生效一半"最难查，所以直接钉住"不许重名"。
+    真要分场景，就换一个 objectName（例如 `GroupLabel`）。
+    """
+    import collections
+
+    for mode in ("dark", "light"):
+        qss = re.sub(r"/\*.*?\*/", "", theme.build_stylesheet(mode), flags=re.S)
+        selectors = [s.strip() for s in re.findall(r"(?m)^([^\n{}]+?)\s*\{", qss)]
+        dup = {k: v for k, v in collections.Counter(selectors).items() if v > 1}
+        assert not dup, f"{mode} 主题里有重名选择器（后者会静默覆盖前者）：{dup}"
+        assert len(selectors) > 150, f"选择器只解析出 {len(selectors)} 个 —— 正则可能失效了"
+
+
+
 
 def test_no_hardcoded_hex_outside_token_blocks():
     """ui/ 目录里不该再出现硬编码色值 —— 全都应该走令牌。

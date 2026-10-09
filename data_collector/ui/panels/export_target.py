@@ -23,7 +23,7 @@ from PyQt5.QtGui import QColor, QGuiApplication
 from ... import theme
 from ...core import logger
 from ..common import SP
-from ..widgets import RadioDot, StatusGlyph
+from ..widgets import CaretGlyph, RadioDot, StatusGlyph
 
 
 class TargetCard(QWidget):
@@ -96,11 +96,11 @@ class ExportTargetMixin:
 
     #: 目标选项：值 →(芯片/选项上的短名, 面板里的标题, 一句"这对你意味着什么")
     #: 三段文案而不是一行标题，是因为现场非研发人员不看配置文件、只认界面，
-    #: 而「两者都送」这类词不解释就不知道是先硬盘还是先服务器。
+    #: 而「两者」这类词不解释就不知道是先硬盘还是先服务器。
     EXPORT_TARGET_ITEMS = (
-        ("server", "服务器", "送到：服务器", "走 SFTP 送到远端"),
-        ("disk", "移动硬盘", "送到：移动硬盘", "写本地挂载点，完全不连服务器"),
-        ("both", "两者都送", "送到：服务器 + 移动硬盘", "先写硬盘，再送服务器"),
+        ("server", "服务器", "服务器", "通过 SFTP 上传至远程服务器"),
+        ("disk", "移动硬盘", "移动硬盘", "写入本地挂载点，无需网络"),
+        ("both", "两者", "服务器 + 移动硬盘", "先写入硬盘，再上传服务器"),
     )
 
     def _build_export_target_selector(self) -> QWidget:
@@ -126,10 +126,10 @@ class ExportTargetMixin:
         # 表现为文字互相重叠的花屏。改成自己管的 `Qt.Popup` 窗口（见 `_build_export_panel`）。
         self.chip_export_target.setPopupMode(QToolButton.DelayedPopup)
         self.chip_export_target.setToolTip(
-            "这批数据送到哪儿（写入 app_config.yaml，重启后仍然有效）：\n"
-            "· 服务器：走 SFTP 送到远端（缺省，与以前一致）\n"
-            "· 移动硬盘：写本地挂载点，完全不连服务器（离线现场用）\n"
-            "· 两者都送：先写硬盘、再送服务器\n"
+            "数据导出目标（写入 app_config.yaml，重启后仍然有效）：\n"
+            "· 服务器：通过 SFTP 上传至远程服务器（缺省，与以前一致）\n"
+            "· 移动硬盘：写入本地挂载点，无需网络（离线现场用）\n"
+            "· 两者：先写入硬盘，再上传服务器\n"
             "\n点这个按钮展开设置。")
         self._build_export_panel()
         self.chip_export_target.clicked.connect(self._toggle_export_panel)
@@ -151,6 +151,10 @@ class ExportTargetMixin:
         self.lb_chip_caption = QLabel("")
         self.lb_chip_caption.setObjectName("ChipCaption")
         chip_row.addWidget(self.lb_chip_caption)
+        # 展开指示放在内容末尾（不是贴最右）：它提示的是"这一整颗可以点开"，
+        # 跟着文字走比飘在另一端更像一体的。颜色由 `_refresh_chip` 跟着状态刷。
+        self.chip_caret = CaretGlyph("none", self.chip_body)
+        chip_row.addWidget(self.chip_caret)
         chip_row.addStretch()
         # 宽度按内容算，见 `_refit_chip` 的注释（三个坑都在那儿）。
         self._refit_chip()
@@ -212,11 +216,15 @@ class ExportTargetMixin:
 
         panel.setMinimumWidth(self.PANEL_MIN_WIDTH + 2 * self.PANEL_SHADOW_MARGIN)
         body = QVBoxLayout(card)
-        body.setContentsMargins(14, 12, 14, 12)
-        body.setSpacing(SP["sp2"])
+        body.setContentsMargins(14, 10, 14, 12)
+        # 面板内是"同一组"，比面板与外界之间的节奏再紧一档（sp2=8 → 6）。
+        body.setSpacing(6)
 
-        title = QLabel("数据送到哪儿")
-        title.setObjectName("PanelTitle")
+        title = QLabel("数据导出目标")
+        title.setObjectName("GroupLabel")
+        # **垂直方向锁死**：中文标签在真机上的行高远大于离屏默认字体，一旦被布局
+        # 分到富余空间，这一行能占掉 40~50px（现场反馈"留空太多"）。
+        title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         body.addWidget(title)
 
         # --- 三个目标选项（卡片式，每项带一句含义） ---
@@ -263,7 +271,8 @@ class ExportTargetMixin:
 
         # --- 挂载点配置：原有的控件原样搬进来 ---
         self.panel_disk_title = QLabel("挂载点")
-        self.panel_disk_title.setObjectName("PanelTitle")
+        self.panel_disk_title.setObjectName("GroupLabel")
+        self.panel_disk_title.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         body.addWidget(self.panel_disk_title)
         self.disk_mount_row = self._build_disk_mount_row(in_panel=True)
         body.addWidget(self.disk_mount_row)
@@ -411,7 +420,7 @@ class ExportTargetMixin:
     #: 面板最小宽度（px）。**给它是为了让"就绪"那条状态说明不折行**。
     #:
     #: 宽度用 `QFontMetrics` 实测，不靠估：就绪态那句
-    #: 「✔ 盘已就绪 · exFAT · 可用 29.0GB」单行要 **271px**，
+    #: 「✔ 硬盘就绪 · exFAT · 可用 29.0GB」单行要 **271px**，
     #: 加「重新检测」按钮 66 + 间距 8 + 左右边距 28 = **373**。
     #: 只按三张卡片的宽度算出来是 290 —— 差这 80 多像素，
     #: 「可用 29.0GB」就会折到第二行（实拍里看出来的）。
@@ -484,11 +493,12 @@ class ExportTargetMixin:
         self._set_chip_title(short)
 
         if target not in ("disk", "both"):
-            # 服务器：没有盘的概念，灰点即可。别在这里显示"未插好" ——
+            # 服务器：没有盘的概念，灰点即可。别在这里显示"未就绪" ——
             # 那是"你选了移动硬盘但盘没插好"的提醒，跟这个目标无关。
             self.chip_glyph.set_kind("none")
             self.lb_chip_caption.setText("")
             theme.set_state(self.chip_export_target, "none")
+            self.chip_caret.set_tone("none")
             self._refit_chip()
             return
 
@@ -497,10 +507,12 @@ class ExportTargetMixin:
         if ok:
             self.chip_glyph.set_kind("ok")
             theme.set_state(self.chip_export_target, "ok")
+            self.chip_caret.set_tone("ok")
         else:
             self.chip_glyph.set_kind("warn")
             theme.set_state(self.chip_export_target, "warn")
-            cap = cap or "未插好"
+            self.chip_caret.set_tone("warn")
+            cap = cap or "未就绪"
         self.lb_chip_caption.setText(cap)
         # 文案变了宽度就得跟着变（「服务器」→「移动硬盘」要长 8px）
         self._refit_chip()
@@ -518,13 +530,15 @@ class ExportTargetMixin:
         3. **宽度随文案变**。「服务器」和「635GB 可用」长度不同，固定宽度要么
            空一块、要么截断。所以每次内容变了都重算，而不是拍一个常数。
 
-        量法：图标 + 标题 + 次要文案 + 两段间距（各6px）+ 左右 padding。
+        量法：图标 + 标题 + 次要文案 + 展开指示 + 三段间距（各6px）+ 左右 padding。
         「635GB 可用」是最长的情况（实测 69px），三位数容量也够用。
         """
+        gap = 6
         need = (self.chip_glyph.width()
                 + self.lb_chip_title.sizeHint().width()
                 + self.lb_chip_caption.sizeHint().width()
-                + 6 * 2)
+                + self.chip_caret.width()
+                + gap * 3)
         width = need + self.CHIP_PADDING
         self.chip_export_target.setFixedWidth(width)
         self.chip_body.setFixedWidth(width - self.CHIP_PADDING)
@@ -558,7 +572,7 @@ class ExportTargetMixin:
     def on_export_target_changed(self) -> None:
         """切换导出目标：立刻写回配置，并（选了硬盘时）探一次盘。
 
-        为什么切换就写：这个设置决定"数据送到哪儿"，只放在内存里的话，
+        为什么切换就写：这个设置决定"数据导出目标"，只放在内存里的话，
         现场下次开程序会退回服务器 —— 而那时没人会记得自己改过。
         """
         target = self.cb_export_target.currentData()
@@ -617,7 +631,7 @@ class ExportTargetMixin:
 
         mount = self.ed_disk_mount.text().strip()
         if not mount:
-            self.lb_disk_state.setText("请填写移动硬盘挂载点")
+            self.lb_disk_state.setText("请填写硬盘挂载点")
             theme.set_state(self.lb_disk_state, "warn")
             self.btn_disk_recheck.setVisible(False)
             # 上一轮探测若显示过"创建标识"，这里必须一并收掉：
@@ -652,12 +666,12 @@ class ExportTargetMixin:
             return
 
         if not path_exists:
-            self.lb_disk_state.setText("✖ 该路径不存在。插上硬盘后点「重新检测」")
+            self.lb_disk_state.setText("✖ 路径不存在，请接入硬盘后点击「重新检测」")
             theme.set_state(self.lb_disk_state, "warn")
             self.btn_disk_mark.setVisible(False)
             self._disk_ok, self._disk_caption = False, ""
         elif not mounted:
-            self.lb_disk_state.setText("✖ 该路径不是已挂载的设备目录（数据会写在本机磁盘上）")
+            self.lb_disk_state.setText("✖ 路径未挂载为设备目录（数据将写入本机磁盘）")
             theme.set_state(self.lb_disk_state, "warn")
             self.btn_disk_mark.setVisible(False)
             self._disk_ok, self._disk_caption = False, ""
@@ -671,7 +685,7 @@ class ExportTargetMixin:
             self.btn_disk_mark.setVisible(True)
             self._disk_ok, self._disk_caption = False, ""
         else:
-            parts = ["✔ 盘已就绪"]
+            parts = ["✔ 硬盘就绪"]
             if fs:
                 parts.append(fs)
             if free:
@@ -691,7 +705,7 @@ class ExportTargetMixin:
         self._refresh_landing_preview()
 
     def _refresh_landing_preview(self) -> None:
-        """面板底部的「将保存到」预览。
+        """面板底部的「保存路径」预览。
 
         这是 v6.4.3 三层落点（序列号 / 日期 / bag 名）的直接收益：导出前就
         把盘上的最终位置摆出来。现场不用导出完再去盘上翻目录找文件。
@@ -725,12 +739,12 @@ class ExportTargetMixin:
         serial = parts[0] if parts else str(span)
         date = parts[1] if len(parts) > 1 else ""
         self.lb_landing_preview.setText(
-            f'<span style="color:{colors["muted"]}">将保存到</span><br>'
+            f'<span style="color:{colors["muted"]}">保存路径</span><br>'
             f'<span style="color:{colors["muted2"]}">{html_escape(mount)}/</span>'
             f'<span style="color:{colors["accent"]}">{html_escape(serial)}</span>'
             f'<span style="color:{colors["muted2"]}">/</span>'
             f'<span style="color:{colors["accent"]}">{html_escape(date)}</span>'
-            f'<span style="color:{colors["muted2"]}">/&lt;本次采集名&gt;/</span>')
+            f'<span style="color:{colors["muted2"]}">/&lt;本次采集目录&gt;/</span>')
         self.lb_landing_preview.setVisible(True)
 
     def _start_disk_probe_timer(self) -> None:
@@ -744,7 +758,7 @@ class ExportTargetMixin:
 
         ## 为什么只在变化时记日志
 
-        每3s 记一条的话，日志区会被「盘已就绪」刷满，**真正的故障
+        每3s 记一条的话，日志区会被「硬盘就绪」刷满，**真正的故障
         （掉线、拔盘、写失败）会被淹没** —— 而那些才是要回头查的。
         所以 `_disk_ok` / `_disk_caption` 变了才记。
         """
@@ -776,9 +790,9 @@ class ExportTargetMixin:
         if after == before:
             return
         if after[0]:
-            self.append(f"移动硬盘已就绪：{after[1]}")
+            self.append(f"硬盘就绪：{after[1]}")
         else:
-            self.append(f"⚠ 移动硬盘状态变化：{self.lb_disk_state.text()}")
+            self.append(f"⚠ 硬盘状态变化：{self.lb_disk_state.text()}")
 
     def on_create_volume_marker(self) -> None:
         """在移动硬盘根目录创建盘标识文件。

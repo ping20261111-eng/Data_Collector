@@ -10,8 +10,9 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QFrame, QSizePolicy, QApplication,
                              QStyle, QStyleOptionFrame)
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QRect,
-                          QRectF)
-from PyQt5.QtGui import QColor, QFont, QPainter, QPalette, QPen, QPolygon
+                          QRectF, QPointF)
+from PyQt5.QtGui import (QColor, QFont, QPainter, QPalette, QPen, QPolygon,
+                           QPolygonF)
 from PyQt5.Qt import QDesktopServices
 import time
 import traceback
@@ -410,5 +411,81 @@ class RadioDot(QWidget):
         except Exception as exc:                     # noqa: BLE001
             # 同 StatusGlyph：自绘控件的异常绝不能从 paintEvent 漏出去。
             logger.warning(f"单选指示器绘制失败：{exc}")
+        finally:
+            painter.end()
+
+
+class CaretGlyph(QWidget):
+    """12px 的展开指示（一个向下的折角），放在芯片右侧。
+
+    ## 为什么加它
+
+    芯片是"点开才展开面板"的入口，但此前它身上**没有任何指示**说"能点开" ——
+    现场第一次用的人会当成一个静态标签。折角是这个动作的通用记号。
+
+    ## 为什么要跟着状态变色
+
+    一颗芯片上不该并存两套颜色语言。芯片有常态 / 就绪 / 异常三态，折角跟着走：
+    常态用次要色、就绪跟绿、异常跟琥珀。为此单独取出色，而不是写死一个灰。
+
+    ## 与同族控件一样的纪律
+
+    自绘、取色必须在 try 内、异常绝不外放、`finally: painter.end()`
+    （`paintEvent` 中途退出会让 QPainter 来不及 end()，进程以段错误收场）。
+
+    几何：12px 见方里画一个 12px 宽、3px 落差的折角，笔宽 1.5。
+    **用 `QPointF` 而不是 `QPoint`** —— 后者只接受整型，传 5.5 会抛 TypeError，
+    而这里抛异常的后果是整个 `paintEvent` 中断、什么都不画。
+    """
+
+    SIZE = 12          #: 控件边长
+    PEN = 1.5          #: 笔宽
+    HALF = 3.5         #: 折角的半宽
+    DROP = 3.0         #: 折角的落差
+
+    #: 色调名 → 色板键。与芯片的 `state` 值对齐（none / ok / warn / danger）。
+    TONES = {"none": "muted2", "ok": "ok", "warn": "warn", "danger": "danger"}
+
+    def __init__(self, tone: str = "none", parent=None):
+        super().__init__(parent)
+        self.setObjectName("ChipCaret")
+        self.setFixedSize(self.SIZE, self.SIZE)
+        # 它只是个记号，点击该由芯片承担（跟 RadioDot 同样的理由）。
+        self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        self._tone = tone
+        self._mode = "light"
+
+    def set_tone(self, tone: str) -> None:
+        if tone == self._tone:
+            return
+        self._tone = tone
+        self.update()
+
+    def set_mode(self, mode: str) -> None:
+        self._mode = mode
+        self.update()
+
+    def paintEvent(self, event):        # noqa: N802 (Qt 命名)
+        painter = QPainter(self)
+        try:
+            colors = theme.palette(self._mode)
+            color = QColor(colors[self.TONES.get(self._tone, "muted2")])
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            pen = QPen(color)
+            pen.setWidthF(self.PEN)
+            pen.setCapStyle(Qt.RoundCap)
+            pen.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(pen)
+            painter.setBrush(Qt.NoBrush)
+            # 折角整体垂直居中：左肩 → 顶点 → 右肩。
+            center_x = self.SIZE / 2.0
+            top_y = (self.SIZE - self.DROP) / 2.0
+            painter.drawPolyline(QPolygonF([
+                QPointF(center_x - self.HALF, top_y),
+                QPointF(center_x, top_y + self.DROP),
+                QPointF(center_x + self.HALF, top_y),
+            ]))
+        except Exception as exc:                     # noqa: BLE001
+            logger.warning(f"展开指示绘制失败：{exc}")
         finally:
             painter.end()

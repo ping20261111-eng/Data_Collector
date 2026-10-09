@@ -627,7 +627,7 @@ def test_export_target_defaults_to_server_and_hides_the_mount_row(status_env):
     assert win.disk_mount_row.isHidden() is True
     assert [win.cb_export_target.itemText(i)
             for i in range(win.cb_export_target.count())] == [
-        "送到：服务器", "送到：移动硬盘", "送到：服务器 + 移动硬盘"]
+        "服务器", "移动硬盘", "服务器 + 移动硬盘"]
 
 
 def test_choosing_the_disk_reveals_the_mount_row_and_saves_it(status_env):
@@ -705,7 +705,7 @@ def test_creating_the_marker_flips_the_state_to_ready(status_env, monkeypatch, t
     win.on_create_volume_marker()
 
     assert (mount / ".nerv_volume").exists(), "标识文件没建出来"
-    assert "盘已就绪" in win.lb_disk_state.text(), \
+    assert "硬盘就绪" in win.lb_disk_state.text(), \
         f"建完没有当场变绿：{win.lb_disk_state.text()}"
     assert win.btn_disk_mark.isHidden() is True, "就绪后不该还摆着出路按钮"
 
@@ -6145,7 +6145,7 @@ def test_the_chip_shows_the_disk_state_without_being_opened(status_env, monkeypa
 
 
 def test_a_missing_disk_shows_warn_on_the_chip(status_env):
-    """盘没插好时芯片是 warn 态，且写明「未插好」—— 不是打不开就完事。"""
+    """盘没就绪时芯片是 warn 态，且写明「未就绪」—— 不是打不开就完事。"""
     win, _cm, _status = status_env
     win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
     win.ed_disk_mount.setText("/definitely/not/here")
@@ -6153,11 +6153,11 @@ def test_a_missing_disk_shows_warn_on_the_chip(status_env):
 
     assert win.chip_export_target.property("state") == "warn", \
         f"路径不存在时芯片应是 warn，实际 {win.chip_export_target.property('state')}"
-    assert win.lb_chip_caption.text() == "未插好"
+    assert win.lb_chip_caption.text() == "未就绪"
 
 
 def test_the_server_target_never_shows_a_disk_warning(status_env):
-    """选了服务器就别报「未插好」—— 那个提醒跟这个目标无关。
+    """选了服务器就别报「未就绪」—— 那个提醒跟这个目标无关。
 
     没有盘的概念，却显示一颗警告图标，会让人以为数据发不出去了。
     """
@@ -6481,7 +6481,7 @@ def test_target_card_style_rules_are_card_level():
 
     这条钉的是"文字层级"那处缺陷：`TargetOptionTitle` / `TargetOptionHint`
     两条 QSS 此前**根本不存在**（实测 grep 无匹配），于是标题和说明同色同重 ——
-    「送到：服务器」和「走 SFTP 送到远端」看起来一样重要，扫的时候读不出
+    「服务器」和「通过 SFTP 上传至远程服务器」看起来一样重要，扫的时候读不出
     哪个是选项名。规则一丢，这个毛病会无声无息地回来。
     """
     from data_collector import theme
@@ -6496,3 +6496,144 @@ def test_target_card_style_rules_are_card_level():
     assert f"border-radius: {theme.RADIUS['r2']}px" in block, (
         f"卡片圆角应该是 r2({theme.RADIUS['r2']}px)，实测这段是：{block[:160]}"
     )
+
+
+# ---------- 导出目标芯片 / 面板 v6.4.7：设计要素（入口指示 · 单一底色 · 紧凑 · 文案） ----------
+
+def test_the_chip_carries_an_expand_indicator(status_env):
+    """芯片右侧必须有"可展开"的指示。
+
+    此前芯片身上**没有任何记号**说"能点开"（现场反馈），第一次用的人会当成静态标签。
+    折角是这个动作的通用记号；它也必须**参与宽度计算**，否则会被文字挤掉。
+    """
+    from data_collector.ui.widgets import CaretGlyph
+
+    win, _cm, _status = status_env
+    caret = getattr(win, "chip_caret", None)
+    assert isinstance(caret, CaretGlyph), f"芯片里没有展开指示，实际 {type(caret).__name__}"
+    assert caret.isHidden() is False, "展开指示被隐藏了（芯片上看不到「能点开」）"
+
+    win.lb_chip_caption.setText("999GB 可用")     # 最宽的一态
+    win._refit_chip()
+    need = (win.chip_glyph.width() + win.lb_chip_title.sizeHint().width()
+            + win.lb_chip_caption.sizeHint().width() + caret.width() + 6 * 3)
+    assert win.chip_export_target.width() >= need, (
+        f"芯片 {win.chip_export_target.width()}px 没把展开指示算进宽度（需要 {need}px）"
+    )
+
+
+def test_the_expand_indicator_follows_the_chip_state(status_env, monkeypatch, tmp_path):
+    """指示的颜色跟着芯片状态走 —— 一颗芯片上不该并存两套颜色语言。"""
+    import data_collector.disk_export as de
+
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
+    assert win.chip_caret._tone == "none", f"服务器态应是常态色，实际 {win.chip_caret._tone}"
+
+    monkeypatch.setattr(de.DiskExportTarget, "is_mounted", lambda self: True)
+    monkeypatch.setattr(de.DiskExportTarget, "filesystem_type", lambda self: "exFAT")
+    mount = tmp_path / "usb"
+    mount.mkdir()
+    (mount / ".nerv_volume").touch()
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.ed_disk_mount.setText(str(mount))
+    win.on_disk_mount_edited()
+    assert win.chip_caret._tone == "ok", f"硬盘就绪时应跟绿，实际 {win.chip_caret._tone}"
+
+    win.ed_disk_mount.setText("/definitely/not/here")
+    win.on_disk_mount_edited()
+    assert win.chip_caret._tone == "warn", f"未就绪时应跟琥珀，实际 {win.chip_caret._tone}"
+
+
+def test_chip_inner_widgets_have_transparent_rules():
+    """芯片内部的容器与标题必须有透明规则。
+
+    现场截图里芯片是"中间一块灰绿、两边两条浅色"，看着像三块拼起来的 ——
+    因为 `ChipBody` / `ChipTitle` 此前**没有 QSS 规则**，
+    吃到了主题全局 `QWidget { background-color: ... }`。
+    """
+    from data_collector import theme
+
+    qss = theme.build_stylesheet("light")
+    for obj in ("QWidget#ChipBody", "QLabel#ChipTitle"):
+        idx = qss.find(obj)
+        assert idx >= 0, f"{obj} 没有 QSS 规则（会被全局 QWidget 规则涂色）"
+        block = qss[idx:idx + 180]
+        assert "transparent" in block, f"{obj} 的规则里没有 transparent：{block[:140]}"
+
+
+def test_the_panel_group_labels_are_one_step_weaker(status_env):
+    """导出面板的分组标签降一档（fs_micro），且用**独立** objectName。
+
+    现场反馈"留空太多"：这一行原本用正文级字号/颜色，既抢眼又占高度。
+    但 `PanelTitle` 是 `common.make_panel_head()` / `common.dialog_card()` /
+    `ui/data_view.py` **共用的白卡片标题样式**（全项目几十处）——
+    把两者混用会**顺手改掉整站所有面板标题**。所以另起 `GroupLabel`，
+    并同时钉住 `PanelTitle` 的原规格没被动过。
+    """
+    from PyQt5.QtWidgets import QLabel, QSizePolicy
+
+    from data_collector import theme
+
+    win, _cm, _status = status_env
+    qss = theme.build_stylesheet("light")
+
+    idx = qss.find("QLabel#GroupLabel")
+    assert idx >= 0, "找不到分组标签的 QSS 规则（QLabel#GroupLabel）"
+    block = qss[idx:idx + 240]
+    assert f"font-size: {theme.TYPE_SCALE['fs_micro']}px" in block, (
+        f"分组标签应降到 fs_micro，实际：{block[:180]}"
+    )
+
+    # 共用的 `PanelTitle` 必须保持原规格（mono + fs_sm）—— 别再把两者搞混。
+    idx2 = qss.find("QLabel#PanelTitle")
+    assert idx2 >= 0, "`PanelTitle` 的原规则丢了（全站面板标题会没样式）"
+    block2 = qss[idx2:idx2 + 240]
+    assert f"font-size: {theme.TYPE_SCALE['fs_sm']}px" in block2, (
+        f"`PanelTitle` 被改动了（它是全站共用的面板标题样式）：{block2[:180]}"
+    )
+
+    labels = win.export_panel_card.findChildren(QLabel, "GroupLabel")
+    assert labels, "导出面板的分组标签没改用 GroupLabel"
+    for lab in labels:
+        assert lab.sizePolicy().verticalPolicy() == QSizePolicy.Fixed, (
+            f"「{lab.text()}」垂直方向没锁死 —— 会被布局分到富余空间（真机上占 40~50px）"
+        )
+
+def test_the_panel_inner_rhythm_is_tighter_than_the_outside(status_env):
+    """面板内是"同一组"，间距要比"面板与外界"的节奏再紧一档（sp2=8 → 6）。"""
+    from data_collector.ui.common import SP
+
+    win, _cm, _status = status_env
+    spacing = win.export_panel_card.layout().spacing()
+    assert spacing == 6, f"面板内间距应是 6，实际 {spacing}"
+    assert 6 < SP["sp2"], "面板内间距应当比 sp2 更紧"
+
+
+def test_target_option_text_is_engineering_wording(status_env):
+    """三个目标的文案：不带"送到："前缀、说明是工程表述（现场反馈口语化太重）。"""
+    win, _cm, _status = status_env
+    labels = [item[2] for item in win.EXPORT_TARGET_ITEMS]
+    assert labels == ["服务器", "移动硬盘", "服务器 + 移动硬盘"], f"选项文案不对：{labels}"
+
+    blob = " ".join(str(x) for item in win.EXPORT_TARGET_ITEMS for x in item)
+    for word in ("送到：", "两者都送", "完全不连服务器", "先写硬盘"):
+        assert word not in blob, f"口语化文案残留：{word}"
+
+
+def test_no_slang_left_in_user_visible_strings(status_env):
+    """用户可见的字符串（状态 / 芯片 / tooltip / 选项说明）里不许再有口语化说法。"""
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.ed_disk_mount.setText("/definitely/not/here")
+    win.on_disk_mount_edited()
+
+    seen = " ".join([
+        win.lb_disk_state.text(),
+        win.lb_chip_caption.text(),
+        win.chip_export_target.toolTip(),
+        " ".join(t[3] for t in win.EXPORT_TARGET_ITEMS),
+    ])
+    for word in ("盘已就绪", "未插好", "送到", "两者都送", "将保存到", "本次采集名"):
+        assert word not in seen, f"口语化残留：{word}（出现在 {seen!r}）"
+    assert "未就绪" in win.lb_chip_caption.text(), "未就绪态芯片文案应是「未就绪」"

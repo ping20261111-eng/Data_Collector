@@ -663,7 +663,7 @@ QPushButton[variant="ghost"]:hover { color: ${text}; border-color: ${muted2}; }
    取代原来那个裸QComboBox——下拉只该选目标，而挂载点路径是另一件事，
    塞在一起必然要外挂一行。这里三件事（目标/路径/状态）收在一处。
 
-   `state` 三态与 `theme.set_state` 对齐：none（服务器）/ ok（盘就绪）/ warn（未插好）。
+   `state` 三态与 `theme.set_state` 对齐：none（服务器）/ ok（硬盘就绪）/ warn（未就绪）。
    默认态就把状态画出来是这一版的关键：盘没插好时不用点开面板就能看见。 */
 QToolButton#ExportChip {
     background-color: ${surface2};
@@ -694,6 +694,19 @@ QToolButton#ExportChip[state="warn"]:hover { background-color: ${warn_soft}; bor
 
 /* 芯片里那个"可用 128GB"：次要信息，比目标名弱一档。
    不能省掉它 —— 29GB 的盘录满这件事，现场必须不点开就知道。 */
+/* 芯片内部的容器与标题。**这两条以前不存在**，于是它们被全局 `QWidget` 背景规则
+   涂成页面底色 —— 而按钮自己是 `surface2`，中间一块、两侧各一条，看着像三块
+   拼起来的（现场截图反馈）。项目里同一类问题补过好几次（`#InlineRow`、`#DiskConfig`）。 */
+QWidget#ChipBody { background: transparent; border: none; }
+QLabel#ChipTitle {
+    background: transparent;
+    color: ${text};
+    font-size: ${fs_base}px;
+}
+/* 芯片右侧那个"可展开"的小箭头。自绘控件，只借 QSS 定尺寸，不画图形 ——
+   颜色由控件自己按状态取（常态次要色 / 就绪跟绿 / 异常跟琥珀）。 */
+QWidget#ChipCaret { background: transparent; }
+
 QLabel#ChipCaption {
     background: transparent;
     color: ${muted};
@@ -732,7 +745,7 @@ QWidget#TargetOption[selected="true"] {
 }
 
 /* 卡片里的两行文字。**此前这两条规则根本不存在**（v6.4.6 查出来的），
-   于是标题和说明同色同重 —— 「送到：服务器」和「走 SFTP 送到远端」
+   于是标题和说明同色同重 —— 「服务器」和「通过 SFTP 上传至远程服务器」
    看起来一样重要，现场扫的时候读不出哪个是选项名、哪个是注解。 */
 QLabel#TargetOptionTitle {
     background: transparent;
@@ -749,10 +762,19 @@ QLabel#TargetOptionHint {
 /* 面板里的挂载点配置块：与整个面板同一张底，不另加灰底 ——
    嵌套灰底（灰底里的灰底）在浅色系里会显得脏。 */
 QWidget#DiskConfig { background: transparent; border: none; }
-QLabel#PanelTitle {
+/* 面板里的分组标签（「数据导出目标」「挂载点」）。
+   **降一档**：它是分组标签、不是标题 —— 现场反馈"留白太多"，而这一行原本用
+   正文级字号 + 正文级颜色，既抢眼又占高度。11px + 更弱的颜色更准。
+   ⚠️ **必须用独立 objectName，不能改 `PanelTitle`**：`PanelTitle` 是
+   `common.make_panel_head()` / `common.dialog_card()` / `ui/data_view.py`
+   共用的**白卡片标题**样式（全项目几十处）。直接改它 = 顺手改了整站所有
+   面板标题，而这次的设计只针对导出面板。各管各的。 */
+QLabel#GroupLabel {
     background: transparent;
-    color: ${muted};
-    font-size: ${fs_sm}px;
+    color: ${muted2};
+    font-family: $font_mono;
+    font-size: ${fs_micro}px;
+    font-weight: 500;
 }
 /* 落点预览：等宽字体（那是路径）+ 浅底（它是个"引用块"，不是控件）。 */
 QLabel#LandingPreview {
