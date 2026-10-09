@@ -9,6 +9,9 @@
 界面对象（`self.append` 日志、`self.config` 配置、`self.ed_*` 控件），
 拆成独立类就要把十几个引用逐个透传，收益不抵改动量。
 Mixin 只是把"同一批代码"换个文件放，`MainWindow` 那边一行都不用改。
+
+v6.4.9 又拆了一次同性质的：服务器凭据（问密码 + 探一次连接）搬到
+`export_remote.py` —— 加上它之后这个文件到了 1026 行，顶过上限守卫。
 """
 
 from html import escape as html_escape
@@ -22,8 +25,9 @@ from PyQt5.QtGui import QColor, QGuiApplication
 
 from ... import theme
 from ...core import logger
-from ..common import SP
+from ..common import REMOTE_TARGETS, SP
 from ..widgets import CaretGlyph, RadioDot, StatusGlyph
+from .export_remote import RemoteCredentialMixin
 
 
 class TargetCard(QWidget):
@@ -80,7 +84,7 @@ class TargetCard(QWidget):
         super().mouseReleaseEvent(event)
 
 
-class ExportTargetMixin:
+class ExportTargetMixin(RemoteCredentialMixin):
     # ---------- 导出目标（数据往哪儿送） ----------
     # 逻辑层在 v6.3.6 就接好了（`DataUploader` 按 `export_target` 分流），
     # 这里只解决"让现场知道能选、并且选完记得住"。
@@ -115,6 +119,7 @@ class ExportTargetMixin:
         点它才展开。`cb_export_target` 仍然保留（藏在面板里），
         既有守卫断言的是它的 `currentData()`，不用改。
         """
+        self._init_remote_state()   # 服务器侧的凭据/连接状态
         self.chip_export_target = QToolButton()
         self.chip_export_target.setObjectName("ExportChip")
         self.chip_export_target.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
@@ -312,6 +317,12 @@ class ExportTargetMixin:
         if panel.isVisible():
             panel.hide()
             return
+        # 打开前先刷一次芯片（v6.4.9）：服务器目标的颜色取决于"凭据 / 连接"，
+        # 而凭据可能是在**别的入口**输入的（上传时的密码框、数据页浏览远端），
+        # 只在自己这条路径上刷就必然漏 —— 表现为"我明明输过密码，它还是灰的"。
+        # **必须在算位置之前**：刷芯片会改它的宽度，而面板是拿芯片宽度对齐的，
+        # 先算位置再改宽度，面板就会与芯片错开一截。
+        self._refresh_chip()
         panel.adjustSize()                      # 先按内容定尺寸，再算位置
         chip = self.chip_export_target
         top_left = chip.mapToGlobal(QPoint(0, chip.height() + 6))
@@ -474,6 +485,10 @@ class ExportTargetMixin:
         # 现场的反应就是"挨个点一遍找当前是哪个"，而第一次点的那个
         # 会把配置改掉（配置本来是 server，一点就变 disk）。
         self._sync_option_visuals()
+        # 回填后也补一次芯片：目标不是 disk/both 时，上面那条探盘分支不会跑，
+        # 芯片就会停在构建时的初值上 —— 而配置里可能本来就有服务器密码
+        # （`remote_password`），那"凭据就绪"这件事必须开机就显示出来。
+        self._refresh_chip()
 
     def _set_disk_row_visible(self, visible: bool) -> None:
         """挂载点配置块的显隐（只在面板内部用）。
@@ -498,12 +513,14 @@ class ExportTargetMixin:
         self._set_chip_title(short)
 
         if target not in ("disk", "both"):
-            # 服务器：没有盘的概念，灰点即可。别在这里显示"未就绪" ——
-            # 那是"你选了移动硬盘但盘没插好"的提醒，跟这个目标无关。
-            self.chip_glyph.set_kind("none")
-            self.lb_chip_caption.setText("")
-            theme.set_state(self.chip_export_target, "none")
-            self.chip_caret.set_tone("none")
+            # 服务器：**没有盘的概念**，显示的是远端凭据/连接的状态。
+            # 别在这里显示盘的状态 —— 那是"你选了移动硬盘但盘没插好"的提醒，
+            # 跟这个目标无关（盘没插好却报个「未就绪」，会让人以为数据发不出去）。
+            kind, caption = self._remote_chip_state()
+            self.chip_glyph.set_kind(kind)
+            self.lb_chip_caption.setText(caption)
+            theme.set_state(self.chip_export_target, kind)
+            self.chip_caret.set_tone(kind)
             self._refit_chip()
             return
 
@@ -561,6 +578,12 @@ class ExportTargetMixin:
         self._sync_option_visuals()
         # 面板选择完就收起：现场是「设置好 → 立刻开始录」，面板留着挡视线。
         self.export_panel.hide()
+        # 选了需要远端的档位就**当场**要密码、并验一次连接（v6.4.9）。
+        # 延后一轮的原因与 `_toggle_export_panel` 完全相同：此刻这次点击还没走完，
+        # 面板又是个 `Qt.Popup`（正处在"等按键全部释放才开始抓鼠标"的过渡态），
+        # 这时候弹模态输入框，现场表现是"密码框弹出来了，但第一下敲不进字"。
+        if value in REMOTE_TARGETS:
+            QTimer.singleShot(0, self._prompt_remote_credentials)
 
     def _sync_option_visuals(self) -> None:
         """把三张卡片的选中态与可点性刷成当前值。"""

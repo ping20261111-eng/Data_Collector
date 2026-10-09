@@ -3436,10 +3436,14 @@ def _inline_task_thread(monkeypatch):
     from data_collector.ui import end_effector as end_effector_module
     from data_collector.ui import posture as posture_module
     from data_collector.ui import posture_modules as posture_modules_module
+    from data_collector.ui.panels import export_remote as export_remote_module
     monkeypatch.setattr(gripper_module, "LocalTaskThread", _InlineThread)
     monkeypatch.setattr(end_effector_module, "LocalTaskThread", _InlineThread)
     monkeypatch.setattr(posture_module, "LocalTaskThread", _InlineThread)
     monkeypatch.setattr(posture_modules_module, "LocalTaskThread", _InlineThread)
+    # v6.4.9 加入：服务器凭据探连（选「服务器」时的那个后台任务）。漏了它，
+    # 相关用例会**真去连 SFTP** —— 离屏环境里表现为卡住或认证超时。
+    monkeypatch.setattr(export_remote_module, "LocalTaskThread", _InlineThread)
 
 
 def test_stop_main_cleans_up_in_background_after_confirm(ui_env, monkeypatch):
@@ -6157,20 +6161,214 @@ def test_a_missing_disk_shows_warn_on_the_chip(status_env):
 
 
 def test_the_server_target_never_shows_a_disk_warning(status_env):
-    """选了服务器就别报「未就绪」—— 那个提醒跟这个目标无关。
+    """选了服务器就**不许带着盘的状态** —— 那个提醒跟这个目标无关。
 
-    没有盘的概念，却显示一颗警告图标，会让人以为数据发不出去了。
+    没有盘的概念，却显示一句「未就绪」，会让人以为数据发不出去了。
+    （v6.4.9 起服务器态**自己**也会有 warn —— 那是"连不上服务器"，
+      与盘无关；这里钉的是盘的告警不许串过来。）
     """
     win, _cm, _status = status_env
     win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
     win.ed_disk_mount.setText("/definitely/not/here")
     win.on_disk_mount_edited()
+    assert win.chip_glyph._kind == "warn"          # 盘确实没就绪
 
     win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
 
-    assert win.chip_glyph._kind == "none", \
-        f"服务器态不该显示警告图标，实际 {win.chip_glyph._kind}"
-    assert win.lb_chip_caption.text() == "", "服务器态不该有可用空间文案"
+    assert win.lb_chip_caption.text() == "", \
+        f"服务器态不该带盘的状态文案，实际「{win.lb_chip_caption.text()}」"
+    assert win.chip_glyph._kind != "warn", \
+        "盘没就绪不该在服务器目标上报 warn（这里没跑过任何探连）"
+    assert win.ed_disk_mount.text() == "/definitely/not/here"   # 配置本身还在，只是不显示
+
+
+# ---------- v6.4.9：服务器凭据（当场问密码 + 验连接）+ 芯片圆点 ----------
+# 三条现场反馈：① 选「服务器」应当当场弹密码框并连一次；
+# ② 输完密码那个点应当变绿；③ 三态一律**圆点**，不要对勾。
+
+
+def test_the_server_chip_dot_follows_the_credentials(status_env):
+    """服务器芯片前面那个点由**凭据**决定（反馈 ②）。
+
+    没有凭据是灰点（"还不知道能不能用"），拿到密码就是绿点。
+    这里直接改 `uploader.password` 再刷芯片 —— 与"上传时被问过密码"是同一条路：
+    密码只存内存一个字段，芯片因此不会出现"我输过密码它还是灰的"。
+    """
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
+
+    win.uploader.password = ""
+    win._refresh_chip()
+    assert (win.chip_glyph._kind, win.lb_chip_caption.text()) == ("none", ""), \
+        f"还没有凭据时该是灰点、无文案，实际 {win.chip_glyph._kind}「{win.lb_chip_caption.text()}」"
+
+    win.uploader.password = "typed-just-now"
+    win._refresh_chip()
+    assert win.chip_glyph._kind == "ok", \
+        f"输入密码后服务器前面应当是绿点，实际 {win.chip_glyph._kind}"
+    assert win.chip_export_target.property("state") == "ok"
+    assert win.lb_chip_caption.text() == "", "服务器常态不该有文案（原因归日志区）"
+
+
+def _spy_deferred_prompt(monkeypatch):
+    """把 `export_target` 里的 `QTimer` 换成只记录"挂了什么回调"的替身。
+
+    ## 为什么不在这里跑事件循环（**本文件的纪律，别再踩**）
+
+    本文件头有一条实测结论：**跑完前面那两百多个界面用例之后，
+    `processEvents()` 会段错误**（连跑三次 100% 复现；用"只取夹具窗口 + 调一次
+    `processEvents()`"的最小用例放在同一位置照样崩，放到文件最前面就不崩 ——
+    与用例代码无关，是那一串用例累积出来的环境状态；生产代码在独立进程里
+    建/销窗口跑同一条调用链完全不崩）。详见
+    `test_the_panel_opens_deferred_not_inside_the_click_handler` 的注释。
+
+    所以这里照那条守卫的办法：**只验接线**（挂没挂、挂的是不是延后一轮），
+    需要执行时就**自己调那个回调**，不把会崩的窗口操作留在测试里。
+    """
+    from data_collector.ui.panels import export_target as et
+
+    scheduled = []
+
+    class _FakeTimer:
+        @staticmethod
+        def singleShot(ms, fn):
+            scheduled.append((ms, fn))
+
+    monkeypatch.setattr(et, "QTimer", _FakeTimer)
+    return scheduled
+
+
+def test_clicking_the_server_card_asks_the_password_then_verifies(status_env, monkeypatch):
+    """点「服务器」：没凭据 → **延后一轮**弹密码框 → 后台验一次连接（反馈 ①）。
+
+    两件事一起钉：① 点卡片当场**不**弹框（那会在点击尚未走完时弹模态框 ——
+    面板是 `Qt.Popup`，现场表现是"框弹出来了但第一下敲不进字"）；
+    ② 那次延后回调执行起来，确实会问一次密码、验一次连接，并把点刷成绿的。
+    """
+    import data_collector.ui.panels.export_remote as er
+    win, _cm, _status = status_env
+    _inline_task_thread(monkeypatch)
+    win.uploader.password = ""
+    seen = {"asked": 0, "probed": 0}
+
+    def fake_ask(uploader, parent=None):
+        seen["asked"] += 1
+        uploader.password = "typed"              # 替用户把密码填进去
+        return True
+
+    def fake_probe():
+        seen["probed"] += 1
+        return {"ok": True, "kind": "ok", "msg": ""}
+
+    scheduled = _spy_deferred_prompt(monkeypatch)
+    monkeypatch.setattr(er, "ensure_remote_password", fake_ask)
+    monkeypatch.setattr(win, "_probe_remote_credentials", fake_probe)
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))   # 先离开服务器
+
+    win.on_target_option_clicked("server")
+
+    assert win.cb_export_target.currentData() == "server", "选了就该切过去"
+    assert len(scheduled) == 1 and scheduled[0][0] == 0, \
+        f"「问密码」应交给 QTimer.singleShot(0, ...)，实际 {scheduled}"
+    assert seen["asked"] == 0, "点卡片那一刻还不该弹框（要等这次点击彻底走完）"
+
+    scheduled[0][1]()                            # 手动跑那次延后回调
+
+    assert seen == {"asked": 1, "probed": 1}, f"应当问一次密码、验一次连接，实际 {seen}"
+    assert win.chip_glyph._kind == "ok", f"验证通过后应当是绿点，实际 {win.chip_glyph._kind}"
+
+
+def test_clicking_the_disk_card_never_asks_for_a_password(status_env, monkeypatch):
+    """选「移动硬盘」**绝不问**服务器密码 —— 离线现场根本没人知道那串东西。
+
+    这条是 `REMOTE_TARGETS` 那道分流的守卫：为了写本地盘被问一次密码，
+    是纯粹的骚扰（而且问完也没有任何用途）。
+    断言"什么都没被挂上"，所以同样不需要跑事件循环（理由见 `_spy_deferred_prompt`）。
+    """
+    import data_collector.ui.panels.export_remote as er
+    win, _cm, _status = status_env
+    _inline_task_thread(monkeypatch)
+    asked = []
+
+    scheduled = _spy_deferred_prompt(monkeypatch)
+    monkeypatch.setattr(er, "ensure_remote_password",
+                        lambda *a, **k: asked.append(1) or True)
+
+    win.on_target_option_clicked("disk")
+
+    assert win.cb_export_target.currentData() == "disk"
+    assert scheduled == [], "移动硬盘目标不该挂任何问密码的回调"
+    assert asked == [], "移动硬盘目标不该弹远端密码框"
+
+
+def test_the_chip_goes_green_before_the_probe_returns(status_env, monkeypatch):
+    """凭据到手就先亮绿点，**不等网络**回来 —— 探连只负责把绿点推翻。
+
+    这条钉的是顺序：若反过来（先等探连成功才变绿），现场输完密码会先看到
+    两三秒的灰点，而网络慢时完全不知道程序在干什么。
+    """
+    win, _cm, _status = status_env
+    _inline_task_thread(monkeypatch)
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
+    win.uploader.password = "pwd"
+    observed = {}
+
+    def fake_probe():
+        observed["kind_at_probe_time"] = win.chip_glyph._kind
+        return {"ok": True, "kind": "ok", "msg": ""}
+
+    monkeypatch.setattr(win, "_probe_remote_credentials", fake_probe)
+    win._start_remote_probe()
+
+    assert observed["kind_at_probe_time"] == "ok", \
+        "凭据到手就该先亮绿点（不能等网络回来才有反馈）"
+
+
+def test_a_rejected_server_password_is_cleared_and_the_dot_goes_warn(status_env):
+    """密码错：**清掉它** + 芯片变琥珀「未就绪」。
+
+    清密码与上传路径同一条规则 —— 不清的话，用户会带着一个错密码反复重试，
+    而每次都只报同一句错。
+    """
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
+    win.uploader.password = "wrong"
+    win._refresh_chip()
+    assert win.chip_glyph._kind == "ok"          # 凭据在 → 绿
+
+    win._on_remote_probe_finished(True, {"ok": False, "kind": "auth", "msg": "认证失败"}, "")
+
+    assert win.uploader.password == "", "认证失败必须清掉密码（与上传路径同一条规则）"
+    assert win.chip_glyph._kind == "warn"
+    assert win.lb_chip_caption.text() == "未就绪"
+    assert "认证失败" in win.log.toPlainText()
+
+
+def test_an_unreachable_server_keeps_the_password_and_reports_warn(status_env):
+    """连不上（网络）：**不清密码**（它可能是对的），芯片琥珀 + 日志写明原因。"""
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
+    win.uploader.password = "maybe-right"
+
+    win._on_remote_probe_finished(True, {"ok": False, "kind": "network", "msg": "socket.timeout"}, "")
+
+    assert win.uploader.password == "maybe-right", "网络不通不该清密码（只是这会儿连不上）"
+    assert win.chip_glyph._kind == "warn"
+    assert "连不上" in win.log.toPlainText()
+
+
+def test_a_successful_probe_clears_a_previous_failure(status_env):
+    """探连成功要把上一次的失败标记清掉，否则绿点永远回不来。"""
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
+    win.uploader.password = "pwd"
+    win._on_remote_probe_finished(True, {"ok": False, "kind": "network", "msg": "x"}, "")
+    assert win.chip_glyph._kind == "warn"
+
+    win._on_remote_probe_finished(True, {"ok": True, "kind": "ok", "msg": ""}, "")
+
+    assert win.chip_glyph._kind == "ok", "重试成功后应当回到绿点"
+    assert "连接正常" in win.log.toPlainText()
 
 
 def test_the_mount_config_lives_inside_the_panel_not_the_main_card(status_env):
@@ -6262,9 +6460,13 @@ def test_the_status_glyph_draws_all_three_kinds(qapp):
     # 其他界面用例之后，会段错误（实测崩在 show()+processEvents 那一行，
     # 而崩溃点离病因很远，只看栈顶会以为是别处坏了）。`render()` 走的是
     # 同一条 paintEvent，只是不经过窗口系统，行为确定得多。
+    # **必须设 `WA_TranslucentBackground`**（v6.4.9 补）：没有父级的控件是个窗口，
+    # `render()` 会把调色板底色也画上 —— 整张位图全不透明，这条断言于是**永远成立**、
+    # 什么都验不到（当时就是这么绿着的）。透明度归零之后，量到的才是真的画了什么。
     for kind in ("none", "ok", "warn", "danger"):
         glyph = StatusGlyph(kind)
         glyph.set_mode("light")
+        glyph.setAttribute(Qt.WA_TranslucentBackground, True)
         glyph.resize(13, 13)
         pixmap = QPixmap(glyph.size())
         pixmap.fill(Qt.transparent)
@@ -6273,7 +6475,70 @@ def test_the_status_glyph_draws_all_three_kinds(qapp):
         ptr = img.bits()
         ptr.setsize(img.byteCount())     # PyQt5 要显式给长度，否则 voidptr 未知大小
         arr = np.frombuffer(ptr, np.uint8).reshape(img.height(), img.width(), 4)
-        assert (arr[:, :, 3] > 30).sum() > 10, f"{kind} 图标几乎没画出来"
+        assert (arr[:, :, 3] > 30).sum() > 60, \
+            f"{kind} 图标几乎没画出来（实心圆点应占 13×13 里的大半）"
+
+
+def test_the_glyph_is_a_filled_dot_in_every_state(qapp):
+    """三态 + danger **都是实心圆点**，只有颜色不同（v6.4.9 反馈 ③）。
+
+    此前"就绪"画的是**对勾**、"未就绪"画的是"圆环 + 感叹号"—— 同一颗芯片上
+    三种形状，扫视时要先认形状再读颜色，与设计稿不符（现场截的图就是那个对勾）。
+    形状统一之后只剩颜色一件事。
+
+    判定用像素而不是看图，三条一起才排得掉"对勾/圆环"：
+    ① 外接框接近正方形（对勾是斜的，圆环是空心）；② 填充率 ≈ π/4（描边图形远低于此）；
+    ③ 直径够大（设计稿量到的比例是 圆点13px / 药丸高31px ≈ 0.42 → 30px 芯片上 12px）。
+    """
+    import numpy as np
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QPixmap
+
+    from data_collector import theme
+    from data_collector.ui.widgets import StatusGlyph
+
+    def _rgb(hexstr):
+        s = hexstr.lstrip("#")
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+
+    palette = theme.palette("light")
+    seen = {}
+    for kind, token in (("none", "muted2"), ("ok", "ok"),
+                        ("warn", "warn"), ("danger", "danger")):
+        glyph = StatusGlyph(kind)
+        glyph.set_mode("light")
+        # 没有父级的控件是个窗口，`render()` 会连调色板底色一起画 ——
+        # 不关掉它，量出来的"外接框"永远是整张位图（对勾也能通过）。
+        glyph.setAttribute(Qt.WA_TranslucentBackground, True)
+        pixmap = QPixmap(glyph.size())
+        pixmap.fill(Qt.transparent)
+        glyph.render(pixmap)
+        img = pixmap.toImage()
+        ptr = img.bits()
+        ptr.setsize(img.byteCount())
+        # 注意通道顺序：`toImage()` 给的是 **BGRA**（小端下的 ARGB32），
+        # 第 4 个通道才是 alpha —— 所以下面取色时要按 B,G,R 还原。
+        arr = np.frombuffer(ptr, np.uint8).reshape(img.height(), img.width(), 4)
+        mask = arr[:, :, 3] > 30
+        ys, xs = np.where(mask)
+        w = int(xs.max() - xs.min() + 1)
+        h = int(ys.max() - ys.min() + 1)
+        assert abs(w - h) <= 1, f"{kind} 不是圆：外接框 {w}×{h}（对勾/圆环会明显不等）"
+        assert mask.sum() >= 0.75 * np.pi * (w / 2) * (h / 2), \
+            (f"{kind} 不像实心圆点：填充率 {mask.sum() / (w * h):.2f}"
+             f"（描边图形 —— 对勾、圆环 —— 会明显低于实心圆的 0.79）")
+        assert w >= 11, f"{kind} 圆点只有 {w}px（设计稿比例 ≈ 芯片高的 0.4 → 应 ≥11px）"
+        # 取色只用**完全不透明**的像素：位图是预乘 alpha 的，边缘那些半透明像素
+        # 的 RGB 已被 alpha 缩过，混进来会把颜色算暗（实测绿点会算成 #28884A）。
+        core = arr[:, :, 3] == 255
+        assert core.sum() > 20, f"{kind} 圆心没有实心区域"
+        b, g, r = (float(v) for v in arr[core][:, :3].mean(axis=0))
+        want = _rgb(palette[token])
+        assert all(abs(got - t) <= 20 for got, t in zip((r, g, b), want)), \
+            f"{kind} 圆点颜色 #{int(r):02X}{int(g):02X}{int(b):02X} 与令牌 {token}={palette[token]} 不符"
+        seen[kind] = (r, g, b)
+
+    assert seen["ok"] != seen["none"], "就绪态与常态必须是两种颜色（否则绿点白加）"
 
 
 def test_the_panel_is_a_popup_not_a_menu(status_env):
@@ -6552,12 +6817,19 @@ def test_the_chip_carries_an_expand_indicator(status_env):
 
 
 def test_the_expand_indicator_follows_the_chip_state(status_env, monkeypatch, tmp_path):
-    """指示的颜色跟着芯片状态走 —— 一颗芯片上不该并存两套颜色语言。"""
+    """指示的颜色跟着芯片状态走 —— 一颗芯片上不该并存两套颜色语言。
+
+    服务器态这里**不写死颜色**：v6.4.9 起它也由状态决定（凭据就绪 = 绿）。
+    断言"跟着芯片的 state 走"才是这条守卫的本意 —— 写死"服务器必是常态色"
+    就会在服务器真的变成"就绪"时误报（那时它是对的，错的是断言）。
+    """
     import data_collector.disk_export as de
 
     win, _cm, _status = status_env
     win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("server"))
-    assert win.chip_caret._tone == "none", f"服务器态应是常态色，实际 {win.chip_caret._tone}"
+    assert win.chip_caret._tone == win.chip_export_target.property("state"), \
+        (f"指示的颜色没跟芯片状态走：指示 {win.chip_caret._tone}"
+         f" vs 芯片 {win.chip_export_target.property('state')}")
 
     monkeypatch.setattr(de.DiskExportTarget, "is_mounted", lambda self: True)
     monkeypatch.setattr(de.DiskExportTarget, "filesystem_type", lambda self: "exFAT")
