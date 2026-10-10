@@ -540,12 +540,17 @@ class PresetCard(QFrame):
 # 模块使能（并入本页）
 # ============================================================
 class ModuleEnableRow(QFrame):
-    """一个模块的使能行：名字 + 状态徽章 + **一个**按钮（躯干 / 双臂并排放在一行里）。
+    """一个模块的使能行：名字 + 状态徽章 + 按钮（躯干 / 双臂并排放在一行里）。
 
-    **为什么只给一个按钮**（现场要求）：检测到"已使能"就只显示「下使能」，未使能就只
+    **为什么平时只给一个按钮**（现场要求）：检测到"已使能"就只显示「下使能」，未使能就只
     显示「上使能」。两个按钮都摆出来，等于让人自己判断该点哪个 —— 判断错了就是**往已使能
     的状态上再发一次 connect**，或者在下完之后又点一次下使能；而且"哪个能点"这件事
     界面明明已经知道（它每 400ms 读一次状态），不该推给现场。
+
+    **唯一的例外是「只通了一侧」**（v6.4.10，现场报的）：那种状态下主按钮按上面的规则
+    显示「上使能」（补的是没通的那一侧），于是**已经通上的那一侧没有下电出口** ——
+    现场只能去关程序或直接断电。所以这一态额外给一个「全部下电」，其余两态不显示，
+    "该点哪个"依然不推给现场。
 
     并入姿势控制的原因很直接：**上使能是这一页的前置条件**（没使能就没有真实角度、
     也不能运动）。独立页在 v6.0.0 已按现场要求删除，判据与步骤仍走 `MODULE_STEPS` /
@@ -572,6 +577,17 @@ class ModuleEnableRow(QFrame):
         self.state_badge = badge(f"{name} —")
         row.addWidget(self.state_badge, 1)
 
+        #: 「全部下电」只在"只通了一侧"时出现（见类注释）。它走的是**下使能**那条
+        #: 既有路径，不新增话题、不新增动作 —— 现场验证过的链路不变。
+        self.btn_disable = QPushButton("全部下电")
+        self.btn_disable.setProperty("variant", "ghost-compact")
+        self.btn_disable.setToolTip(
+            f"断开{name}（两侧一起，机构失去保持力）\n"
+            "只在「只通了一侧」时出现：那种状态下主按钮是「上使能」，没有下电出口")
+        self.btn_disable.clicked.connect(self._on_disable_clicked)
+        self.btn_disable.setVisible(False)
+        row.addWidget(self.btn_disable)
+
         self.btn = QPushButton("上使能")
         self.btn.setProperty("variant", "ghost-compact")
         self.btn.clicked.connect(self._on_clicked)
@@ -583,8 +599,16 @@ class ModuleEnableRow(QFrame):
         self._turn_on = bool(turn_on)
         self.btn.setText("上使能" if self._turn_on else "下使能")
 
+    def set_partial(self, partial: bool) -> None:
+        """「只通了一侧」时多给一个下电出口；其余状态收起来。"""
+        self.btn_disable.setVisible(bool(partial))
+
     def _on_clicked(self) -> None:
         self.action_requested.emit(self.module, self._turn_on)
+
+    def _on_disable_clicked(self) -> None:
+        # 下电走既有的下使能路径（connect false 断的是两侧，与文案一致）
+        self.action_requested.emit(self.module, False)
 
 
 

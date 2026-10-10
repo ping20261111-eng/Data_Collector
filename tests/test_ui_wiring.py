@@ -5719,7 +5719,7 @@ def test_posture_module_enable_is_independent_per_module(status_env, tmp_path, m
 
 
 def test_posture_single_arm_gets_disable_button(status_env, tmp_path, monkeypatch):
-    """只通了一侧时，必须有一个「全部下电」出口（v6.4.6，现场报的）。
+    """只通了一侧时，必须有一个「全部下电」出口（v6.4.10，现场报的）。
 
     现场症状：机械臂只连上一侧时，模块行按规则显示「上使能」（补没通的那侧），
     于是**已通的那一侧没有下电出口** —— 只能去关程序或直接断电。

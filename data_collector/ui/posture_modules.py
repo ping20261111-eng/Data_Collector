@@ -223,11 +223,15 @@ class PostureModulesMixin:
                 self._apply_buttons()
 
     def _apply_module_buttons(self):
-        """每个模块**只留一个按钮**，文案随检测到的状态走（现场要求）。
+        """每个模块的按钮随检测到的状态走（现场要求）。
 
-        判定规则只有一条：**已使能 → 这一次点击是「下使能」；其余（未使能 / 只通一侧 /
-        读不到）→ 「上使能」**。只通一侧时按"上使能"处理是对的 —— 补的是没通的那一侧；
-        读不到状态时按钮禁用并写明原因（`monitor_ok` 为假），不打哑谜。
+        主按钮的判定规则只有一条：**已使能 → 这一次点击是「下使能」；其余（未使能 /
+        只通一侧 / 读不到）→ 「上使能」**。只通一侧时按"上使能"处理是对的 —— 补的是
+        没通的那一侧；读不到状态时按钮禁用并写明原因（`monitor_ok` 为假），不打哑谜。
+
+        v6.4.10：**只通一侧时额外出现「全部下电」**。那一态下主按钮是「上使能」，
+        已通的那一侧原本没有下电出口（现场只能去关程序或断电）。只在 partial 出现，
+        正常两态不显示，避免把"该点哪个"推回给现场。
         """
         monitor_ok = bool(self.view.get("available"))
         for module, row in self.module_rows.items():
@@ -235,13 +239,17 @@ class PostureModulesMixin:
             name = MODULE_NAMES[module]
             busy = module in self._module_actions
             turn_on = state != MODULE_STATE_ON
+            partial = (state == MODULE_STATE_PARTIAL)
             row.set_next_action(turn_on)
+            row.set_partial(monitor_ok and partial)
             row.btn.setEnabled(monitor_ok and not busy)
+            # 下电按钮与主按钮同生共死：动作进行中一起禁掉，避免连点两个出口
+            row.btn_disable.setEnabled(monitor_ok and not busy)
             if not monitor_ok:
                 why = "状态读不出来：先启动状态监控（点「启动程序」会自动起）"
             elif busy:
                 why = f"{name}的使能动作正在执行，等它出结果"
-            elif turn_on and state == MODULE_STATE_PARTIAL:
+            elif turn_on and partial:
                 why = f"{name}只通了一侧，点这里补齐另一侧（会二次确认）"
             elif turn_on:
                 why = "上使能（会二次确认；机构会立即进入可控状态）"
