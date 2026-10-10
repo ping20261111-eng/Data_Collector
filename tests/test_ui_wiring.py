@@ -4607,10 +4607,15 @@ def _seed_motion_presets(tmp_path):
 
 
 def _posture_status(status_file, *, trunk=True, arms=True, moving=False,
-                    emergency="解锁", joint=True):
-    """写一份能用的状态文件：躯干 6 轴 + 双臂 7 轴的真实角度（来自 state 话题）。"""
+                    emergency="解锁", joint=True, arms_partial=False):
+    """写一份能用的状态文件：躯干 6 轴 + 双臂 7 轴的真实角度（来自 state 话题）。
+
+    `arms_partial=True` 造"只通了一侧"：左通、右没通（`MODULE_STATE_PARTIAL`）——
+    这一态下单臂下电出口是 v6.3.7 新加的，用例要能复现它。
+    """
     arm_entry = {"has_data": arms, "age_sec": 0.2 if arms else None, "enabled": arms,
-                 "enabled_left": arms, "enabled_right": arms}
+                 "enabled_left": arms,
+                 "enabled_right": (arms and not arms_partial)}
     if arms and joint:
         for side, sign in (("left", 1), ("right", -1)):
             arm_entry[side] = {
@@ -5517,6 +5522,71 @@ def test_posture_module_enable_is_independent_per_module(status_env, tmp_path, m
     dialog._module_actions["arms"]["deadline"] = 0.0
     dialog._collect_module_actions()
     assert "未确认" in dialog.result.toPlainText()
+
+
+def test_posture_single_arm_gets_disable_button(status_env, tmp_path, monkeypatch):
+    """只通了一侧时，必须有一个「全部下电」出口（v6.3.7，现场报的）。
+
+    现场症状：机械臂只连上一侧时，模块行按规则显示「上使能」（补没通的那侧），
+    于是**已通的那一侧没有下电出口** —— 只能去关程序或直接断电。
+
+    同时钉住反向：正常两态（全通 / 全断）**不出现**这个按钮 —— 多摆一个出口会把
+    "该点哪个"推回给现场，而这正是当初定"一个模块一个按钮"要避免的。
+    """
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file, trunk=False, arms=True, arms_partial=True)
+    dialog = _open_posture(win, monkeypatch)
+    monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    sent = []
+    monkeypatch.setattr(win.launcher, "set_module_enabled",
+                        lambda module, enabled, timeout=30.0:
+                        sent.append((module, enabled)) or ["已下发"])
+
+    arms_row = dialog.module_rows["arms"]
+    dialog.refresh()
+
+    # 只通一侧：主按钮仍是「上使能」（补齐另一侧），同时出现下电出口
+    assert arms_row.btn.text() == "上使能"
+    assert arms_row.btn_disable.isVisible() is True
+
+    # 点下电 → 走既有的下使能路径（connect false），不新增话题
+    arms_row.btn_disable.click()
+    assert sent == [("arms", False)]
+
+    # 全断 → 主按钮「上使能」，不给下电出口（没东西可下）
+    _refresh_status(dialog, status_file, trunk=False, arms=False)
+    assert dialog.module_rows["arms"].btn_disable.isVisible() is False
+
+    # 全通 → 主按钮本身就是「下使能」，不需要第二个出口
+    _refresh_status(dialog, status_file, trunk=False, arms=True)
+    assert dialog.module_rows["arms"].btn.text() == "下使能"
+    assert dialog.module_rows["arms"].btn_disable.isVisible() is False
+
+
+def test_posture_disable_button_disabled_while_action_busy(status_env, tmp_path, monkeypatch):
+    """使能动作进行中，下电出口与主按钮一起禁掉 —— 两个出口都点会发出互相矛盾的指令。"""
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file, trunk=False, arms=True, arms_partial=True)
+    dialog = _open_posture(win, monkeypatch)
+    monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+
+    stashed = []
+
+    def _hang(module, enabled, timeout=30.0):
+        stashed.append((module, enabled))
+        return ["已下发"]
+
+    monkeypatch.setattr(win.launcher, "set_module_enabled", _hang)
+
+    dialog.refresh()
+    dialog.on_module_action("arms", True)          # 上使能进行中
+
+    assert dialog.module_rows["arms"].btn.isEnabled() is False
+    assert dialog.module_rows["arms"].btn_disable.isEnabled() is False
 
 
 def test_arm_diagram_shows_front_and_side_views_side_by_side():

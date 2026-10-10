@@ -37,7 +37,7 @@ class _Headers(dict):
 
 
 class _FakeResponse:
-    """够用的 urlopen 返回值替身：支持分块 read 与 headers.get。"""
+    """够用的取版本响应替身：支持分块 read 与 headers.get。"""
 
     def __init__(self, body: bytes, status: int = 200, length: int = None):
         self._body = body
@@ -57,13 +57,20 @@ class _FakeResponse:
         return False
 
 
-def _patch_urlopen(monkeypatch, response, recorder=None):
-    def fake_urlopen(request, timeout=None):
+def _patch_direct(monkeypatch, response, recorder=None):
+    """顶掉取版本的**统一出口** `core_release.open_direct`。
+
+    这个接缝是 v6.4.10 从 `urllib.request.urlopen` 换过来的：为了让内网流量
+    不被系统代理劫持（见 `open_direct` 的注释），取列表与下载都改走自建的
+    **无代理** opener。桩必须跟着换 —— 继续打 `urlopen` 会打空，
+    用例就会真去连 `http://host/...`。
+    """
+    def fake_direct(request, timeout=None):
         if recorder is not None:
             recorder.append(request)
         return response
 
-    monkeypatch.setattr("data_collector.core_release.urllib.request.urlopen", fake_urlopen)
+    monkeypatch.setattr("data_collector.core_release.open_direct", fake_direct)
 
 
 def _release(size: int = 10, name: str = None) -> RemoteRelease:
@@ -152,7 +159,7 @@ def test_index_fetch_reports_unreachable(monkeypatch):
     def boom(*args, **kwargs):
         raise urllib.error.URLError("connection refused")
 
-    monkeypatch.setattr("data_collector.core_release.urllib.request.urlopen", boom)
+    monkeypatch.setattr("data_collector.core_release.open_direct", boom)
 
     with pytest.raises(AppError) as excinfo:
         ReleaseIndex("http://host/file/wheeled_robot/").fetch()
@@ -162,16 +169,66 @@ def test_index_fetch_reports_unreachable(monkeypatch):
 
 
 def test_index_fetch_reports_bad_response(monkeypatch):
-    _patch_urlopen(monkeypatch, _FakeResponse(b"<html><body>nothing</body></html>"))
+    _patch_direct(monkeypatch, _FakeResponse(b"<html><body>nothing</body></html>"))
     with pytest.raises(AppError) as excinfo:
         ReleaseIndex("http://host/file/wheeled_robot/").fetch()
     assert excinfo.value.code is ErrorCode.REPO_BAD_RESPONSE
 
 
 def test_index_fetch_parses_page(monkeypatch):
-    _patch_urlopen(monkeypatch, _FakeResponse(INDEX_HTML.encode("utf-8")))
+    _patch_direct(monkeypatch, _FakeResponse(INDEX_HTML.encode("utf-8")))
     releases = ReleaseIndex("http://host/file/wheeled_robot").fetch()
     assert len(releases) == 3
+
+
+def test_version_fetch_ignores_the_environment_proxy(monkeypatch):
+    """取版本要**直连**，不被 `http_proxy` 劫持（v6.4.10 现场问题）。
+
+    现场复现：启动它的那个 shell 里带着 `http_proxy=http://127.0.0.1:7897/`，
+    `no_proxy=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,::1`
+    —— 而 urllib 的 `no_proxy` **只认主机名与域名后缀、不认 CIDR**：
+
+        proxy_bypass("172.16.10.2")  →  False      # 明明落在 172.16.0.0/12 里
+
+    于是这个纯内网请求被送去本机代理，代理没开 → 立刻 `Connection refused`；
+    界面上就是"看不到远端版本"。浏览器不吃这几个环境变量，所以
+    "浏览器能打开、程序看不到"这个对比特别容易把人带到"服务器坏了"上去。
+
+    这条用一个**真在跑**的本机 HTTP 服务 + 一个**死的**代理地址来钉：
+    只要哪天又退回 `urllib.request.urlopen`，请求就会去连那个死代理并失败。
+    """
+    import threading
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_GET(self):                                # noqa: N802 (HTTP 命名)
+            body = INDEX_HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):                   # 用例里别往 stderr 刷日志
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    # 死代理：端口 1 上没有任何东西在听
+    for name in ("http_proxy", "HTTP_PROXY", "https_proxy", "HTTPS_PROXY",
+                 "all_proxy", "ALL_PROXY"):
+        monkeypatch.setenv(name, "http://127.0.0.1:1/")
+    # `no_proxy` 清空：否则本机地址可能正好被放过，这条用例就白跑了
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setenv("NO_PROXY", "")
+    try:
+        url = f"http://127.0.0.1:{server.server_port}/wheeled_robot/"
+        releases = ReleaseIndex(url, timeout=5).fetch()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert len(releases) == 3, "环境里挂着代理时，取版本必须仍然直连到仓库"
 
 
 # ---------- 工作空间识别 ----------
@@ -217,7 +274,7 @@ def test_inspect_local_walks_through_all_states(tmp_path):
 def test_download_writes_archive_atomically(tmp_path, monkeypatch):
     release = _release(size=10)
     progress = []
-    _patch_urlopen(monkeypatch, _FakeResponse(b"0123456789"))
+    _patch_direct(monkeypatch, _FakeResponse(b"0123456789"))
 
     archive = ReleaseDownloader().download(
         release, tmp_path, on_progress=lambda *args: progress.append(args))
@@ -232,7 +289,7 @@ def test_download_resumes_from_part(tmp_path, monkeypatch):
     release = _release(size=10)
     (tmp_path / (release.name + PART_SUFFIX)).write_bytes(b"01234")
     requests = []
-    _patch_urlopen(monkeypatch, _FakeResponse(b"56789", status=206), requests)
+    _patch_direct(monkeypatch, _FakeResponse(b"56789", status=206), requests)
 
     archive = ReleaseDownloader().download(release, tmp_path)
 
@@ -248,7 +305,7 @@ def test_download_restarts_when_server_ignores_range(tmp_path, monkeypatch):
     """
     release = _release(size=10)
     (tmp_path / (release.name + PART_SUFFIX)).write_bytes(b"XXXXX")
-    _patch_urlopen(monkeypatch, _FakeResponse(b"0123456789", status=200))
+    _patch_direct(monkeypatch, _FakeResponse(b"0123456789", status=200))
 
     archive = ReleaseDownloader().download(release, tmp_path)
 
@@ -257,7 +314,7 @@ def test_download_restarts_when_server_ignores_range(tmp_path, monkeypatch):
 
 def test_download_detects_truncated_body_and_keeps_part(tmp_path, monkeypatch):
     release = _release(size=10)
-    _patch_urlopen(monkeypatch, _FakeResponse(b"0123", length=10))    # 声明 10，只给 4
+    _patch_direct(monkeypatch, _FakeResponse(b"0123", length=10))    # 声明 10，只给 4
 
     with pytest.raises(AppError) as excinfo:
         ReleaseDownloader().download(release, tmp_path)
@@ -269,7 +326,7 @@ def test_download_detects_truncated_body_and_keeps_part(tmp_path, monkeypatch):
 
 def test_download_cancel_keeps_part(tmp_path, monkeypatch):
     release = _release(size=1_000_000)
-    _patch_urlopen(monkeypatch, _FakeResponse(b"x" * 1000, length=1_000_000))
+    _patch_direct(monkeypatch, _FakeResponse(b"x" * 1000, length=1_000_000))
     calls = {"count": 0}
 
     def should_cancel():
@@ -306,7 +363,7 @@ def test_download_skips_when_archive_already_complete(tmp_path, monkeypatch):
     def boom(*args, **kwargs):
         pytest.fail("本地已有完整包时不该再发请求")
 
-    monkeypatch.setattr("data_collector.core_release.urllib.request.urlopen", boom)
+    monkeypatch.setattr("data_collector.core_release.open_direct", boom)
 
     archive = ReleaseDownloader().download(release, tmp_path)
     assert archive.read_bytes() == b"0123456789"
@@ -317,7 +374,7 @@ def test_download_retries_when_local_archive_is_short(tmp_path, monkeypatch):
     release = _release(size=10 * 1024 * 1024)
     (tmp_path / release.name).write_bytes(b"x" * 1024)
     requests = []
-    _patch_urlopen(monkeypatch, _FakeResponse(b"y" * (10 * 1024 * 1024)), requests)
+    _patch_direct(monkeypatch, _FakeResponse(b"y" * (10 * 1024 * 1024)), requests)
 
     ReleaseDownloader().download(release, tmp_path)
 

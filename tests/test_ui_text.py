@@ -25,7 +25,12 @@ TEXT_METHODS = {
     "setText", "setToolTip", "setPlaceholderText", "setInformativeText",
     "setWindowTitle", "setStatusTip", "setWhatsThis",
 }
-TEXT_CLASSES = {"QLabel", "QMessageBox", "QInputDialog", "append", "show_error"}
+#: 参数里带"给人看的文本"的调用名。**同时用于属性调用与裸名字调用**：
+#: `append` / `show_error` 是方法（`self.append(...)`），`_spec` 是模块级函数。
+#: **v6.4.10 补 `_spec`**：`errors.py` 里每条错误提示的建议文案都是它的第 4 个实参，
+#: 而那段文字会被 `describe()` 拼进界面 —— 不扫它，`REPO_BAD_RESPONSE` 那条
+#: "确认 version_repo_url 指向**包所在目录**"就带着一对星号发给了用户（现场只看到 `**`）。
+TEXT_CLASSES = {"QLabel", "QMessageBox", "QInputDialog", "append", "show_error", "_spec"}
 #: 各页 / 各执行器自己的"往日志区写一行"的口子（`#Console` 那个只读文本框）。
 #: **v6.3.0 补**：这些口的实参是普通字符串 / f-string，而星号真正落进的是它们内部那次
 #: `self.result.append(...)` / `self.progress(...)` —— AST 只看得到内部那一次调用的实参
@@ -90,3 +95,20 @@ def test_report_is_a_covered_text_sink():
     assert all(_is_text_call(node) for node in calls), \
         "`_report` 不在文本落点里 —— 日志里的星号守不住"
     assert "**" in _literal_parts(calls[0].args[0])
+
+
+def test_spec_is_a_covered_text_sink():
+    """`_spec` 必须在文本落点清单里（v6.4.10 补，理由同 `_report` 那条）。
+
+    它天生容易漏：错误提示的文字是 `_spec(ErrorCode.X, Owner.Y, True, "给人看的建议")`
+    的**第 4 个实参**，而 AST 只看得到这一次调用 —— 名字不在清单里就整段跳过。
+    实测漏掉的后果：`REPO_BAD_RESPONSE` 那句带着 `**包所在目录**` 直接显示给用户。
+    """
+    source = ('_spec(ErrorCode.REPO_BAD_RESPONSE, Owner.NETWORK, True,\n'
+              '      "确认 version_repo_url 指向**包所在目录**")\n')
+    calls = [node for node in ast.walk(ast.parse(source))
+             if isinstance(node, ast.Call)]
+    assert calls, "样例源码没解析出调用"
+    assert all(_is_text_call(node) for node in calls), \
+        "`_spec` 不在文本落点里 —— 错误提示里的星号守不住"
+    assert any("**" in _literal_parts(arg) for arg in calls[0].args)
