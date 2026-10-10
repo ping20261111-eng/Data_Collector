@@ -153,6 +153,37 @@ class LocalState:
         return "未下载"
 
 
+def open_direct(request, timeout: float):
+    """**直连**打开一个请求：对版本仓库一律不走代理（v6.4.10 现场问题）。
+
+    ## 为什么要显式关掉代理
+
+    `urllib` 默认会读 `http_proxy` / `HTTPS_PROXY` 等环境变量，并用 `no_proxy`
+    决定"哪些主机不走代理"。但它的 `no_proxy` **只认主机名与域名后缀，不认 CIDR**：
+
+        实测（本机，Python 3.10）
+        no_proxy=localhost,127.0.0.1,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12,::1
+        proxy_bypass("172.16.10.2")  →  **False**      ← 明明落在 172.16.0.0/12 里
+        getproxies()["http"]         →  http://127.0.0.1:7897/
+
+    于是这个**纯内网**请求被送去本机代理：代理没开 → 立刻
+    `Connection Refused`；代理开着 → 也白绕一圈（还可能被代理拒掉私网目标）。
+    现场表现就是"**浏览器能打开、程序看不到版本**" —— 浏览器不吃这几个环境变量，
+    所以这个对比会把人往"服务器坏了"的方向带。
+
+    `version_repo_url` 按设计就是内网文件服务器（例如 `http://172.16.10.2:9000/...`），
+    内网流量本就不该出代理，所以这里一律直连，**不看代理环境变量**。
+    代价：不支持"只能经代理访问的仓库"—— 那种部署与这个配置项的用途不符；
+    真要支持，改这一处即可（这也是把它单独抽成一个函数的原因）。
+
+    `ProxyHandler({})`（空字典）是标准库文档给出的"关掉自动探测代理"的写法；
+    每次新造一个 opener 而不是共用全局单例，避免多线程（取列表 / 下载各一个线程）
+    共享同一个 OpenerDirector。
+    """
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    return opener.open(request, timeout=timeout)
+
+
 def parse_autoindex(html: str, base_url: str,
                     suffix: str = ARCHIVE_SUFFIX) -> List[RemoteRelease]:
     """解析 nginx autoindex 页面，列出匹配 `suffix` 的版本包（新的在前）。
@@ -289,7 +320,7 @@ class ReleaseIndex:
         """拉取版本列表。失败抛 AppError，界面按错误码给归属与建议。"""
         request = urllib.request.Request(self.base_url, headers={"User-Agent": USER_AGENT})
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with open_direct(request, self.timeout) as response:
                 raw = response.read()
                 charset = response.headers.get_content_charset() or "utf-8"
         except urllib.error.HTTPError as exc:
@@ -364,7 +395,9 @@ class ReleaseDownloader:
         if offset:
             request.add_header("Range", f"bytes={offset}-")
         try:
-            response = urllib.request.urlopen(request, timeout=self.timeout)
+            # 同样直连（见 `open_direct`）：下载走的是同一个内网地址，
+            # 被系统代理劫持的话 291MB 会绕去代理、甚至直接连不上。
+            response = open_direct(request, self.timeout)
         except urllib.error.HTTPError as exc:
             raise AppError(ErrorCode.REPO_UNREACHABLE,
                            f"下载 {release.name} 失败，服务器返回 HTTP {exc.code}") from exc

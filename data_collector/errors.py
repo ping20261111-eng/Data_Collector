@@ -104,9 +104,10 @@ _spec(ErrorCode.NOT_FOUND, Owner.USER, False,
       "重新选择数据目录")
 _spec(ErrorCode.REPO_UNREACHABLE, Owner.NETWORK, True,
       "确认能访问版本服务器（app_config.yaml 的 version_repo_url）：地址、端口、"
-      "以及本机是否在该内网里")
+      "以及本机是否在该内网里。本程序对版本仓库「直连、不走代理」（忽略 http_proxy "
+      "等环境变量），所以这里报连不上时不用去查代理设置")
 _spec(ErrorCode.REPO_BAD_RESPONSE, Owner.NETWORK, True,
-      "版本服务器返回的内容里解析不出包列表：确认 version_repo_url 指向**包所在目录**"
+      "版本服务器返回的内容里解析不出包列表：确认 version_repo_url 指向「包所在目录」"
       "（例如 …/file/wheeled_robot/），而不是它的上层")
 _spec(ErrorCode.TARGET_EXISTS, Owner.CONFIG, False,
       "目标目录已存在，程序不会覆盖（那可能就是正在使用的工作空间）："
