@@ -6,8 +6,10 @@
   字节数正确、内容错乱的包 —— 大小校验对此毫无察觉；
 - tar 成员名是外部数据，可以写成 `../../..`，解压前必须逐条校验。
 """
+import calendar
 import io
 import tarfile
+import time
 import urllib.error
 from pathlib import Path
 
@@ -16,8 +18,8 @@ import pytest
 from data_collector.core_release import (ARCHIVE_SUFFIX, PART_SUFFIX, RemoteRelease,
                                          ReleaseDownloader, ReleaseExtractor,
                                          ReleaseIndex, detect_workspace_root,
-                                         human_size, inspect_local, parse_autoindex,
-                                         parse_size)
+                                         human_size, inspect_local, mtime_epoch,
+                                         parse_autoindex, parse_size, release_epoch)
 from data_collector.errors import AppError, ErrorCode
 
 INDEX_HTML = """<html>
@@ -133,6 +135,95 @@ def test_parse_autoindex_marks_untagged_builds_as_official():
 def test_parse_autoindex_base_url_without_slash_still_joins():
     releases = parse_autoindex(INDEX_HTML, "http://host/file/wheeled_robot")
     assert releases[0].url.startswith("http://host/file/wheeled_robot/")
+
+
+# ---------- 排序：按时间（v6.4.12 现场） ----------
+def _row(name: str, date: str, size: str = "291M") -> str:
+    """造一行 autoindex。**独立于 INDEX_HTML** —— 排序这类用例要能自成一体。"""
+    return f'<a href="{name}">{name[:38]}..&gt;</a> {date}    {size}\n'
+
+
+def test_a_long_suffix_after_the_stamp_does_not_sink_the_package():
+    """时间戳后面跟**多段后缀**（`-fix_zyf1010_trunklimit`）时，包不能沉到列表最后。
+
+    现场（v6.4.12）：今天刚传的两个包叫 `…-202610121624-fix_zyf1010_trunklimit`，
+    而旧正则只容许时间戳后跟 `[A-Za-z0-9]+` **一段** —— 下划线让它整条匹配不上 →
+    `stamp` 变空串 → 被当成最旧的排到最后（"今天的新包跑到去年那些下面"）。
+    """
+    html = (
+        _row("wheeled_robot_x86_64-v1.4.0-develop-202608171511.tar.bz2",
+             "17-Aug-2026 07:12")
+        + _row("wheeled_robot_x86_64-v1.4.0-develop-202610121624"
+               "-fix_zyf1010_trunklimit.tar.bz2", "12-Oct-2026 08:25")
+        + _row("wheeled_robot_x86_64-v1.4.0-develop-202610121540"
+               "-fix_zyf1010_trunklimit.tar.bz2", "12-Oct-2026 07:42"))
+    releases = parse_autoindex(html, "http://host/")
+
+    assert [r.stamp for r in releases] == [
+        "202610121624", "202610121540", "202608171511"], \
+        "带长后缀的包没被解析出时间戳（于是沉底、看起来最旧）"
+    assert releases[0].kind == "fix", "类型只取时间戳后的**第一段**，人名/主题不参与分类"
+    assert releases[0].stamp_text == "10-12 16:24", "显示列也要跟着正确"
+
+
+def test_a_name_without_any_stamp_falls_back_to_the_server_time():
+    """名字里没有 12 位时间戳的包按**服务器时间列**落位，不是一律排到最后。
+
+    旧实现直接拿 `stamp` 字符串当排序键，空串最小 → 这类包永远沉底。
+    """
+    html = (
+        _row("wheeled_robot_x86_64-v1.4.0-develop-202608171511.tar.bz2",
+             "17-Aug-2026 07:12")
+        + _row("wheeled_robot_x86_64-v1.4.0-develop.tar.bz2", "12-Oct-2026 08:25"))
+    releases = parse_autoindex(html, "http://host/")
+
+    assert releases[0].name.endswith("-develop.tar.bz2"), \
+        "没有时间戳的包应当按服务器时间排到前面，而不是沉底"
+    assert releases[0].stamp == ""
+    assert releases[0].stamp_text == "12-Oct-2026 08:25", "没有时间戳时显示列退回服务器时间"
+
+
+def test_releases_are_sorted_by_time_not_by_name():
+    """排序键是**时间**，不是名字串 —— 名字字母序与时间序相反时按时间排。"""
+    html = (
+        _row("zzz_pkg-202601010900.tar.bz2", "01-Jan-2026 01:00")
+        + _row("aaa_pkg-202612310900.tar.bz2", "31-Dec-2026 01:00"))
+    releases = parse_autoindex(html, "http://host/")
+
+    assert [r.stamp for r in releases] == ["202612310900", "202601010900"]
+
+
+def test_the_server_time_column_is_read_as_gmt_without_the_locale():
+    """时间列是 **GMT**（HTTP 头的 `Date` 也是 GMT），且**不许依赖 LC_TIME**。
+
+    为什么不能 `time.strptime(..., "%d-%b-%Y %H:%M")`：`%b` 按区域设置认月份缩写，
+    机器人机 / 开发机的 locale 不是英文时这一列会**静默解析成 0** —— 而 0 在排序里
+    就等于"最旧"，表现又是"最新的包沉到底部"（同一个症状、另一个成因）。
+    """
+    expected = calendar.timegm((2026, 10, 12, 8, 25, 0))
+    assert mtime_epoch("12-Oct-2026 08:25") == expected
+    assert mtime_epoch("12-OCT-2026 08:25") == expected      # 大小写都认
+    assert mtime_epoch("12-Okt-2026 08:25") == 0             # 认不出的缩写 → 0，不乱猜
+    assert mtime_epoch("") == 0
+
+
+def test_a_stamp_is_read_in_local_time_while_the_column_is_utc():
+    """两个时间来源的时基不同，必须各自按正确的时基解释（搞混就是整体错 8 小时）。
+
+    时间戳 = **构建时的本机时间**（现场 +08:00）；时间列 = GMT。混排（带时间戳的包与
+    只带时间列的包排在一起）时，错 8 小时会让顺序错位 —— 而这类错位不会被任何
+    告警暴露，只能靠这条守卫。
+    """
+    stamp = "202610120900"
+    fields = (2026, 10, 12, 9, 0, 0)
+    entry = RemoteRelease(name=f"pkg-{stamp}{ARCHIVE_SUFFIX}", url="http://host/p",
+                          size=0, mtime="12-Oct-2026 01:00", stamp=stamp, kind="正式")
+
+    assert release_epoch(entry) == int(time.mktime(time.strptime(stamp, "%Y%m%d%H%M")))
+    if time.timezone or time.altzone:
+        # 非 UTC 机器上两种解释必然不同 —— 正好用来钉住"用的是本机时区"这一条。
+        # UTC 机器上这条差异不可观测，所以只在非 UTC 时断言（不做假绿）。
+        assert release_epoch(entry) != calendar.timegm(fields)
 
 
 @pytest.mark.parametrize("text,expected", [

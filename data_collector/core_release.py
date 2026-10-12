@@ -26,11 +26,13 @@
 """
 from __future__ import annotations
 
+import calendar
 import errno
 import os
 import re
 import shutil
 import tarfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -63,8 +65,25 @@ _ROW_RE = re.compile(
     r'(?:\s*(?P<date>\d{2}-[A-Za-z]{3}-\d{4}\s+\d{2}:\d{2}))?'
     r'(?:\s*(?P<size>-|[\d.]+[KMGTP]?))?',
     re.IGNORECASE | re.DOTALL)
-_STAMP_RE = re.compile(r"-(?P<stamp>\d{12})(?:-(?P<kind>[A-Za-z0-9]+))?$")
+#: 包名尾部的 12 位构建时间戳，其后可以跟一段类型后缀。
+#:
+#: **类型后缀必须容许"多段"**（v6.4.12 现场）：实际有个包叫
+#: `…-develop-202610121624-fix_zyf1010_trunklimit` —— 时间戳后面是「类型 + 人名 + 主题」，
+#: 而旧写法只容许 `[A-Za-z0-9]+` 一段，**下划线让它整条匹配不上**。
+#: 后果不是"少认一个类型"，而是 **`stamp` 变成空串 → 这个包被当成最旧的排到列表最后**
+#: （现场就是"今天刚传的两个包跑到了底部"）。
+#: 现在：时间戳后面可以跟 `-<第一段>`，再跟任意 `[A-Za-z0-9_-]`。`kind` 只取**第一段**
+#: （`fix`），后面的人名/主题不参与分类 —— 否则类型下拉里会冒出一个人一个选项。
+_STAMP_RE = re.compile(r"-(?P<stamp>\d{12})(?:-(?P<kind>[A-Za-z0-9]+)[A-Za-z0-9_-]*)?$")
 _SIZE_UNITS = {"K": 1024, "M": 1024 ** 2, "G": 1024 ** 3, "T": 1024 ** 4, "P": 1024 ** 5}
+
+#: autoindex 的时间列（`12-Oct-2026 08:25`）。nginx 用的是英文月份缩写。
+_MTIME_RE = re.compile(
+    r"(?P<day>\d{1,2})-(?P<mon>[A-Za-z]{3})-(?P<year>\d{4})\s+"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})")
+_MONTHS = {name: index for index, name in enumerate(
+    ("Jan", "Feb", "Mar", "Apr", "May", "Jun",
+     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"), start=1)}
 
 
 def human_size(num: float) -> str:
@@ -184,6 +203,58 @@ def open_direct(request, timeout: float):
     return opener.open(request, timeout=timeout)
 
 
+def _epoch_raw(year: int, month: int, day: int, hour: int, minute: int) -> int:
+    """按 **UTC** 把日历字段转成 epoch 秒；越界/非法一律返回 0（= 最旧）。"""
+    try:
+        return int(calendar.timegm((year, month, day, hour, minute, 0)))
+    except (ValueError, OverflowError):
+        return 0
+
+
+def mtime_epoch(text: str) -> int:
+    """autoindex 的时间列（`12-Oct-2026 08:25`，**GMT**）→ epoch 秒；解析不出返回 0。
+
+    为什么不直接 `time.strptime(..., "%d-%b-%Y %H:%M")`：`%b` 认的是 **LC_TIME
+    区域设置**里的月份缩写 —— 机器人机/开发机的 locale 不一定是英文，那时这一列会
+    **静默解析成 0**，而"解析不出"与"时间戳为 0"（= 最旧）在排序上是同一个意思，
+    表现就是"最新的包又沉到底部"。所以月份缩写自己认，认不出就是 0。
+    """
+    match = _MTIME_RE.search(text or "")
+    if match is None:
+        return 0
+    month = _MONTHS.get(match.group("mon").title())
+    if not month:
+        return 0
+    return _epoch_raw(int(match.group("year")), month, int(match.group("day")),
+                  int(match.group("hour")), int(match.group("minute")))
+
+
+def release_epoch(release: RemoteRelease) -> int:
+    """排序用的"时间"（epoch 秒）：**名字里的 12 位时间戳优先，没有就用服务器时间列**。
+
+    ## 两个时基不同，必须先归一
+
+    - 名字里的时间戳是**构建时的本机时间**（现场机器 +08:00）：`202610121624` = 12 日 16:24；
+    - autoindex 时间列是 **GMT**（HTTP 头的 `Date` 也是 GMT）：
+      同一个包的列值就是 `12-Oct-2026 08:25`。
+
+    所以时间戳按**本机时区**解释（`time.mktime`）、时间列按 **UTC** 解释
+    （`calendar.timegm`）。不归一的话，一个"名字里没有时间戳"的新包会因为差 8 小时
+    而排到错误的位置 —— 这类错位比"整体不排"更难发现。
+
+    ## 为什么要有兜底
+
+    旧实现直接拿 `stamp` 字符串当排序键，**没有时间戳的包一律排到最后**（空串最小），
+    于是"今天刚传的包"看起来比去年的还旧。现在没时间戳的按服务器时间列落位。
+    """
+    if len(release.stamp) == 12:
+        try:
+            return int(time.mktime(time.strptime(release.stamp, "%Y%m%d%H%M")))
+        except (ValueError, OverflowError, OSError):
+            pass
+    return mtime_epoch(release.mtime)
+
+
 def parse_autoindex(html: str, base_url: str,
                     suffix: str = ARCHIVE_SUFFIX) -> List[RemoteRelease]:
     """解析 nginx autoindex 页面，列出匹配 `suffix` 的版本包（新的在前）。
@@ -217,7 +288,9 @@ def parse_autoindex(html: str, base_url: str,
         ))
 
     # 时间戳降序：列表第一行就是最新包，现场"默认选中最新"不用再筛
-    releases.sort(key=lambda item: (item.stamp, item.name), reverse=True)
+    # 按**时间**降序（不是按名字）：名字里的时间戳优先，没有就退回服务器时间列。
+    # 列表第一行就是最新的包，现场「默认选中最新」不用再筛。
+    releases.sort(key=lambda item: (release_epoch(item), item.name), reverse=True)
     return releases
 
 
