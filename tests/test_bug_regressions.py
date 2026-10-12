@@ -297,3 +297,75 @@ def test_bug2_pending_records_are_deduped(tmp_path):
     indexes = [p.index for p in rec._pending]
     assert indexes.count(record.index) == 1
     assert rec.records[0].label == "改两次"
+
+# ---------- 磁盘空间：录制退出的头号现场原因（v6.3.9） ----------
+
+class _Usage:
+    """`shutil.disk_usage` 的最小替身（真调用只用到 `.free`）。"""
+
+    def __init__(self, free: int):
+        self.free = free
+
+
+def _patch_disk_usage(monkeypatch, free=None, boom=False):
+    """把 `core_data.shutil.disk_usage` 换成固定值。
+
+    不用真的把磁盘写满 —— 那既慢又危险；这里只桩住"读到多少可用空间"这一步。
+    """
+    if boom:
+        def _raise(_path):
+            raise OSError("读不到")
+        monkeypatch.setattr("data_collector.core_data.shutil.disk_usage", _raise)
+        return
+    monkeypatch.setattr("data_collector.core_data.shutil.disk_usage",
+                        lambda _path: _Usage(free))
+
+
+def test_disk_full_reports_zero_free(rec_env, monkeypatch):
+    """可用空间为 0 时要说"已满" —— 现场机器人日志里的 `Errno 28` 就是这个。"""
+    rm, _bag, _launcher = rec_env
+    _patch_disk_usage(monkeypatch, free=0)
+    assert "已满" in rm.disk_full()
+
+
+def test_disk_full_reports_low_free(rec_env, monkeypatch):
+    """剩得不多也要说，且带上具体数字 —— 现场据此判断还能不能再录一场。"""
+    rm, _bag, _launcher = rec_env
+    _patch_disk_usage(monkeypatch, free=500 * 1024 * 1024)
+    hint = rm.disk_full()
+    assert "500 MB" in hint
+    assert "已满" not in hint          # 快满不等于满，别用最重的那个词
+
+
+def test_disk_full_silent_when_healthy(rec_env, monkeypatch):
+    """空间正常时一个字都不多说 —— 这条路径每秒都会走一次。"""
+    rm, _bag, _launcher = rec_env
+    _patch_disk_usage(monkeypatch, free=50 * 1024 ** 3)
+    assert rm.disk_full() == ""
+
+
+def test_disk_free_unknown_is_not_treated_as_full(rec_env, monkeypatch):
+    """读不到就当**未知**，不能当成 0。
+
+    当成 0 会在正常机器上误报"磁盘已满"，而那是在每秒一次的看门狗路径上 ——
+    误报一次就把现场引到错误的方向上（他们会去清磁盘，而问题在别处）。
+    """
+    rm, _bag, _launcher = rec_env
+    _patch_disk_usage(monkeypatch, boom=True)
+    assert rm.disk_free() is None
+    assert rm.disk_full() == ""
+
+
+def test_disk_free_probes_nearest_existing_ancestor(rec_env):
+    """bag 目录还没建出来时，往上找一层存在的祖先照样能读到分区空间。
+
+    第一次录制前 bag 目录可能不存在；直接 `disk_usage` 会抛 FileNotFoundError，
+    于是"最需要空间检查的时候反而查不到"。
+    """
+    rm, bag, _launcher = rec_env
+    import shutil as real_shutil
+    missing = bag / "not_created_yet" / "deeper"
+    rm.config._bag = missing
+    free = rm.disk_free()
+    assert free is not None
+    assert free == real_shutil.disk_usage(str(bag)).free
