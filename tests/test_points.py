@@ -953,11 +953,20 @@ from data_collector.ui.panels.data_ops import DataOpsMixin  # noqa: E402
 
 
 class _RecordingStub:
-    """RecorderManager 的替身：只提供 on_record / on_stop_record 用到的能力。"""
+    """RecorderManager 的替身：只提供 on_record / on_stop_record / 看门狗用到的能力。
+
+    `health_result` 与 `disk_full_result` 让用例能摆出"没落盘""进程已死""磁盘满"
+    这几种现场状态 —— 它们在真机上都是 `RecorderManager` 内部算出来的。
+    `stop()` 故意**不清** `started_at`：那正是"进程没了但会话还在、界面没复位"
+    那个故障窗口（v6.4.13 修的就是它）。
+    """
 
     def __init__(self):
         self._active = False
         self.started_at = time.time()
+        self.start_calls = 0
+        self.health_result = {"alive": True, "producing": True, "message": ""}
+        self.disk_full_result = ""
 
     def is_active(self):
         return self._active
@@ -965,11 +974,18 @@ class _RecordingStub:
     def start(self, *_args):
         self._active = True
         self.started_at = time.time()
+        self.start_calls += 1
         return True
 
     def stop(self):
         self._active = False
         return True
+
+    def health(self, *_args, **_kwargs):
+        return self.health_result
+
+    def disk_full(self):
+        return self.disk_full_result
 
 
 class _UploaderStub:
@@ -1057,6 +1073,141 @@ def test_panel_closes_and_entry_hides_when_recording_stops(qapp, point_env, monk
     assert harness.point_panel is None
     assert harness.point_recorder is None
     assert harness.btn_point.isHidden()
+
+
+# ---------- 录制看门狗与按钮分派（v6.4.13：现场"无法停止录制"的根因）----------
+
+
+def test_watchdog_resets_ui_even_after_warning_latched(qapp, point_env, monkeypatch):
+    """**核心回归**：告警闩锁已经置位之后，进程死亡也必须把界面复位。
+
+    现场故障链：机器人磁盘满 → bag 写不进去 → 第一秒报一次"没有新文件落盘"、
+    闩锁置 True → 脚本随后退出 → 此后每秒都因"已告警过"提前 return →
+    **界面永远停在「录制中」**，按钮永远显示「停止录制」。
+
+    修复前这一段嵌在"首次告警"分支里，本用例必然红。
+    """
+    _patch_record_dialog(monkeypatch)
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+
+    harness.on_record()                               # 正常起录
+    assert harness.btn_record.text() == "停止录制"
+    harness.point_panel.close()
+
+    # 第 1 秒：进程还在，但没有新文件落盘（磁盘满的典型表现）→ 报一次
+    harness.recorder.health_result = {"alive": True, "producing": False,
+                                      "message": "bag 目录下还没有新文件落盘"}
+    harness.update_record_time()
+    assert harness._record_health_warned is True
+    assert harness.btn_record.text() == "停止录制"     # 此刻确实还在录
+
+    # 脚本随后自行退出 —— 闩锁已经是 True 了
+    harness.recorder.health_result = {"alive": False, "producing": False,
+                                      "message": "录制进程已退出"}
+    harness.update_record_time()
+
+    assert harness.record_status_label.text() == "录制已中断"
+    assert harness.btn_record.text() == "数据录制"
+    assert harness.record_timer.isActive() is False
+    assert any("录制进程已退出" in m for m in harness.messages)
+
+
+def test_watchdog_still_warns_only_once_while_process_alive(qapp, point_env):
+    """进程还活着时，同一件事只报一次 —— 节流不能因为上面的修复而丢掉。"""
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+    harness.recorder.health_result = {"alive": True, "producing": False,
+                                      "message": "bag 目录下还没有新文件落盘"}
+
+    harness.update_record_time()
+    harness.update_record_time()
+    harness.update_record_time()
+
+    warns = [m for m in harness.messages if m.startswith("录制异常")]
+    assert len(warns) == 1
+
+
+def test_watchdog_resets_latch_when_recording_restarts(qapp, point_env, monkeypatch):
+    """起录必须复位闩锁：它原先只在"又开始落盘"时复位，于是报过一次之后就再也不提示。"""
+    _patch_record_dialog(monkeypatch)
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+
+    harness.recorder.health_result = {"alive": True, "producing": False, "message": "没落盘"}
+    harness.update_record_time()
+    assert harness._record_health_warned is True
+
+    harness.on_record()
+    assert harness._record_health_warned is False
+    harness.point_panel.close()
+
+
+def test_record_toggle_dispatches_to_stop_when_session_remains(qapp, point_env, monkeypatch):
+    """进程已死但会话还在时，点按钮的意图是"停下来"，不能变成"新建录制"。
+
+    按钮显示的是 `_set_record_button` 记下的状态，而进程可能在看门狗跑下一次之前
+    就死了。原来按 `is_active()` 分派 → 走进 `on_record()` → 弹出新建录制对话框，
+    现场看到的正是"点了停止却弹出一个新建录制的窗口，怎么都停不下来"。
+    """
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+
+    harness.recorder._active = False                   # 进程已经没了
+    assert harness.recorder.started_at is not None     # 但这次会话还在
+    harness._set_record_button("recording")           # 按钮仍显示「停止录制」
+    assert harness.btn_record.text() == "停止录制"
+
+    called = []
+    monkeypatch.setattr(harness, "on_stop_record", lambda: called.append("stop"))
+    monkeypatch.setattr(harness, "on_record", lambda: called.append("new"))
+
+    harness.on_record_toggle()
+    assert called == ["stop"]
+
+
+def test_record_toggle_starts_when_no_session(qapp, point_env, monkeypatch):
+    """反向钉住：真的没有会话时，点按钮仍然是"新建录制"。"""
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+    harness.recorder._active = False
+    harness.recorder.started_at = None
+
+    called = []
+    monkeypatch.setattr(harness, "on_stop_record", lambda: called.append("stop"))
+    monkeypatch.setattr(harness, "on_record", lambda: called.append("new"))
+
+    harness.on_record_toggle()
+    assert called == ["new"]
+
+
+def test_exit_hint_names_full_disk(qapp, point_env):
+    """进程退出时若磁盘已满，要把原因说出来 —— 脚本输出不落盘，界面是唯一的出口。"""
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+
+    harness.recorder.disk_full_result = "录制盘已满（bag 目录所在分区可用空间为 0）"
+    assert "录制盘已满" in harness._record_exit_hint({})
+
+    harness.recorder.disk_full_result = ""
+    hint = harness._record_exit_hint({})
+    assert "检查 bag 目录" in hint and "录制盘已满" not in hint
+
+
+def test_watchdog_exit_message_carries_disk_reason(qapp, point_env):
+    """整条链：磁盘满 → 进程退出 → 界面复位 + 日志里写明是磁盘满。"""
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+
+    harness.recorder.health_result = {"alive": True, "producing": False, "message": "没落盘"}
+    harness.update_record_time()
+    harness.recorder.disk_full_result = "录制盘已满（bag 目录所在分区可用空间为 0）"
+    harness.recorder.health_result = {"alive": False, "producing": False,
+                                      "message": "录制进程已退出"}
+    harness.update_record_time()
+
+    assert harness.record_status_label.text() == "录制已中断"
+    assert any("录制盘已满" in m for m in harness.messages)
 
 
 def test_entry_reopens_the_same_panel_with_count_intact(qapp, point_env, monkeypatch):

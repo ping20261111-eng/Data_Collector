@@ -52,9 +52,27 @@ class DataOpsMixin:
         self.record_status_label.setText(f"录制中 {minutes:02d}:{seconds:02d}")
 
         # 看门狗：录制期间每秒确认数据确实在落盘。"进程还在"不等于"在录"——
-        # 话题无数据、ROS 环境不完整都会让脚本空转，那种情况下计时器还在走、
-        # 界面显示"录制中"，但磁盘上什么都没有。只报一次，不刷屏。
+        # 话题无数据、ROS 环境不完整、磁盘满都会让脚本空转或直接退出，那种情况下
+        # 计时器还在走、界面显示"录制中"，但磁盘上什么都没有。
         health = self.recorder.health()
+
+        # 「进程已经不在了」必须**每 tick 都判**，放在"只报一次"的闸门之外。
+        # v6.4.13 修的现场故障就是这么来的：这一段原来嵌在首次告警分支里，于是
+        # "没有落盘"先报过一次 → 闩锁置 True → 脚本随后因磁盘满退出 → 此后每秒
+        # 都因为"已告警过"提前 return，**界面永远停在「录制中」**，按钮永远显示
+        # 「停止录制」。操作员点它会被分派去新建录制（见 on_record_toggle），现场
+        # 看到的正是"点停止却弹出一个新建录制的窗口，怎么都停不下来"。
+        # 顺序反过来是因为这两件事性质不同：进程死没死是**状态**（每秒都要准），
+        # "要不要为同一件事再说一句"只是**话术**（可以有节制）。
+        if not health["alive"]:
+            self.record_timer.stop()
+            self.record_status_label.setText("录制已中断")
+            theme.set_state(self.record_status_label, "none")
+            self._finish_points()
+            self._set_record_button("idle")
+            self.append(f"录制进程已退出，计时已停止{self._record_exit_hint(health)}")
+            return
+
         if health["producing"]:
             self._record_health_warned = False
             return
@@ -63,14 +81,18 @@ class DataOpsMixin:
         self._record_health_warned = True
         self.append(f"录制异常：{health['message']}")
 
-        if not health["alive"]:
-            # 进程已经不在了，继续计时只会让用户误以为还在采
-            self.record_timer.stop()
-            self.record_status_label.setText("录制已中断")
-            theme.set_state(self.record_status_label, "none")
-            self._finish_points()
-            self._set_record_button("idle")
-            self.append("录制进程已退出，计时已停止")
+    def _record_exit_hint(self, health: dict) -> str:
+        """进程退出后补一句最可能的原因。
+
+        脚本输出不落盘（`launch_record` 走后台模式、不接日志文件），退出原因对界面
+        是黑盒；不补这一句，现场只看到"进程已退出"，而真实原因（磁盘满）写在机器人
+        自己的日志里、没人会去查。查得到就别浪费 —— 磁盘满是能当场补救的
+        （清完空间重录），说清楚比让人猜省事。
+        """
+        full = self.recorder.disk_full()
+        if full:
+            return f"（原因：{full} —— 清理后重新录制，本次数据不完整）"
+        return "（若数据不完整，请检查 bag 目录）"
 
     @guard_slot
     def on_record_toggle(self):
@@ -78,8 +100,15 @@ class DataOpsMixin:
 
         为什么用状态分派而不是像遥操作那样换信号连接：换连接要 disconnect 几个
         候选槽，漏一个的后果就是"点了没反应"；分派只是一个 if，少一处可错的地方。
+
+        **分派要看"有没有录制会话"，不能只看"进程还活着吗"**（v6.4.13 修）：
+        按钮显示的是 `_set_record_button` 记下的状态，而进程可能已经死了、界面
+        还没复位（看门狗每秒才跑一次，中间有窗口）。这时操作员点的是「停止录制」，
+        按 `is_active()` 分派却会走进 `on_record()` —— 弹出新建录制对话框，现场看到
+        的正是"点了停止却弹出一个新建录制的窗口，停不下来"。
+        `started_at` 就是这次会话存在的凭据：start() 写入、stop() 清空。
         """
-        if self.recorder.is_active():
+        if self.recorder.is_active() or getattr(self.recorder, "started_at", None) is not None:
             self.on_stop_record()
         else:
             self.on_record()
@@ -130,6 +159,10 @@ class DataOpsMixin:
             theme.set_state(self.record_status_label, "danger")
             self.record_timer.start(1000)
             self.record_start_time = time.time()
+            # 「只报一次」的闩锁必须**每次起录都复位**：它原先只在"又开始落盘了"
+            # 的路径上复位，于是上一场录制报过一次异常之后，后面每一场录制都再也不会
+            # 提示任何异常 —— 闩锁是按进程活着的，不是按录制会话算的。
+            self._record_health_warned = False
             # 打点会话必须**先于**按钮状态建立：_set_record_button → _sync_point_button
             # 会读 point_recorder 来决定按钮显示与否，顺序反了就永远不出现（现场症状）。
             # 起始时刻取自 RecorderManager（它才是真正发指令的时刻，打点的相对秒要以它

@@ -411,6 +411,42 @@ class RecorderManager:
     def is_active(self) -> bool:
         return self.current_proc is not None and self.current_proc.poll() is None
 
+    #: bag 目录可用空间低于这个值就算"快满了"（字节）。1 GiB 的判据是"够写一个
+    #: 小包、但不够写一场完整采集" —— 真要拦住起录得知道采集时长，那是现场知识，
+    #: 这里不去猜；只负责把"已经满到写不进任何东西"这件事说清楚。
+    DISK_LOW_BYTES = 1024 ** 3
+
+    def disk_free(self) -> Optional[int]:
+        """bag 目录所在分区的可用字节数；读不到返回 None（不猜、不当成 0）。"""
+        try:
+            bag_dir = Path(self.config.get_bag_dir())
+            # 分区可能还没建出来（第一次录制前），那就近找一层存在的祖先
+            probe = bag_dir
+            while not probe.exists() and probe != probe.parent:
+                probe = probe.parent
+            return shutil.disk_usage(str(probe)).free
+        except Exception as exc:                       # noqa: BLE001
+            logger.debug(f"读 bag 目录可用空间失败（按未知处理）：{exc}")
+            return None
+
+    def disk_full(self) -> str:
+        """磁盘已经满到写不进东西时返回一句人话，正常时返回空串。
+
+        现场故障（v6.4.12）：机器人磁盘满 → `ros2 bag record` 写不进 bag 直接退出，
+        而脚本输出不落盘、退出码也没人看，界面只显示"录制进程已退出"。机器人那边
+        自己的日志里其实有 `[Errno 28] No space left on device`，但没人会去查。
+        这里把最常见、也最能当场补救的那一类原因直接说出来。
+        """
+        free = self.disk_free()
+        if free is None:
+            return ""
+        if free <= 0:
+            return "录制盘已满（bag 目录所在分区可用空间为 0）"
+        if free < self.DISK_LOW_BYTES:
+            return (f"录制盘可用空间只剩 {free / 1024 ** 2:.0f} MB"
+                    f"（bag 目录所在分区）")
+        return ""
+
     @property
     def started_at(self) -> Optional[float]:
         """本次录制的起始时刻。
