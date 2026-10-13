@@ -1885,6 +1885,33 @@ class Launcher:
             return {"ok": None, "reason": self.bridge_note or "常驻通道不可用"}
         return bridge.ensure("trunk_non_realtime", on_line=on_line)
 
+    def set_trunk_locked(self, locked: bool, on_line=None) -> dict:
+        """躯干**自锁** / **解除自锁**（v6.4.13）。
+
+        - **自锁**（`locked=True`）：往 `/trunk_control/switch_power_on` 发一条
+          `UInt8MultiArray`，把 `core_motion.TRUNK_LOCK_INDEXES`（H1~H3）切成
+          **「仅上电」** —— 电机**退出使能**。效果：**还能读角度**（`trunk_state` 照常），
+          但**不接受运动指令**。做法逐字取自现场脚本
+          `shell-switch_pown_on_test/swich_pown_on.sh` 里那段「#自锁」。
+        - **解除**（`locked=False`）：`connect false` → 等 → `connect true`
+          （现场确认的两步；单发一条 `connect true` 不生效）。
+          ⚠️ **会动机构**：`connect true` 会让躯干抬头，调用方必须先确认。
+
+        **状态不可回读**：ROS 侧没有任何"当前是否自锁"的话题
+        （`getMotorBrakeState()` 只存在于 C++ SDK 接口里），所以这里只说
+        "发出去了 / 没发出去"，**不说"现在是自锁状态"**。界面同理。
+
+        走**常驻通道**（与其它"一次性指令"同一条路），不新开机制。
+        """
+        bridge = self.bridge(on_line=on_line)
+        if bridge is None:
+            return {"ok": None, "reason": self.bridge_note or "常驻通道不可用"}
+        # 解除是两步、每步都要等够（见通道里的 TRUNK_LOCK_SETTLE），
+        # 所以给它比默认 20s 更宽的窗口，别让"其实在做"被读成超时。
+        timeout = 20.0 if locked else 40.0
+        return bridge.ensure("trunk_lock" if locked else "trunk_unlock",
+                             timeout=timeout, on_line=on_line)
+
     def ensure_arm_point_mode(self, side: str, on_line=None) -> dict:
         """让某侧手臂退出 follow / servoj（`ArmMove` 的前置条件）。"""
         bridge = self.bridge(on_line=on_line)

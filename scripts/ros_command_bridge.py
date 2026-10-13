@@ -105,6 +105,31 @@ MODE_SWITCH_SETTLE = 3.0
 #: 每次下发躯干目标前显式发一条 —— 理由见 `core_motion` 里那个常量的说明。
 TRUNK_SPEED_RATE = 1.0
 
+#: 躯干「自锁」（**仅上电 / 退出使能**）要切过去的电机索引。
+#:
+#: SDK 原文（`sdk_docs/sdk_iface.txt`）：
+#:   「将多个电机切换为仅上电状态，电机退出使能。可以执行 connectDev 恢复电机到使能状态」
+#: 索引**从下至上 0~5**（0 = H1 脚踝 … 5 = H6 颈·抬头）。现场脚本
+#: `shell-switch_pown_on_test/swich_pown_on.sh` 里那段注释就叫「#自锁」，固定用
+#: `[0x00, 0x01, 0x02]` = **H1~H3（脚踝 / 膝 / 大腿，腿部承重三轴）**。
+#:
+#: 与 `data_collector/core_motion.py::TRUNK_LOCK_INDEXES` 必须一致（两处各有一份：
+#: 本脚本是独立进程，不 import 包；一致性由 `tests/test_scripts.py` 钉住）。
+TRUNK_LOCK_INDEXES = (0, 1, 2)
+
+#: `switch_power_on` 的 `UInt8MultiArray.layout.data_offset`。
+#:
+#: ⚠️ **与躯干目标的 `TRUNK_LAYOUT_OFFSET`（= 1）刻意不同**：现场脚本这条写的是
+#: `data_offset: 0`，照抄。两个话题、两种消息类型，别"顺手统一成 1" ——
+#: 躯干目标那个 1 是 v6.3.3 用现场实测换来的，不是所有 MultiArray 都得填 1。
+TRUNK_LOCK_LAYOUT_OFFSET = 0
+
+#: 自锁 / 解除各步之后停多久（秒）。解除是**两步**（现场确认）：
+#: `connect false → 等 → connect true`。比现场脚本里"单发一条 connect true"多一步
+#: "先下使能" —— 道理与「改完 motor_mode 必须重发 connect 才生效」同源：
+#: 电源/连接状态变了之后，要让节点重新走一遍连接才认这个新状态。
+TRUNK_LOCK_SETTLE = 3.0
+
 #: 消息类型 → 建消息的函数名（表在下面，**逐字段显式构造**，不做通用 YAML→消息转换）
 MSG_TYPES = (
     "std_msgs/msg/Bool",
@@ -112,6 +137,7 @@ MSG_TYPES = (
     "std_msgs/msg/Float32",
     "std_msgs/msg/Float32MultiArray",
     "std_msgs/msg/Float64MultiArray",
+    "std_msgs/msg/UInt8MultiArray",
     "wheeled_robot_msgs/msg/ArmMove",
     "wheeled_robot_msgs/msg/HandPosture",
 )
@@ -123,6 +149,9 @@ PREWARM = (
     ("/trunk_control/motor_mode", "std_msgs/msg/Byte"),
     ("/trunk_control/joint_target_position", "std_msgs/msg/Float32MultiArray"),
     ("/trunk_control/speed_rate", "std_msgs/msg/Float32"),
+    # 自锁（仅上电 / 退出使能）。**必须建在这里**：这条命令的现场用法就是
+    # "点一下、立刻生效"，而 PREWARM 的全部意义是不让 DDS 发现落在按键那一刻。
+    ("/trunk_control/switch_power_on", "std_msgs/msg/UInt8MultiArray"),
     ("/arm_control/connect", "std_msgs/msg/Bool"),
     ("/arm_control/left_arm_move", "wheeled_robot_msgs/msg/ArmMove"),
     ("/arm_control/right_arm_move", "wheeled_robot_msgs/msg/ArmMove"),
@@ -266,6 +295,16 @@ def build_message(msg_type: str, fields: dict, types: dict):
         # 脚本）写的都是 1。
         # **只设 data_offset，不填 dim** —— 三份样本的 `dim` 都是空表。
         message = types[msg_type](data=[float(item) for item in fields["data"]])
+        layout = fields.get("layout") or {}
+        message.layout.data_offset = int(layout.get("data_offset", 0))
+        return message
+    if msg_type == "std_msgs/msg/UInt8MultiArray":
+        # 躯干**自锁**（仅上电 / 退出使能）走的就是它。两处与 Float32MultiArray 不同：
+        # ① `layout.data_offset` 现场脚本写的是 **0**（不是 1）—— 见
+        #    `TRUNK_LOCK_LAYOUT_OFFSET` 的说明，别套用躯干目标那个值；
+        # ② 元素是 `uint8`：越界值会让 rclpy 直接抛断言，所以显式 `& 0xFF` ——
+        #    与 `Byte` 分支同一个理由（别把 int 裸塞进定长无符号字段）。
+        message = types[msg_type](data=[int(item) & 0xFF for item in fields["data"]])
         layout = fields.get("layout") or {}
         message.layout.data_offset = int(layout.get("data_offset", 0))
         return message
@@ -683,6 +722,58 @@ class Bridge:
             self.spin(MODE_SWITCH_SETTLE)
         return {"ok": True, "steps": results, "reason": ""}
 
+    def ensure_trunk_lock(self, progress=None) -> dict:
+        """**自锁**躯干：把 `TRUNK_LOCK_INDEXES` 那几个电机切成「仅上电」（退出使能）。
+
+        现场脚本 `swich_pown_on.sh` 里那段注释就叫「#自锁」，做法是往
+        `/trunk_control/switch_power_on` 发一条 `UInt8MultiArray`，`data` 是**电机索引**。
+
+        自锁之后：**还能读角度**（`trunk_state` 照常发布），但**不接受运动指令**。
+        恢复只有一条路 —— `connect true`（SDK 原文「可以执行 connectDev 恢复电机到使能状态」），
+        见 `ensure_trunk_unlock`。
+
+        **状态不可回读**：ROS 侧没有任何"当前是否自锁"的话题
+        （`getMotorBrakeState()` 只存在于 C++ SDK 的接口里），所以这里只能保证
+        "发出去了"，调用方也只能这么报 —— 绝不写"已自锁"。
+        """
+        names = "、".join(f"H{index + 1}" for index in TRUNK_LOCK_INDEXES)
+        step = {
+            "name": f"躯干自锁（{names} 转为仅上电）",
+            "topic": "/trunk_control/switch_power_on",
+            "type": "std_msgs/msg/UInt8MultiArray",
+            "payload": {"layout": {"dim": [], "data_offset": TRUNK_LOCK_LAYOUT_OFFSET},
+                        "data": [int(index) for index in TRUNK_LOCK_INDEXES]},
+        }
+        result = self.publish(step, progress)
+        if not result["ok"]:
+            return {"ok": False, "steps": [result], "reason": result["reason"]}
+        self.spin(TRUNK_LOCK_SETTLE)
+        return {"ok": True, "steps": [result], "reason": ""}
+
+    def ensure_trunk_unlock(self, progress=None) -> dict:
+        """**解除自锁**：`connect false` → 等 → `connect true`。
+
+        为什么是两步、而不是像现场脚本那样单发一条 `connect true`：现场确认单发不生效。
+        道理与「改完 `motor_mode` 必须重发 `connect` 才生效」同源 ——
+        电源/连接状态变了之后，要让控制节点重新走一遍连接流程才认。
+
+        ⚠️ **会动机构**：`connect true` 会让躯干抬头回默认姿态（与"上使能"同一后果），
+        调用方（界面）必须先二次确认。这个后果与 `ensure_trunk_non_realtime` 是同一条。
+        """
+        steps = [
+            {"name": "躯干下使能（解除自锁 · 第 1 步）", "topic": "/trunk_control/connect",
+             "type": "std_msgs/msg/Bool", "payload": {"data": False}},
+            {"name": "躯干重新使能（解除自锁 · 第 2 步）", "topic": "/trunk_control/connect",
+             "type": "std_msgs/msg/Bool", "payload": {"data": True}},
+        ]
+        results = []
+        for step in steps:
+            results.append(self.publish(step, progress))
+            if not results[-1]["ok"]:
+                return {"ok": False, "steps": results, "reason": results[-1]["reason"]}
+            self.spin(TRUNK_LOCK_SETTLE)
+        return {"ok": True, "steps": results, "reason": ""}
+
     def ensure_arm_point_mode(self, side, progress=None) -> dict:
         """让某侧手臂回到"能接受 `ArmMove`"的状态：退出 follow / servoj。
 
@@ -719,11 +810,12 @@ class Bridge:
 def load_types() -> dict:
     """装上消息类。缺哪个（比如没装 `wheeled_robot_msgs`）就在表里少哪个。"""
     from std_msgs.msg import (Bool, Byte, Float32, Float32MultiArray,
-                              Float64MultiArray)
+                              Float64MultiArray, UInt8MultiArray)
 
     types = {"Bool": Bool, "Byte": Byte, "Float32": Float32,
              "Float32MultiArray": Float32MultiArray,
-             "Float64MultiArray": Float64MultiArray, "_raw": {}}
+             "Float64MultiArray": Float64MultiArray,
+             "UInt8MultiArray": UInt8MultiArray, "_raw": {}}
     try:
         from wheeled_robot_msgs.msg import ArmMove, ArmPosition, HandPosture
         types.update({"ArmMove": ArmMove, "ArmPosition": ArmPosition,
@@ -782,6 +874,10 @@ def handle(bridge: Bridge, request: dict, progress=None) -> dict:
         what = request.get("what")
         if what == "trunk_non_realtime":
             return bridge.ensure_trunk_non_realtime(progress)
+        if what == "trunk_lock":
+            return bridge.ensure_trunk_lock(progress)
+        if what == "trunk_unlock":
+            return bridge.ensure_trunk_unlock(progress)
         if what == "arm_point_mode":
             side = request.get("side")
             if side not in ("left", "right"):

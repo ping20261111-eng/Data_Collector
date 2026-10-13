@@ -5718,6 +5718,147 @@ def test_posture_module_enable_is_independent_per_module(status_env, tmp_path, m
     assert "未确认" in dialog.result.toPlainText()
 
 
+def test_trunk_lock_button_exists_only_on_the_trunk_row(status_env, tmp_path, monkeypatch):
+    """「自锁」按钮**只有躯干那一行有**。
+
+    SDK 里只有躯干有 `switch_power_on`（`/trunk_control/switch_power_on`），双臂没有
+    对应接口。给双臂也摆一个按钮是误导 —— 现场会以为"手臂也能自锁"。
+    """
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file)
+    dialog = _open_posture(win, monkeypatch)
+
+    assert dialog.module_rows["trunk"].btn_lock is not None
+    assert dialog.module_rows["arms"].btn_lock is None
+
+
+def test_trunk_lock_button_shows_only_when_trunk_is_enabled(status_env, tmp_path, monkeypatch):
+    """未使能时**不显示**「自锁」。
+
+    机构本来就不动（而且这时候连状态数据都没有），再锁一次没有意义；更实际的问题是
+    现场容易点成"先自锁、再上使能"，白跑一趟。
+
+    用 `isHidden()` 而不是 `isVisible()`：离屏用例里顶层窗口没有 show，
+    `isVisible()` 恒为 False（那样这条断言就成了空转），`isHidden()` 才如实反映
+    `setVisible()` 的效果。
+    """
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file, trunk=False, arms=True)
+    dialog = _open_posture(win, monkeypatch)
+
+    row = dialog.module_rows["trunk"]
+    assert row.btn_lock.isHidden() is True, "未使能时不该出现「自锁」"
+    assert row.btn_lock.text() == "自锁"
+
+    _refresh_status(dialog, status_file, trunk=True, arms=True)
+    assert row.btn_lock.isHidden() is False, "已使能后「自锁」应当出现"
+
+
+def test_trunk_lock_sends_the_lock_then_flips_the_button(status_env, tmp_path, monkeypatch):
+    """点「自锁」→ 下发 → 成功后按钮文案翻成「解除自锁」，且**只报"已下发"**。
+
+    文案说的是"本页下发过什么"（自锁状态没有回读话题），所以它翻转发 = 本页的记录变了。
+    结果区绝不能出现"已自锁"这种把"下发过"说成"现在是"的话。
+    """
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file)
+    dialog = _open_posture(win, monkeypatch)
+    monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    calls = []
+    monkeypatch.setattr(win.launcher, "set_trunk_locked",
+                        lambda locked: (calls.append(locked), {
+                            "ok": True,
+                            "steps": [{"name": "躯干自锁（H1、H2、H3 转为仅上电）",
+                                       "sent": 3, "matched": 1}],
+                            "reason": ""})[1])
+
+    dialog.on_trunk_lock_action(True)
+
+    row = dialog.module_rows["trunk"]
+    assert calls == [True], "应当按 locked=True 下发"
+    assert dialog._trunk_lock_sent is True
+    assert row.btn_lock.text() == "解除自锁"
+    text = dialog.result.toPlainText()
+    assert "无法回读" in text, "必须说明这个状态读不回来"
+    assert "已自锁" not in text, "不能把「下发过」说成「现在是」"
+
+
+def test_trunk_unlock_goes_through_the_two_step_path(status_env, tmp_path, monkeypatch):
+    """已下发过自锁后，再点一次就是**解除** —— 参数是 `locked=False`。
+
+    解除的实际两步（`connect false` → `connect true`）在通道层（`test_scripts.py`
+    的 `test_bridge_ensures_the_trunk_lock_and_unlock_shapes`）逐条钉住；
+    界面层只要保证"第二次点击传的是 False"。
+    """
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file)
+    dialog = _open_posture(win, monkeypatch)
+    monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    calls = []
+    monkeypatch.setattr(win.launcher, "set_trunk_locked",
+                        lambda locked: (calls.append(locked), {
+                            "ok": True, "steps": [], "reason": ""})[1])
+
+    dialog.on_trunk_lock_action(True)
+    assert dialog.module_rows["trunk"].btn_lock.text() == "解除自锁"
+
+    dialog.on_trunk_lock_action(False)
+
+    assert calls == [True, False]
+    assert dialog._trunk_lock_sent is False
+    assert dialog.module_rows["trunk"].btn_lock.text() == "自锁"
+
+
+def test_trunk_lock_failure_keeps_the_record_untouched(status_env, tmp_path, monkeypatch):
+    """下发**失败不翻转**文案 —— 记录的是"本页装过什么"，没发出去就不算装过。"""
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file)
+    dialog = _open_posture(win, monkeypatch)
+    monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    monkeypatch.setattr(win.launcher, "set_trunk_locked",
+                        lambda locked: {"ok": False, "steps": [],
+                                        "reason": "等 3s 没有订阅者（主程序没在跑？）"})
+
+    dialog.on_trunk_lock_action(True)
+
+    assert dialog._trunk_lock_sent is None, "没发出去就不该记成「下发过」"
+    assert dialog.module_rows["trunk"].btn_lock.text() == "自锁"
+    assert "未完成" in dialog.result.toPlainText()
+
+
+def test_trunk_lock_blocks_trunk_motion_but_not_the_arms(status_env, tmp_path, monkeypatch):
+    """自锁后**本页不再接受躯干运动指令**；手臂不受影响。
+
+    这是唯一"不说谎"的做法：自锁 = 退出使能，这时候发目标本来就不生效 ——
+    放过去的话，现场看到的是"点了没反应"（残差判据最后只会报"未确认"），
+    比一句明确的拦截更难懂。
+
+    只拦躯干：自锁针对的是 `switch_power_on` 给的那几个躯干电机索引，
+    手臂是另一个控制节点、另一批话题。
+    """
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file, trunk=True, arms=True)
+    dialog = _open_posture(win, monkeypatch)
+
+    assert dialog._enable_reason("trunk") == "", "自锁前躯干是可动的"
+
+    dialog._trunk_lock_sent = True
+    reason = dialog._enable_reason("trunk")
+    assert "自锁" in reason and "解除自锁" in reason, f"拦截原因要指路，实际：{reason!r}"
+
+    # 手臂那条路不受影响（`_enable_reason("left")` 走的是 arms）
+    assert dialog._enable_reason("left") == "", "自锁只针对躯干，不该连带挡住手臂"
+
+
 def test_posture_single_arm_gets_disable_button(status_env, tmp_path, monkeypatch):
     """只通了一侧时，必须有一个「全部下电」出口（v6.4.10，现场报的）。
 

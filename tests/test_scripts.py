@@ -1371,7 +1371,12 @@ def bridge_module(monkeypatch):
                            RELIABLE="reliable", BEST_EFFORT="best_effort")}),
         ("std_msgs", {}),
         ("std_msgs.msg", {"Bool": _Msg, "Byte": _Byte, "Float32": _Msg,
-                          "Float32MultiArray": _Msg, "Float64MultiArray": _Msg}),
+                          "Float32MultiArray": _Msg, "Float64MultiArray": _Msg,
+                          # v6.4.13 躯干自锁（`switch_power_on`）用的类型。**替身必须
+                          # 带上它**：`load_types()` 是按 `MSG_TYPES` 逐个查表的，
+                          # 缺一个就在 `types["_raw"]` 里少一个键 —— 替身少这一项时
+                          # `load_types()` 直接 ImportError，整个通道的用例全挂。
+                          "UInt8MultiArray": _Msg}),
         ("wheeled_robot_msgs", {}),
         ("wheeled_robot_msgs.msg", {"ArmMove": _Msg, "ArmPosition": _ArmPosition,
                                     "HandPosture": _Msg, "ArmState": _ArmState,
@@ -1494,6 +1499,91 @@ def test_bridge_trunk_speed_rate_matches_the_client(bridge_module):
     from data_collector import core_motion
 
     assert bridge_module.TRUNK_SPEED_RATE == core_motion.TRUNK_SPEED_RATE == 1.0
+
+
+def test_bridge_trunk_lock_indexes_match_the_client(bridge_module):
+    """两处 `TRUNK_LOCK_INDEXES` 必须一致 —— 它决定自锁锁哪几个关节。
+
+    SDK 原文：`switch_power_on` 的参数是"需要切换为仅上电状态的电机索引，
+    从下至上 0~5"；现场脚本 `swich_pown_on.sh` 用的是 `[0x00, 0x01, 0x02]`（H1~H3）。
+    两处漂了的话，界面按一套锁、兜底那条路按另一套锁，现场看到的是
+    "同样点了自锁，锁住的关节不一样"。
+    """
+    from data_collector import core_motion
+
+    assert bridge_module.TRUNK_LOCK_INDEXES == core_motion.TRUNK_LOCK_INDEXES == (0, 1, 2)
+    assert bridge_module.TRUNK_LOCK_LAYOUT_OFFSET == core_motion.TRUNK_LOCK_LAYOUT_OFFSET
+
+
+def test_bridge_builds_the_trunk_lock_message(bridge_module):
+    """自锁那条消息的形状：索引原样、`data_offset` 是 **0**（不是躯干目标的 1）。
+
+    `data_offset` 这一个字段就是 v6.3.3 那个"发得出去、机构一动不动"的根因
+    （躯干目标缺省 0 时节点收得到但不执行）。自锁这条话题**恰好相反** ——
+    现场脚本 `swich_pown_on.sh` 那段「#自锁」写的就是 `data_offset: 0`。
+    这里把 0 钉死，防止有人"顺手统一成 1"。
+    """
+    types = bridge_module.load_types()["_raw"]
+    message = bridge_module.build_message(
+        "std_msgs/msg/UInt8MultiArray",
+        {"layout": {"dim": [], "data_offset": bridge_module.TRUNK_LOCK_LAYOUT_OFFSET},
+         "data": list(bridge_module.TRUNK_LOCK_INDEXES)},
+        types)
+
+    assert list(message.data) == [0, 1, 2]
+    assert message.layout.data_offset == 0
+    assert list(message.layout.dim) == []
+
+
+def test_bridge_uint8_array_clamps_instead_of_asserting(bridge_module):
+    """越界值必须被 `& 0xFF`，不能让 rclpy 抛断言。
+
+    与 `Byte` 分支同一个理由：`uint8` 是定长无符号，塞负数或超界值时直接 assert。
+    那种失败发生在**按下去的那一刻**，现场只看到"点了没反应"。
+    """
+    types = bridge_module.load_types()["_raw"]
+    message = bridge_module.build_message("std_msgs/msg/UInt8MultiArray",
+                                          {"data": [256, -1, 300]}, types)
+    assert list(message.data) == [0, 255, 44]
+
+
+def test_bridge_ensures_the_trunk_lock_and_unlock_shapes(bridge_module):
+    """自锁 = **1 步**；解除 = **2 步**（先下使能、再上使能）。
+
+    现场脚本里解除只发一条 `connect true`，而现场确认那样不生效 —— 正确做法是
+    `connect false` → `connect true`（与"改完 motor_mode 必须重发 connect 才生效"同源）。
+    这个步数差是这条功能最容易写错的地方，所以逐条钉住话题与数据。
+    """
+    bridge, _node = _make_bridge(bridge_module)
+    sent = []
+
+    def fake_publish(item, progress=None):
+        sent.append((item["name"], item["topic"], item["type"], dict(item["payload"])))
+        return {"name": item["name"], "ok": True, "sent": 1, "matched": 1, "reason": ""}
+
+    bridge.publish = fake_publish
+    bridge.spin = lambda seconds: None          # 别真的等那 3 秒
+
+    bridge.ensure_trunk_lock()
+    assert len(sent) == 1, "自锁只有一步（switch_power_on）"
+    _name, topic, msg_type, payload = sent[0]
+    assert topic == "/trunk_control/switch_power_on"
+    assert msg_type == "std_msgs/msg/UInt8MultiArray"
+    assert list(payload["data"]) == [0, 1, 2]
+    assert payload["layout"]["data_offset"] == 0
+
+    sent.clear()
+    bridge.ensure_trunk_unlock()
+    assert [item[1] for item in sent] == ["/trunk_control/connect",
+                                          "/trunk_control/connect"], "解除是两步"
+    assert [item[3]["data"] for item in sent] == [False, True], "先下使能、再上使能"
+    assert all(item[2] == "std_msgs/msg/Bool" for item in sent)
+
+
+def test_bridge_prewarms_the_lock_topic(bridge_module):
+    """`switch_power_on` 必须在预热表里 —— 自锁的现场用法就是"点一下、立刻生效"。"""
+    topics = {topic for topic, _type in bridge_module.PREWARM}
+    assert "/trunk_control/switch_power_on" in topics
 
 
 def test_bridge_move_path_also_carries_the_layout(bridge_module):

@@ -88,6 +88,23 @@ TRUNK_MODE_TOPIC = "/trunk_control/motor_mode"
 TRUNK_MODE_MSG = "std_msgs/msg/Byte"
 TRUNK_CONNECT_TOPIC = "/trunk_control/connect"
 BOOL_MSG = "std_msgs/msg/Bool"
+#: 躯干**自锁**（仅上电 / 退出使能）。SDK 原文：「将多个电机切换为仅上电状态，
+#: 电机退出使能。可以执行 connectDev 恢复电机到使能状态」，索引从下至上 0~5。
+TRUNK_LOCK_TOPIC = "/trunk_control/switch_power_on"
+TRUNK_LOCK_MSG = "std_msgs/msg/UInt8MultiArray"
+#: 自锁覆盖的电机索引 = **H1~H3**（脚踝 / 膝 / 大腿，腿部承重三轴）——
+#: 取自现场脚本 `shell-switch_pown_on_test/swich_pown_on.sh` 那段「#自锁」的
+#: `data: [0x00, 0x01, 0x02]`。
+#: 与 `scripts/ros_command_bridge.py::TRUNK_LOCK_INDEXES` 必须一致（两处各有一份：
+#: 那个脚本是独立进程、不 import 包；一致性由 `tests/test_scripts.py` 钉住）。
+TRUNK_LOCK_INDEXES = (0, 1, 2)
+#: `switch_power_on` 的 `layout.data_offset`：**0**（照现场脚本）。
+#: ⚠️ 与躯干目标的 `TRUNK_LAYOUT_OFFSET`（= 1）**不同**，别套用。
+TRUNK_LOCK_LAYOUT_OFFSET = 0
+#: 自锁覆盖的轴名（界面文案用）。由索引推出来 —— 手写一处 "H1~H3" 就等于多一个
+#: 会和索引脱节的地方。
+TRUNK_LOCK_AXES_TEXT = (f"H{TRUNK_LOCK_INDEXES[0] + 1}~H{TRUNK_LOCK_INDEXES[-1] + 1}"
+                        if TRUNK_LOCK_INDEXES else "")
 ARM_MOVE_TOPICS = {"left": "/arm_control/left_arm_move",
                    "right": "/arm_control/right_arm_move"}
 ARM_MOVE_MSG = "wheeled_robot_msgs/msg/ArmMove"

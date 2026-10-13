@@ -23,6 +23,7 @@ import time
 from PyQt5.QtWidgets import QMessageBox
 
 from .. import theme
+from ..core_motion import TRUNK_LOCK_AXES_TEXT
 from ..core_operations import (MODULE_NAMES, MODULE_STATE_OFF, MODULE_STATE_ON,
                               MODULE_STATE_PARTIAL, MODULE_STATE_TEXT,
                               MODULE_STATE_UNKNOWN, MODULE_STEPS,
@@ -41,6 +42,13 @@ class PostureModulesMixin:
     `_busy` / `_report` / `_apply_buttons` / `refresh`）—— 它们都不在这里构造，
     这样这一册只讲"使能与模式"，版面与数据留在各自那本册子里。
     """
+
+    #: 本页下发过的**自锁动作**：None = 本次运行没下发过 / True = 已下发自锁 /
+    #: False = 已下发解除。**这不是"当前是否自锁"** —— 那个状态没有回读话题
+    #: （`getMotorBrakeState()` 只在 C++ SDK 里），所以它只是"本页做过什么"的记录。
+    #: 用类属性而不是在 `__init__` 里赋值：这个 mixin 没有自己的 `__init__`，
+    #: 而宿主（`posture.py`）那边已经贴着 1000 行上限了。
+    _trunk_lock_sent = None
 
     def _module_state(self) -> dict:
         state = self.view.get("module_state")
@@ -71,6 +79,20 @@ class PostureModulesMixin:
             return self.view.get("reason") or "读不到机器人状态（状态监控没在跑？）"
         module = "trunk" if group == "trunk" else "arms"
         name = "躯干" if module == "trunk" else "双臂"
+
+        # v6.4.13 躯干自锁：自锁（仅上电）期间**不接受运动指令**。
+        #
+        # 判据只能是"**本页有没有下发过自锁**" —— ROS 侧没有"当前是否自锁"的话题
+        # （`getMotorBrakeState()` 只存在于 C++ SDK），所以这里读不到真实状态。
+        #
+        # 为什么选择**拦住并说清**、而不是"照发 + 提示"：自锁时发出去的目标不会被执行，
+        # 残差判据最后会报"未确认"，现场看到的是"点了没反应"，比一句拦住的说明更难懂。
+        # **如实写下代价**：若自锁是在外部解除的（现场脚本），本页仍会拦一次 ——
+        # 点一下「解除自锁」即可（那一下会 connect → 抬头，是已知副作用）。
+        if module == "trunk" and self._trunk_locked():
+            return ("躯干已自锁（仅上电：能读角度、不接受运动指令）"
+                    "—— 先点「解除自锁」，再下发动作")
+
         state = self._enabled(module)
         if state == MODULE_STATE_UNKNOWN:
             return f"{name}使能状态未知"
@@ -257,7 +279,111 @@ class PostureModulesMixin:
                 why = "下使能（机构失去保持力）"
             row.btn.setToolTip(why)
 
+            # 躯干自锁按钮（v6.4.13）：**只在"已使能"时出现** —— 未使能时它没有意义
+            # （机构已经不动了），而现场容易点成"先自锁再上使能"，白跑一趟。
+            # 按钮文案表示的是**"本页下发过什么"**，不是"现在是什么"：自锁状态没有
+            # 回读话题，写"当前已自锁"就是编。
+            if row.btn_lock is not None:
+                locked_now = self._trunk_locked()
+                if not monitor_ok:
+                    lock_why = "状态读不出来：先启动状态监控"
+                elif busy:
+                    lock_why = f"{name}的动作正在执行，等它出结果"
+                elif locked_now:
+                    lock_why = ("解除自锁：下使能 → 重新使能（两步）。"
+                                "会动机构 —— 那一下躯干会抬头。\n"
+                                "（自锁状态无法回读，这里按「本页下发过自锁」判断）")
+                else:
+                    lock_why = (f"把躯干 {TRUNK_LOCK_AXES_TEXT} 转为「仅上电」："
+                                "之后仍能读角度，但不接受运动指令。\n"
+                                "解除方式：再点一次这个按钮")
+                row.set_lock_state(visible=(monitor_ok and state == MODULE_STATE_ON),
+                                   locked_now=locked_now,
+                                   enabled=monitor_ok and not busy,
+                                   why=lock_why)
+
     def _emit_busy(self):
         """把"还有动作在跑"报给主窗口（姿势动作或任一模块动作在跑即为真）。"""
         self.busy_changed.emit(bool(self._module_actions) or self._busy)
+
+    # ================= 躯干自锁（v6.4.13） =================
+    def _trunk_locked(self) -> bool:
+        """本页是否**下发过**自锁。
+
+        ⚠️ 语义是"本页做过什么"，不是"现在是不是自锁" —— 后者读不到
+        （ROS 侧没有自锁/抱闸状态话题）。所有用它做判断的地方都要按这个语义解释。
+        """
+        return self._trunk_lock_sent is True
+
+    @guard_slot
+    def on_trunk_lock_action(self, locked: bool):
+        """躯干**自锁** / **解除自锁**。
+
+        - 自锁：往 `/trunk_control/switch_power_on` 发 `TRUNK_LOCK_INDEXES`（H1~H3），
+          那几个电机转「仅上电」（退出使能）—— **还能读角度，但不接受运动指令**；
+        - 解除：`connect false` → `connect true`（两步，现场确认）。
+
+        **两个方向都会立刻改变机构状态**（解除那一下 `connect true` 会让躯干抬头），
+        所以都先二次确认。
+
+        **成没成不在这里下结论**：自锁没有回读话题，只能报"已下发 / 未完成"，
+        绝不写"已自锁"。
+        """
+        if self._busy or "trunk" in self._module_actions:
+            self._report("正在执行上一组动作，等它出结果再点")
+            return
+        if not self.view.get("available"):
+            self._report("状态读不出来，未下发任何指令：先启动状态监控")
+            return
+        if locked:
+            title = "确认躯干自锁"
+            ask = (f"将把躯干 {TRUNK_LOCK_AXES_TEXT} 转为「仅上电」（电机退出使能）：\n"
+                   "· 之后仍然能读角度；\n"
+                   "· 但不接受任何运动指令（本页的单轴 / 预设 / 下发都会被挡住）；\n"
+                   f"· 解除方式：再点一次这个按钮（会先下使能、再上使能，"
+                   f"那一下躯干会抬头）。\n\n是否继续？")
+        else:
+            title = "确认解除自锁"
+            ask = ("将向躯干下发两步：下使能 → 重新使能。\n"
+                   "注意：重新使能会让躯干抬头回默认姿态，"
+                   "请先确认现场无人处于机构运动范围内。\n\n是否继续？")
+        if QMessageBox.question(self, title, ask,
+                               QMessageBox.Yes | QMessageBox.No,
+                               QMessageBox.No) != QMessageBox.Yes:
+            self._report(f"已取消{'自锁' if locked else '解除自锁'}")
+            return
+        self._busy = True
+        self._emit_busy()
+        self._apply_buttons()
+        self._report(f"躯干{'自锁' if locked else '解除自锁'}：正在下发…")
+        # 线程先建好再 start：start() 里可能同步就跑完（测试替身是同步的）
+        thread = LocalTaskThread(lambda value=locked: self.launcher.set_trunk_locked(value))
+        thread.finished.connect(
+            lambda ok, payload, error, value=locked:
+                self._on_trunk_lock_done(value, ok, payload, error))
+        thread.start()
+
+    @guard_slot
+    def _on_trunk_lock_done(self, locked: bool, ok: bool, payload, error: str):
+        """自锁 / 解除的下发回报。**只报"发出去了"，不报"生效了"。**"""
+        self._busy = False
+        self._emit_busy()
+        verb = "自锁" if locked else "解除自锁"
+        if ok and isinstance(payload, dict) and payload.get("ok"):
+            for step in payload.get("steps") or []:
+                self._report(f"    {step.get('name')}：已发 {step.get('sent', 0)} 次"
+                             f"（订阅者 {step.get('matched', -1)}）")
+            self._trunk_lock_sent = bool(locked)
+            detail = ("（本页记录：已下发自锁 —— 解除方式就是再点一次这个按钮）"
+                      if locked else "（本页记录：已下发解除）")
+            self._report(f"✅ 躯干{verb}指令已下发{detail}。\n"
+                         f"    注意：自锁状态无法回读（ROS 侧没有这个话题），"
+                         f"以机构实际表现为准：自锁后关节不接受运动指令。")
+        else:
+            reason = payload.get("reason") if isinstance(payload, dict) else ""
+            # 失败**不改**记录 —— 记录代表"本页下发过什么"，没发出去就不算
+            self._report(f"⚠ 躯干{verb}未完成：{reason or error or '通道没有回话'}")
+        self._apply_head()
+        self._apply_buttons()
+        self.refresh()
 

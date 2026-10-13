@@ -558,6 +558,10 @@ class ModuleEnableRow(QFrame):
     """
 
     action_requested = pyqtSignal(str, bool)
+    #: 躯干**自锁**：True = 自锁（仅上电 / 退出使能），False = 解除自锁。
+    #: 单独一个信号而不是塞进 `action_requested` —— 后者是"使能/下使能"那条
+    #: `MODULE_STEPS` 路径（两个模块共用），自锁只有躯干有（SDK 只给躯干这个接口）。
+    lock_requested = pyqtSignal(bool)
 
     def __init__(self, module: str, name: str, parent=None):
         super().__init__(parent)
@@ -576,6 +580,19 @@ class ModuleEnableRow(QFrame):
 
         self.state_badge = badge(f"{name} —")
         row.addWidget(self.state_badge, 1)
+
+        # 躯干专属的「自锁」（v6.4.13）：把 H1~H3 切成"仅上电"（退出使能）——
+        # 还能读角度，但不接受运动指令。**只给 trunk 造**：SDK 里只有躯干有
+        # `switch_power_on`，双臂没有对应接口，给双臂摆一个按不动的按钮是误导。
+        # 默认不显示，由页面按"检测到的使能状态 + 本页下发过什么"决定（见 mixin）。
+        self.btn_lock = None
+        self._lock_next = True                  # 这一次点击的含义：True=自锁
+        if module == "trunk":
+            self.btn_lock = QPushButton("自锁")
+            self.btn_lock.setProperty("variant", "ghost-compact")
+            self.btn_lock.setVisible(False)
+            self.btn_lock.clicked.connect(self._on_lock_clicked)
+            row.addWidget(self.btn_lock)
 
         #: 「全部下电」只在"只通了一侧"时出现（见类注释）。它走的是**下使能**那条
         #: 既有路径，不新增话题、不新增动作 —— 现场验证过的链路不变。
@@ -602,6 +619,24 @@ class ModuleEnableRow(QFrame):
     def set_partial(self, partial: bool) -> None:
         """「只通了一侧」时多给一个下电出口；其余状态收起来。"""
         self.btn_disable.setVisible(bool(partial))
+
+    def set_lock_state(self, visible: bool, locked_now: bool,
+                       enabled: bool, why: str) -> None:
+        """自锁按钮的一处收口：显示 / 文案 / 可用 / 提示语，一次定完。
+
+        文案说的是**「本页下发过什么」**，不是「现在是什么」—— 自锁状态没有回读
+        话题（`getMotorBrakeState()` 只在 C++ SDK 里），报"当前已自锁"就是编。
+        """
+        if self.btn_lock is None:
+            return
+        self._lock_next = not bool(locked_now)     # 下一次点击做什么：已下发过自锁 → 解除
+        self.btn_lock.setText("解除自锁" if locked_now else "自锁")
+        self.btn_lock.setVisible(bool(visible))
+        self.btn_lock.setEnabled(bool(enabled))
+        self.btn_lock.setToolTip(why)
+
+    def _on_lock_clicked(self) -> None:
+        self.lock_requested.emit(self._lock_next)
 
     def _on_clicked(self) -> None:
         self.action_requested.emit(self.module, self._turn_on)
@@ -668,6 +703,9 @@ class PostureCardsMixin:
                 strip.addWidget(divider)
             row = ModuleEnableRow(module, name, self)
             row.action_requested.connect(self.on_module_action)
+            # 自锁只有躯干那一行有按钮（`btn_lock` 在别的模块上是 None）——
+            # 挂信号本身是幂等的，不必判断模块。
+            row.lock_requested.connect(self.on_trunk_lock_action)
             strip.addWidget(row, 1)
             self.module_rows[module] = row
         body.addWidget(self.module_frame)
