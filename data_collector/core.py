@@ -1521,6 +1521,17 @@ class ConfigManager:
             "timeout": timeout if timeout > 0 else 20.0,
         }
 
+    def get_ui_scale(self):
+        """界面缩放系数 —— **留空 = 自动**（按屏幕宽算，见 `theme.scale_for_screen`）。
+
+        现场换屏（1080P → 4K）或换站位时，可以在这里手填一档而不必重新打包；
+        填 0 / 空 / 非法值都退回自动 —— 配置写坏不该让界面起不来。
+
+        返回值原样透传给 `theme.scale_for_screen(width, override=...)`，
+        由它做范围钳制与回落，这里只负责"把配置读出来"。
+        """
+        return self.app_config.get("ui_scale")
+
     def get_vision_calib_dir(self) -> Path:
         """相机标定结果目录：优先 vision_calib_dir；否则 ${nerv_dir}/vision/calib。
 

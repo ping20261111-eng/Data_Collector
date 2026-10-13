@@ -478,3 +478,71 @@ def test_combo_box_itself_carries_the_popup_selection_colors():
         body = rule.group(1)
         assert f"selection-background-color: {palette['accent_soft']}" in body
         assert f"selection-color: {palette['accent_on_soft']}" in body
+
+
+# ---------- 全局缩放（v6.4.16） ----------
+@pytest.fixture
+def restore_scale():
+    """用例碰过缩放系数后必须还原。
+
+    `theme.SCALE` 是**全局**的：漏还原会让后面所有量像素/量高度的用例按放大后的
+    字号去比设计值，报出来的失败与病因隔着十万八千里。
+    """
+    before = theme.ui_scale()
+    yield
+    theme.configure_scale(before)
+
+
+def test_scale_for_screen_maps_the_site_screen_to_1_33():
+    """1080P（1920）→ 1.33；1440 及以下不缩；4K 封顶 1.5。"""
+    assert theme.scale_for_screen(1920) == pytest.approx(1.333, abs=0.001)
+    assert theme.scale_for_screen(1440) == 1.0
+    assert theme.scale_for_screen(1366) == 1.0        # 比基准窄：只放大不缩小
+    assert theme.scale_for_screen(3840) == theme.SCALE_MAX
+    assert theme.scale_for_screen(0) == 1.0           # 量不到屏幕：退回基准，别乱放大
+    assert theme.scale_for_screen(None) == 1.0
+
+
+def test_scale_for_screen_lets_the_config_override_win():
+    """`app_config.yaml` 的 `ui_scale` 优先；留空/非法/≤0 一律退回自动。"""
+    assert theme.scale_for_screen(1920, 1.2) == 1.2    # 手动档压过自动
+    assert theme.scale_for_screen(1440, 1.5) == 1.5    # 基准屏上也能强制放大
+    for empty in (None, "", "abc", 0, -1):
+        assert theme.scale_for_screen(1920, empty) == pytest.approx(1.333, abs=0.001), \
+            f"override={empty!r} 应当退回自动"
+    assert theme.scale_for_screen(1920, 9.0) == theme.SCALE_MAX   # 超范围向上钳死
+
+
+def test_configure_scale_scales_type_and_controls_but_not_spacing(restore_scale):
+    """缩放的**范围**：字号与控件高度跟，间距与圆角**不跟**。
+
+    间距不跟是量出来的取舍：连它一起放，姿势控制页从 1021 长到 1264（多 91px），
+    而现场同时要求"这一页纵向排列缩减一点" —— 两个要求方向相反。
+    圆角不跟是因为药丸令牌按"配套的控件高度"命名（`pill_30` = 半高），
+    `test_every_pill_radius_fits_its_height` 会去核 `值 == 名字里的高度/2`。
+    """
+    theme.configure_scale(1.33)
+    assert theme.TYPE_SCALE["fs_base"] == round(14 * 1.33)      # 19
+    assert theme.CONTROL_HEIGHT["ch_main"] == round(22 * 1.33)  # 29
+    assert theme.CONTROL_HEIGHT["ch_start"] == round(26 * 1.33)
+    assert theme.SPACING["sp3"] == 12, "间距不该跟着缩放"
+    assert theme.RADIUS["pill_30"] == 15, "圆角不该跟着缩放（药丸令牌按高度命名）"
+    qss = theme.build_stylesheet("light")
+    assert f"min-height: {theme.CONTROL_HEIGHT['ch_main']}px" in qss
+    assert "min-height: 22px" not in qss, "缩放后不该还留着基准值"
+
+    theme.configure_scale(1.0)
+    assert theme.TYPE_SCALE["fs_base"] == 14, "缩回 1.0 必须精确回到设计值（别累积舍入）"
+    assert theme.CONTROL_HEIGHT["ch_main"] == 22
+    assert "min-height: 22px" in theme.build_stylesheet("light")
+
+
+def test_the_default_scale_keeps_the_design_numbers(restore_scale):
+    """**默认档必须原样** —— 这是既有那批尺寸守卫（断言 44 / 32 / 214 这些数）的前提。"""
+    from data_collector.ui.posture_widgets import PresetCard
+
+    theme.configure_scale(1.0)
+    assert theme.ui_scale() == 1.0
+    assert theme.CONTROL_HEIGHT == {"ch_main": 22, "ch_start": 26, "ch_input": 20}
+    assert theme.TYPE_SCALE["fs_base"] == 14
+    assert PresetCard.height_scaled() == PresetCard.HEIGHT, "预设卡基准高不该变"

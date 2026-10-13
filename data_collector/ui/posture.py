@@ -41,11 +41,12 @@ from ..core_motion import (ARM_AXES, ARM_NAMES, MotionRunner, TRUNK_AXES,
                            trunk_target_step)
 from ..core_operations import (MODULE_STATE_ON, MODULE_STATE_PARTIAL,
                               MODULE_STATE_TEXT, read_robot_status)
-from .common import SP, dialog_card, fit_console, fit_dialog_to_screen
+from .common import SP, dialog_card, fit_console, fit_dialog_to_screen, sync_layout
 from .posture_dialogs import PresetEditDialog, _MoveConfirmDialog
 from .posture_modules import PostureModulesMixin
-from .posture_widgets import (UNKNOWN, ArmDiagram, PostureCardsMixin, PresetCard,
-                              TrunkDiagram, group_of, specs_for)
+from .posture_cards import PostureCardsMixin
+from .posture_widgets import (UNKNOWN, ArmDiagram, PresetCard, TrunkDiagram,
+                              group_of, specs_for)
 from .safety import guard_slot
 from .threads import LocalTaskThread
 
@@ -158,8 +159,26 @@ class PostureDialog(PostureModulesMixin, PostureCardsMixin, QDialog):
     #: **不能再小**：800 实测卡宽只有 138，名字被截成 `KneeBend…`；
     #: 再往下（760）预设区会出**横向滚动条**，第 3 张卡被切掉。
     MIN_WIDTH = 860
-    CONSOLE_MIN_ROWS = 2
-    CONSOLE_MAX_ROWS = 8
+    #: 结果区**最少**几行 —— 只在屏幕真不够时才会落到底（`_shrink_for_screen` 第一步）。
+    #: **2 → 1（v6.4.16）**：这一条是"1080P + 1.33 缩放"下把页面塞进屏幕的最后一块余量。
+    #: 平时看到的是 `CONSOLE_MAX_ROWS`（4）行，只有页面被压到极限时才只剩 1 行 ——
+    #: 那时用户还能拖大窗口或按 F11 全屏换回更多行。
+    CONSOLE_MIN_ROWS = 1
+    #: 结果区默认最多几行。**8 → 4（v6.4.16）**：
+    #: 这一页是"看一眼上一条结果就走"的用法，8 行从来没被用满，却白占 ~60px 页高。
+    #: 而这一页在 1080P 上正卡在"底部按钮被顶出屏幕"的临界点，屏幕不够时它又是
+    #: 第一个被压的（`_shrink_for_screen`），下限本来就是 2 —— 默认给 4 是
+    #: "平时也不浪费、不够时还有得压"的折中。要翻旧日志仍可拖大或滚。
+    CONSOLE_MAX_ROWS = 4
+
+    #: 结果区**被压缩后的上限**（`_shrink_for_screen` 第一步把它降下来；None = 没压过）。
+    #:
+    #: ⚠️ 为什么需要它：`refresh()` 每次都会调 `_fit_console()`，而那个方法按
+    #: `CONSOLE_MAX_ROWS` 恢复行数 —— 于是"压完 500ms 就被撤销"，
+    #: 现场表现是"刚打开时好好的，过一会儿底下又出去了"（v6.4.16 实测踩到：
+    #: 直接调 `_shrink_for_screen` 量到的下限是 1021，等下一个刷新周期回来又变 1078）。
+    #: 压缩必须写进**状态**，不能只改一次控件高度。
+    _console_rows_capped = None
 
     busy_changed = pyqtSignal(bool)
     #: 执行器在后台线程里报进度（跨线程只走信号）
@@ -197,7 +216,7 @@ class PostureDialog(PostureModulesMixin, PostureCardsMixin, QDialog):
         # 页内距 16 → 8、卡片间距 12 → 4（v6.3.0 两轮收紧）：两张卡上下排列之后这一页
         # 同时受宽和高两头挤（现场 2026-09-29 的截图里右侧整条被切掉）。分块感靠卡片自己
         # 的白底与描边维持，不靠间距 —— 所以这两个值可以一路收到"不贴在一起"为止。
-        layout.setContentsMargins(SP["sp2"], SP["sp2"], SP["sp2"], SP["sp2"])
+        layout.setContentsMargins(SP["sp1"], SP["sp1"], SP["sp1"], SP["sp1"])
         layout.setSpacing(SP["sp1"])
         layout.addWidget(self._build_head_card())
         # 角度卡与预设卡**上下排列**（现场 2026-09-29 要求「改为上下而不是左右」）。
@@ -463,7 +482,10 @@ class PostureDialog(PostureModulesMixin, PostureCardsMixin, QDialog):
         self._fitting = True
         try:
             self._console_width = max(1, self.result.viewport().width())
-            fit_console(self.result, self.CONSOLE_MIN_ROWS, self.CONSOLE_MAX_ROWS)
+            upper = self.CONSOLE_MAX_ROWS
+            if self._console_rows_capped is not None:
+                upper = min(upper, self._console_rows_capped)
+            fit_console(self.result, self.CONSOLE_MIN_ROWS, upper)
         finally:
             self._fitting = False
 
@@ -906,20 +928,50 @@ class PostureDialog(PostureModulesMixin, PostureCardsMixin, QDialog):
            `CONSOLE_MAX_ROWS` 行），收到下限只影响"同时能看几条日志"，不动任何操作。
         2. **预设区再收**：从两行卡收到一行。预设区本来就有滚动条，一次少看几条而已，
            6 个躯干预设仍然都够得到。
-        3. **轴表一律不碰**：三列各 214px 是"20 个轴一屏看全"（v5.6.0 定的，
-           也是把 20 轴排成三列的全部意义）。压它等于把这一页的核心价值砍掉 ——
-           真放不下就让它超屏，由 `fit_dialog_to_screen` 兜底把标题栏留在屏内。
+        3. **轴表最后才压（v6.4.16 新增的一步）**：三列各 214px 是"20 个轴一屏看全"
+           （v5.6.0 定的）。这一步原来写的是"一律不碰，真放不下就让它超屏" ——
+           **那条规则要改**：超屏的代价是**底部操作按钮在屏幕外、点不到**
+           （对话框没有外层滚动条），而压轴表的代价只是"某一列多滚一下"，
+           前者严重得多。下限有保底（`AXIS_MIN_ROWS` 行仍完整可见）。
+
+        ⚠️ **每一步之后都重新量一次 `dialog_floor()`，不靠"估算压掉了多少"**。
+        v6.4.16 实测踩到：原先按 `before - after` 估算，而"某个控件变矮了"并不等于
+        "布局下限变矮了"（结果区本来就在下限、怎么收都是 0），于是 `room` 被算成还剩一点、
+        直接 `return`，**后面两步一步都没跑** —— 表现是"可用 1040 的屏上，一个字都没压"。
+        改成以 `dialog_floor()` 为准：目标 = 当前下限 − room，哪一步让它达标就停。
         """
         if room <= 0:
             return
-        before = self.result.height()
-        fit_console(self.result, self.CONSOLE_MIN_ROWS, self.CONSOLE_MIN_ROWS)
-        room -= max(0, before - self.result.height())
-        if room <= 0:
+        target = self.dialog_floor() - room
+        if self.dialog_floor() <= target:
             return
-        one_row = PresetCard.HEIGHT + SP["sp1"]
-        room -= max(0, self.preset_height - one_row)
-        self.set_preset_list_height(one_row)
+
+        # 1. 结果区收到下限（**改状态**，不是只改一次高度 —— 见 `_console_rows_capped`）
+        self._console_rows_capped = self.CONSOLE_MIN_ROWS
+        self._fit_console()
+        sync_layout(self)
+        if self.dialog_floor() <= target:
+            return
+
+        # 2. 预设区收到一行
+        self.set_preset_list_height(PresetCard.height_scaled() + SP["sp1"])
+        sync_layout(self)
+        if self.dialog_floor() <= target:
+            return
+
+        # 3. 轴表压"刚好够"的量，不越过保底线
+        floor = self.axis_list_floor()
+        now = self._axis_height_now
+        want = max(floor, now - (self.dialog_floor() - target))
+        self.set_axis_list_height(want)
+        sync_layout(self)
+
+    def dialog_floor(self) -> int:
+        """布局的**最小高** —— 窗口比它还矮，Qt 只会把内容挤扁（不是留白），
+        而"底下那几个按钮怎么点不到"这类现场反馈极难从此反推回来。
+        所以压缩之后要拿它兜一道底：宁可超屏（贴顶放，标题栏还在屏内），不要挤扁。
+        """
+        return self.layout().minimumSize().height()
 
     def hideEvent(self, event):                                # noqa: N802 (Qt 命名)
         """页面一藏起来就停周期刷新。

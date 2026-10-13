@@ -113,6 +113,86 @@ TYPE_SCALE = {
     "fs_lg": 22, "fs_read": 34, "fs_pillar": 44,
 }
 SPACING = {"sp1": 4, "sp2": 8, "sp3": 12, "sp4": 16, "sp5": 24, "sp6": 32, "sp7": 48}
+
+# ================= 全局 UI 缩放（v6.4.16） =================
+#
+# 现场是大屏（1080P 起）且站位较远，1440 宽的基准尺寸在那里显得小、点不准。
+# `configure_scale()` 在**启动时**按屏幕算一个系数，原地放大字号与控件高度。
+#
+# ⚠️ 三条纪律（都是实测/约束推出来的，改之前先读）：
+#
+# 1. **间距（SPACING）与圆角（RADIUS）不缩放。**
+#    实测：只放字号时姿态页 1021 → 1173；连间距一起放 → **1264**（多 91px）。
+#    而现场同时要求姿态页"纵向排列缩减一点"—— 两个要求方向相反，所以间距保持原值：
+#    放大的是"看得清、点得中"（字号 + 触摸目标），不是"版面松紧"。
+# 2. **RADIUS 不缩放**：药丸令牌按"配套的控件高度"命名（`pill_27/30/32`，值恒为
+#    半高），`test_every_pill_radius_fits_its_height` 会去核 `半径 == 名字里的高度/2`。
+#    跟着缩会让令牌名与值脱钩。代价：放大后药丸更像圆角矩形（半径 ≤ 半高仍然成立）。
+# 3. **`setFixedHeight` 等 41 处写死尺寸不动**：多数是装饰件（1px 分隔线、12px 箭头、
+#    30px 芯片），跟着放会把它们撑变形。放大靠"字号 + 下面这三个控件高度令牌"传下去。
+SCALE = 1.0
+
+#: 缩放前的字阶原值。`configure_scale` 每次都从这份**原值**重算，
+#: 不在上一次结果上再乘 —— 否则反复调用会累积舍入误差。
+_BASE_TYPE_SCALE = dict(TYPE_SCALE)
+
+#: 控件高度令牌（原先散在 QSS 里写死成 `min-height: 22px` 这类）。
+#:
+#: 这三个值决定"按键/输入框有多高"，是触摸目标的主体；与字号一起缩放。
+#: 名字里的语义：`ch_main` 操作区主按钮、`ch_start` 启动/关闭那类更大的钮、`ch_input` 输入控件。
+CONTROL_HEIGHT = {"ch_main": 22, "ch_start": 26, "ch_input": 20}
+_BASE_CONTROL_HEIGHT = dict(CONTROL_HEIGHT)
+
+#: 缩放基准屏宽：窗口在这块屏幕上按 1.0 渲染。
+#:
+#: 取 1440 而不是 860（最小宽），是为了让**开发机与既有的 54 条尺寸守卫**都落在 1.0
+#: ——守卫断言的是"某个按钮比另一个高"这类关系，基准一动就全要重写，而且重写完
+#: 就再也守不住"某个按钮是不是变矮了"。缩小方向一律不缩（下限 1.0）。
+BASE_SCREEN_WIDTH = 1440
+SCALE_MAX = 1.5
+
+
+def configure_scale(scale: float) -> None:
+    """设定全局缩放系数（原地更新令牌，**必须在 `apply_theme` 之前调用**）。
+
+    原地 `update()` 而不是重新赋值：全项目 129 处 `SP[...]` / `TYPE_SCALE[...]`
+    拿的都是同一个 dict 的引用，原地改即可全部生效，不用改调用点。
+    """
+    global SCALE
+    SCALE = max(1.0, min(SCALE_MAX, float(scale)))
+    TYPE_SCALE.update({k: max(1, round(v * SCALE)) for k, v in _BASE_TYPE_SCALE.items()})
+    CONTROL_HEIGHT.update(
+        {k: max(1, round(v * SCALE)) for k, v in _BASE_CONTROL_HEIGHT.items()})
+
+
+def ui_scale() -> float:
+    """当前缩放系数（自绘/定高控件用它算自己的尺寸，见 `posture_widgets`）。"""
+    return SCALE
+
+
+def scale_for_screen(width: int, override=None) -> float:
+    """按屏幕可用宽度算缩放系数：`clamp(宽/1440, 1.0, 1.5)`。
+
+    1080P（1920）→ **1.33**；1440 及以下 → 1.0（不缩）；4K 封顶 1.5
+    （再大就不是"看得清"的问题，而是这个按 860 最小宽设计的版面会散架）。
+
+    `override` 是 `app_config.yaml` 的 `ui_scale`（留空 / 非法 / ≤0 → 自动算）。
+    做成纯函数是为了能被用例直接喂数值验证，不必去造一块屏幕。
+    """
+    if override not in (None, ""):
+        try:
+            value = float(override)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return max(1.0, min(SCALE_MAX, value))
+    try:
+        width = int(width)
+    except (TypeError, ValueError):
+        return 1.0
+    if width <= 0:
+        return 1.0
+    return max(1.0, min(SCALE_MAX, width / BASE_SCREEN_WIDTH))
 # B 方案是"卡片"语言：圆角明显大于工业风的发丝边框（原 2/4/7）。
 # pill 给徽章与幽灵按钮用，做成全圆角。
 #
@@ -839,7 +919,7 @@ QPushButton[variant="ghost-danger"]:disabled { color: ${muted2}; border-color: $
    注意 QSS 里 min-height 是"内容盒"高度，padding 与 border 另算。 */
 QFrame[role="actions"] QPushButton {
     padding: 10px 16px;
-    min-height: 22px;
+    min-height: ${ch_main}px;   /* 触摸目标：随 configure_scale 放大 */
     border-radius: ${r2}px;
 }
 /* 幽灵变体的圆角也要在操作区内被覆盖：它自带 pill 全圆角，特异性比上面那条高 */
@@ -849,7 +929,7 @@ QFrame[role="actions"] QPushButton[variant="ghost"] {
 /* 主操作仍是操作区里唯一更大的按钮（靠尺寸区分层级，不靠颜色堆叠） */
 QFrame[role="actions"] QPushButton[variant="launch"] {
     padding: 14px 28px;
-    min-height: 26px;
+    min-height: ${ch_start}px;  /* 同上，这一档比主按钮更大 */
     font-size: 15px;
     font-weight: 700;
 }
@@ -866,7 +946,7 @@ QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
     border-radius: ${r2}px;
     color: ${text};
     padding: 7px 10px;
-    min-height: 20px;
+    min-height: ${ch_input}px;  /* 输入控件高度，随缩放大 */
 }
 /* 下拉**弹层**里的选中色必须同时给组合框自己一份：弹层的 delegate 用的是
    `QComboBox::viewOptions()` 造出来的调色板，也就是**组合框的**调色板，不是视图的 ——
@@ -1116,6 +1196,9 @@ def build_stylesheet(mode: str = "dark") -> str:
     """生成整套 QSS。所有令牌在这里填进模板，组件代码不再各自写样式。"""
     values = palette(mode)
     values.update({k: str(v) for k, v in TYPE_SCALE.items()})
+    # 控件高度令牌（v6.4.16）：与字号一起随 `configure_scale` 放大。
+    # 间距 / 圆角**不注入缩放值** —— 理由见 SCALE 那一段的三条纪律。
+    values.update({k: str(v) for k, v in CONTROL_HEIGHT.items()})
     values.update({k: str(v) for k, v in RADIUS.items()})
     values["r1"] = str(RADIUS["r1"])
     values["r2"] = str(RADIUS["r2"])

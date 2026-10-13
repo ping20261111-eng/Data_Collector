@@ -236,14 +236,16 @@ class StatusMixin:
 
     # ---------- 躯干自锁（两个入口共用这一处，v6.4.15） ----------
     def _sync_robot_menu(self):
-        """「机器人控制 ▾」弹出前刷新自锁那一项的名字。
+        """「机器人控制 ▾」弹出前刷新那两项的名字。
 
-        名字表示的是**本页下发过什么**（`trunk_lock_sent`），不是"现在是不是自锁" ——
+        自锁那一项表示的是**本页下发过什么**（`trunk_lock_sent`），不是"现在是不是自锁" ——
         ROS 侧没有自锁状态话题（`getMotorBrakeState()` 只存在于 C++ SDK 的接口里）。
+        全屏那一项表示的是**窗口当前状态**（可回读，用 `isFullScreen()`）。
         本菜单的约定是**一律可点、不置灰**，所以"点下去会做什么"只能靠文案说清。
         """
         locked = getattr(self, "trunk_lock_sent", None) is True
         self.btn_trunk_lock.setText("解除自锁" if locked else "躯干自锁")
+        self.btn_fullscreen.setText("退出全屏" if self.isFullScreen() else "全屏显示")
 
     @guard_slot
     def on_trunk_lock(self, locked=None, report=None):

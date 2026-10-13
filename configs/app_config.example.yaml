@@ -28,6 +28,11 @@ version_repo_timeout: 20       # 列目录超时(秒)；下载与解压走各自
 # ---------- 界面（可选） ----------
 # ui_theme: light（默认，办公/现场）/ dark（暗光环境）
 ui_theme: light
+# 界面缩放系数（v6.4.16）。**留空 = 自动**（按屏幕可用宽算：宽/1440，钳在 1.0~1.5）——
+# 1080P(1920) → 1.33，1440 及以下不缩，4K 封顶 1.5。字号与按键高度按它放大，间距不放。
+# 换屏幕 / 换站位（离得远看不清）时可以在这里手填一档（如 1.2 / 1.5）而不必重新打包；
+# 填 0 / 空 / 非法值都退回自动。
+ui_scale:
 # 机型/序列号/末端手型来源（顶栏与手型都用它）。留空则依次找：
 #   ${nerv_dir}/product/Product.json（机器人侧 product.sh 读的同一个文件，权威）
 #   > 项目根/Product.json > ${workspace}/Product.json > ${workspace}/install/config/Product.json

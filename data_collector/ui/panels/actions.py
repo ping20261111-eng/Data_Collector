@@ -278,6 +278,14 @@ class ActionsMixin(ExportTargetMixin):
             "提示：自锁等于「关节失去保持力矩」—— 若躯干当前不在支撑位，可能自行下沉")
         self.btn_trunk_lock.triggered.connect(self.on_trunk_lock)
 
+        self.btn_fullscreen = QAction("全屏显示", self)
+        self.btn_fullscreen.setShortcut("F11")
+        self.btn_fullscreen.setToolTip("铺满整块屏幕（F11 也可切换）。"
+                                       "放大后的界面在窗口里看要留出标题栏与边框，"
+                                       "全屏能多出约 40px 高度给内容"
+                                       "（姿势控制页正卡在这个高度上）")
+        self.btn_fullscreen.triggered.connect(self.on_toggle_fullscreen)
+
         robot_menu = QMenu(self)
         robot_menu.addAction(self.btn_gripper)
         robot_menu.addAction(self.btn_end_effector)
@@ -287,6 +295,8 @@ class ActionsMixin(ExportTargetMixin):
         robot_menu.addAction(self.btn_pokepoint)
         robot_menu.addSeparator()          # 上面是"起节点"，这条是"直接改机构状态"
         robot_menu.addAction(self.btn_trunk_lock)
+        robot_menu.addSeparator()          # 上面都是"操作机器人"，这条是"操作这个窗口"
+        robot_menu.addAction(self.btn_fullscreen)
         # 菜单项名字随「本页下发过什么」变（自锁 / 解除自锁）。本菜单的约定是
         # **一律可点、不置灰**（Qt 菜单项的悬停提示不可靠，灰着又没理由会被读成"坏了"），
         # 所以"现在点下去会做什么"只能靠文案说清 —— 每次弹出前刷一次。
@@ -296,7 +306,7 @@ class ActionsMixin(ExportTargetMixin):
         self.btn_robot_menu.setProperty("variant", "ghost")
         self.btn_robot_menu.setMenu(robot_menu)
         self.btn_robot_menu.setToolTip("机器控制类功能：夹爪控制 / 末端参数 / 姿势控制 / "
-                                       "开始标定 / 戳点 / 躯干自锁"
+                                       "开始标定 / 戳点 / 躯干自锁 / 全屏显示"
                                        "（都直接操作机器人本体；上、下使能在「姿势控制」页里）")
 
         # 停止相机标定：只在标定节点运行期间出现 —— 空闲时既不该占位、也不该

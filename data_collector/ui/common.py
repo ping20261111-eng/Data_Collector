@@ -397,12 +397,18 @@ def make_panel_head(title, right_widgets=()):
     return head, layout
 
 
-def dialog_card(title: str):
+def dialog_card(title: str, *, head_pad=None, body_pad=None):
     """对话框里的一张白卡片：`QFrame#Panel` + `PanelHead`（标题 + 右侧徽章位）+ 内容区。
 
     三个控制页面（模块使能 / 夹爪控制 / 末端参数）原本各写一套版面：模块页与夹爪页是
     "裸行 + 分隔线"，末端参数是白卡片 —— 同一个家族长两副样子，现场学一次不够。
     抽成这一个构造器后三页同构（现场："控制页面统一吧"）。
+
+    Args:
+        head_pad / body_pad: 卡头与内容区的**上下**内边距，不给就用默认（`sp3`）。
+            姿势控制页会传 `sp2` —— 它一页摞了四张卡，每张各让 8px 就是 32px，
+            而这一页在 1080P 上正好卡在"底部按钮被顶出屏幕"的临界点（v6.4.16）。
+            其余页面保持默认：那点留白是"卡片语言"的一部分，没必要跟着一起挤。
 
     Returns:
         ``(卡片, 卡头行布局, 内容区布局)``：卡头行由调用方往里加徽章/说明（标题已加好并靠左）。
@@ -413,10 +419,11 @@ def dialog_card(title: str):
     outer.setContentsMargins(0, 0, 0, 0)
     outer.setSpacing(0)
 
+    head_v = SP["sp3"] if head_pad is None else head_pad
     head = QFrame()
     head.setObjectName("PanelHead")
     head_row = QHBoxLayout(head)
-    head_row.setContentsMargins(SP["sp4"], SP["sp3"], SP["sp4"], SP["sp3"])
+    head_row.setContentsMargins(SP["sp4"], head_v, SP["sp4"], head_v)
     head_row.setSpacing(SP["sp2"])
     label = QLabel(title)
     label.setObjectName("PanelTitle")
@@ -426,7 +433,8 @@ def dialog_card(title: str):
     outer.addWidget(head)
 
     body = QVBoxLayout()
-    body.setContentsMargins(SP["sp4"], SP["sp3"], SP["sp4"], SP["sp4"])
+    body.setContentsMargins(SP["sp4"], head_v, SP["sp4"],
+                            SP["sp4"] if body_pad is None else body_pad)
     body.setSpacing(SP["sp2"])
     outer.addLayout(body)
     return card, head_row, body
@@ -470,6 +478,15 @@ def fit_console(console, min_rows: int = 3, max_rows: int = 9) -> int:
 #: 屏幕可用高度低于这个值就不再压缩：压到这个份上，内容已经挤得没法读，
 #: 再压只会让"还看得见什么"变得不可预测 —— 保持原样让人自己拖动窗口，行为至少可预期。
 MIN_SCREEN_HEIGHT = 640
+
+#: 窗口管理器给对话框加的标题栏 + 边框高度（估算）。
+#:
+#: `availableGeometry().height()` 是**桌面可用区**，不含窗口自己的装饰；把内容直接
+#: 铺到那个高度，底部的按钮行就会被标题栏顶出屏幕 —— 现场 1080P 上姿势控制页
+#: "下面有一截看不到"正是这么来的（v6.4.16）。留在屏内这 40px 是给窗口装饰的。
+#:
+#: 只影响"不给 limit 时"的自动值；用例显式传 limit 时不受影响（它们要能喂固定值）。
+WINDOW_FRAME_ALLOWANCE = 40
 
 
 def sync_layout(widget) -> None:
@@ -515,7 +532,8 @@ def fit_dialog_to_screen(dialog, *, limit=None, shrink=None) -> int:
     if limit is None:
         if screen is None:
             return dialog.height()
-        limit = screen.availableGeometry().height()
+        # 减掉窗口装饰的高度：不减的话"刚好塞满可用区"的窗口，底部会被标题栏顶出屏。
+        limit = screen.availableGeometry().height() - WINDOW_FRAME_ALLOWANCE
     if not limit or limit < MIN_SCREEN_HEIGHT:
         return dialog.height()
     need = max(dialog.height(), dialog.sizeHint().height())

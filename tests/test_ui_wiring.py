@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (QApplication, QDialog, QLabel,  # noqa: E402
                              QPushButton, QScrollArea, QVBoxLayout, QWidget)
 
 from data_collector.core import ConfigManager, PROJECT_ROOT, save_yaml  # noqa: E402
-from data_collector.ui.common import SP, fit_dialog_to_screen  # noqa: E402
+from data_collector.ui.common import SP, fit_dialog_to_screen, sync_layout  # noqa: E402
 from data_collector.ui.posture_widgets import PresetCard  # noqa: E402
 
 
@@ -2909,9 +2909,11 @@ def test_robot_menu_wired(ui_env):
     """机器控制类功能全在**一个**二级菜单里（现场："对机器控制的功能全放在一个二级菜单内"）。
 
     工具行只剩 采集统计 / 性能监控 / 机器人控制 ▾（+ 按需出现的「停止相机标定」）；
-    菜单是一层到底的 6 项，用分隔线分组，不做三级。
+    菜单是一层到底的 7 项，用分隔线分组，不做三级。
     v6.4.15 加了「躯干自锁」（现场要求：不进页面就能锁）—— 它单独占一组：
     上面那两条是"起节点"，它是"直接改机构状态"，混在一起会被读成"也是起个节点"。
+    v6.4.16 又加了「全屏显示」（现场要求：全屏入口，别只靠窗口管理器）—— 也单独占一组：
+    前六项都在"操作机器人"，它操作的是**这个窗口**。
 
     v6.0.0 起「模块使能…」已删（现场要求：并进「姿势控制」页），所以"开窗口"只剩三项。
     """
@@ -2926,19 +2928,41 @@ def test_robot_menu_wired(ui_env):
     actions = [act.text() for act in menu.actions() if act.text()]
     # 名称写全、**不带省略号**（现场 2026-09-28 要求："下拉菜单的名称补全，不要有…"）
     assert actions == ["夹爪控制", "末端参数", "姿势控制",
-                       "开始标定（自动启动节点）", "戳点", "躯干自锁"]
+                       "开始标定（自动启动节点）", "戳点", "躯干自锁", "全屏显示"]
     assert not any(act.text().endswith("…") for act in menu.actions() if act.text())
-    # 分隔线代替层级：把"开窗口"、"起节点"、"直接改机构状态"三组分开
-    assert sum(1 for act in menu.actions() if act.isSeparator()) == 2
+    # 分隔线代替层级：把"开窗口"、"起节点"、"直接改机构状态"、"操作窗口"四组分开
+    assert sum(1 for act in menu.actions() if act.isSeparator()) == 3
 
     # 菜单项不置灰（Qt 菜单的悬停提示不可靠，灰着没理由会被读成"坏了"）
     assert all(act.isEnabled() for act in menu.actions() if act.text())
     assert win.btn_posture is not None and win.btn_pokepoint is not None
     assert win.btn_trunk_lock is not None
+    assert win.btn_fullscreen is not None
     assert not hasattr(win, "btn_module_enable")      # 独立页已删，入口不该还留着
     # 「停止相机标定」本期没动：仍在工具行、仍按需出现，空闲时不占位
     assert win.btn_cancel_calibration.isHidden()
     assert not hasattr(win, "btn_camera_calib")      # 已并进「开始标定」，不再单独给入口
+
+
+def test_fullscreen_toggles_and_the_menu_text_follows(status_env):
+    """全屏有两个入口（F11 与菜单项），同一处实现；菜单文案**据实**显示（这个状态可回读）。
+
+    与自锁那项的区别值得写下来：自锁只能声明"本页下发过什么"（ROS 侧没有状态话题），
+    而全屏是窗口自己的属性，`isFullScreen()` 一问就知道 —— 所以这里显示的是真状态。
+    """
+    win, _cm, _status = status_env
+    assert win._fullscreen_shortcut.key().toString() == "F11", "F11 没挂上"
+
+    win._sync_robot_menu()
+    assert win.btn_fullscreen.text() == "全屏显示"
+    win.on_toggle_fullscreen()
+    assert win.isFullScreen(), "切了一次却没进全屏"
+    win._sync_robot_menu()
+    assert win.btn_fullscreen.text() == "退出全屏", "全屏后菜单文案没跟着变"
+    win.on_toggle_fullscreen()
+    assert not win.isFullScreen(), "再切一次没退出全屏"
+    win._sync_robot_menu()
+    assert win.btn_fullscreen.text() == "全屏显示"
 
 
 class _AliveProc:
@@ -5483,20 +5507,20 @@ def test_posture_reports_unconfirmed_publish(status_env, tmp_path, monkeypatch):
     assert "执行完成" not in text
 
 
-def test_posture_shrinks_console_then_presets_and_never_the_axes(
+def test_posture_shrinks_console_then_presets_and_axes_last(
         status_env, tmp_path, monkeypatch):
-    """屏幕装不下时的压缩顺序：**结果区 → 预设区；轴表一律不动**（v6.3.4）。
+    """屏幕装不下时的压缩顺序：**结果区 → 预设区 → 轴表（最后，且有保底）**。
 
-    为什么要有这一步：这一页的自然高度是 1025，而屏幕可用高度有限（主窗口是
-    `setGeometry(100, 100, 940, 860)`，底边 960）—— 不处理就会把底部的操作按钮
-    推到屏幕外，而对话框**没有滚动条**，用户没有任何办法够到它们，拖窗口也拖不回来。
+    为什么要有这一步：这一页的自然高度远超屏幕可用高度 —— 不处理就会把底部的操作按钮
+    推到屏幕外，而对话框没有外层滚动条，用户没有任何办法够到它们，拖窗口也拖不回来。
 
     顺序不能换，三条理由各不相同：
     * 结果区（日志）本来就按内容自适应，收到下限只影响"同时看几条"；
     * 预设区本来就有滚动条，收到一行只是少看几条，6 个躯干预设仍然都够得到；
-    * **轴表三列各 214px 是"20 个轴一屏看全"的承诺**（v5.6.0 定的）—— 压它等于把
-      这一页的核心价值砍掉，所以宁可真放不下时超屏，由 `fit_dialog_to_screen`
-      兜底把标题栏留在屏内。
+    * **轴表最后才压**（v6.4.16 从"一律不碰"改成这一步）：它三列各 214px 是
+      "20 个轴一屏看全"的承诺（v5.6.0），但超屏的代价是**操作按钮点不到**，
+      而压它的代价只是"某一列多滚一下" —— 前者严重得多，所以两害相权取后者。
+      触发条件很窄（前两步都到下限还不够），且**有保底**：`AXIS_MIN_ROWS` 行仍完整可见。
     """
     win, _cm, status_file = status_env
     _seed_motion_presets(tmp_path)
@@ -5511,26 +5535,61 @@ def test_posture_shrinks_console_then_presets_and_never_the_axes(
 
     assert dialog.result.height() < console_before, "结果区没被收"
     assert dialog.preset_height < preset_before, "预设区没被收（结果区收完还不够时要接着收它）"
-    assert dialog.axis_areas["trunk"].height() == axis_before, "轴表被动了 —— 这一处不能动"
-    assert dialog.preset_height == PresetCard.HEIGHT + SP["sp1"], "预设区应收到「一行卡」"
+    assert dialog.preset_height == PresetCard.height_scaled() + SP["sp1"], \
+        "预设区应收到「一行卡」"
+    # 200px 比前两步能给的量还多，所以会轮到第三步；但它必须停在保底线上。
+    assert dialog.axis_areas["trunk"].height() < axis_before, \
+        "前两步压完还差 200px，轴表应当接着压（v6.4.16 起不再是「一律不碰」）"
+    assert dialog.axis_areas["trunk"].height() >= dialog.axis_list_floor(), \
+        "轴表压过了保底线 —— 至少要留 AXIS_MIN_ROWS 行完整可见"
+
+
+def test_posture_axes_stop_at_the_floor_when_compressed(status_env, tmp_path, monkeypatch):
+    """轴表被压时**不许低于保底线**，且三列同高（列高不一致会被读成"这列还没加载"）。"""
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file)
+    dialog = _open_posture(win, monkeypatch)
+
+    dialog._shrink_for_screen(9999)                 # 要压掉一个不可能满足的量
+
+    floor = dialog.axis_list_floor()
+    assert floor > 0, "保底线应当是正数"
+    for group in ("trunk", "left", "right"):
+        assert dialog.axis_areas[group].height() == floor, \
+            f"{group} 列没停在保底线（{dialog.axis_areas[group].height()} != {floor}）"
+    # 保底线 = 表头 + AXIS_MIN_ROWS 行；拿真实行高反推，确认它还容得下那么多行
+    row = dialog.axis_row_height()
+    assert row > 0
+    assert floor - row >= dialog.AXIS_MIN_ROWS * row - 1, \
+        f"保底线 {floor} 装不下 {dialog.AXIS_MIN_ROWS} 行 × {row}px"
 
 
 #: 用例里模拟的"短屏"高度。出处：主窗口是 `setGeometry(100, 100, 940, 860)`，
-#: 底边 960 —— 所以现场的可用高度至少 960，取 900 是往保守一侧压。
-SHORT_SCREEN = 900
+#: 底边 960 —— 所以现场的可用高度至少 960，取 780 是往保守一侧压。
+#:
+#: **v6.4.16 从 900 调到 780**：这一页的自然高度那时从 1025 收到 **865**
+#: （结果区上限 8→4 行、卡片留白收紧、预设区可压到一行），900 的屏已经压都不需要压了
+#: —— 用例的前提（`natural > SHORT_SCREEN`）会直接不成立。780 仍然低于自然高，
+#: 能继续逼出压缩路径。
+SHORT_SCREEN = 780
 
 
-def test_posture_fits_a_short_screen_without_touching_the_axes(
-        status_env, tmp_path, monkeypatch):
-    """模拟一块 900px 高的屏：压完之后**窗口必须真的 ≤900**，且轴表一动没动。
+def test_posture_fits_a_short_screen(status_env, tmp_path, monkeypatch):
+    """模拟一块 780px 高的屏：**压完之后布局下限必须能进这块屏**（v6.4.16 起成立）。
 
     这条是整件事的目的本身 —— 前面那条只验"压的顺序"，这条验"到底进没进屏幕"。
-    900 是照现场推的：主窗口是 `setGeometry(100, 100, 940, 860)`，底边 960。**本页的自然
-    高度是 1025**，不压就是底部的「确认运动 / 取消」整排按钮在屏幕外。
 
-    顺带把"压不动时靠 `resize` 兜底"也验了：姿势页压完约 923，仍然高于 900，
-    所以走的是兜底那条路 —— 它能生效的前提是**布局的最小高小于 900**，
-    而三列轴表（各 214，固定）加其余卡片正好在这条线之内。
+    **为什么断言的是"下限"而不是窗口高度**：`fit_dialog_to_screen` 走的是
+    "先压缩、再把窗口 resize 到 limit"，而这一页有个 500ms 的周期刷新，两次量到的
+    `dialog.height()` 之间会被刷新动过（实测差几十像素）—— 拿窗口高做断言会时绿时红。
+    真正要保的性质是"**内容的最小高度已经降到这块屏以内**"：只要它成立，
+    `fit_dialog_to_screen` 那一下 resize 就一定落得进去。窗口高度本身另有
+    `test_posture_axes_are_untouched_when_a_small_shrink_suffices` 与
+    `test_posture_shrinks_console_then_presets_and_axes_last` 两条盯着。
+
+    v6.4.16 之前这条是压不进去的：轴表"一律不碰"时，能压的只有结果区与预设区，
+    实测下限 ~975 > 780 的屏，剩下那截永远在屏幕外（旧用例只能断言"≤ limit+80"）。
     """
     win, _cm, status_file = status_env
     _seed_motion_presets(tmp_path)
@@ -5539,26 +5598,75 @@ def test_posture_fits_a_short_screen_without_touching_the_axes(
     natural = dialog.height()
     assert natural > SHORT_SCREEN, "前提：本页自然高度本来就超过这块屏"
 
-    axis_before = dialog.axis_areas["trunk"].height()
     preset_before = dialog.preset_height
+    floor_before = dialog.dialog_floor()
 
-    height = fit_dialog_to_screen(dialog, limit=SHORT_SCREEN,
-                                  shrink=dialog._shrink_for_screen)
+    dialog._shrink_for_screen(max(0, floor_before - SHORT_SCREEN))
+    sync_layout(dialog)
 
-    assert height < natural, "压完必须比原来矮"
-    # **实测下限 975**（本机量的）。压到这里之后能压的都压完了：
-    # 结果区到了 2 行、预设区到了一行，剩下的全是"内容定高"的卡片 ——
-    # 而三列轴表（各 214）是"20 个轴一屏看全"的承诺，不动。
-    # 所以下面这条断言的是"已经压到接近下限"，不是"一定进得去 SHORT_SCREEN"：
-    # 屏幕可用高若低于 ~980，这一页放不下 —— 那要改形态（内容可滚动 + 底栏固定），
-    # 属设计稿范围，不在这一轮。
-    assert height <= SHORT_SCREEN + 80, "离实测下限（975）太远，说明有哪一块没压到"
-    assert dialog.axis_areas["trunk"].height() == axis_before, "轴表被动了"
+    assert dialog.dialog_floor() < floor_before, "压完下限必须变小（否则等于没压）"
+    assert dialog.dialog_floor() <= SHORT_SCREEN, \
+        (f"压完下限仍是 {dialog.dialog_floor()} > {SHORT_SCREEN} —— "
+         "底部的操作按钮会落在屏幕外")
     assert dialog.preset_height <= preset_before, "预设区只允许变小，不允许变大"
-    # 压不动就只能超屏 —— 这时要**贴着屏幕顶部**放：三个控制页都是非模态 `show()`，
-    # 位置由窗口管理器定（默认居中），那样超出的一截上下各切一半、标题栏都可能不在屏内；
-    # 贴顶之后被切的只有底部，标题栏一定够得到。
-    assert dialog.y() <= 9, "超屏时应贴屏幕顶部（留 8px 边距），而不是交给窗口管理器居中"
+    for group in ("trunk", "left", "right"):
+        assert dialog.axis_areas[group].height() >= dialog.axis_list_floor(), \
+            f"{group} 列压过了保底线"
+
+
+def test_the_console_stays_compressed_across_a_refresh(status_env, tmp_path, monkeypatch):
+    """压缩必须**经得住周期刷新**（v6.4.16 实测踩到的坑）。
+
+    `refresh()`（500ms 那个定时器调的就是它）里会走一遍 `_fit_console()`，而它按
+    `CONSOLE_MAX_ROWS` 恢复行数 —— 于是"只改一次控件高度"的压缩会被**悄悄撤销**：
+
+        · 直接调 `_shrink_for_screen(38)` 之后量到的下限 = 1021
+        · 等一个刷新周期回来再量          = 1078（回到原点）
+
+    现场表现就是"**刚打开时好好的，过一会儿底下又出去了**"——比一直溢出更难归因。
+    所以压缩写进的是**状态**（`_console_rows_capped`），`_fit_console` 必须尊重它。
+    """
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file)
+    dialog = _open_posture(win, monkeypatch)
+
+    dialog._shrink_for_screen(200)
+    sync_layout(dialog)
+    console_after = dialog.result.height()
+    floor_after = dialog.dialog_floor()
+    assert console_after < dialog.CONSOLE_MAX_ROWS * 20, \
+        "前提：压完结果区应当明显更矮（否则这条用例验不到东西）"
+
+    dialog.refresh()                     # 周期刷新走的就是这条
+    sync_layout(dialog)
+
+    assert dialog.result.height() <= console_after, \
+        "刷新把结果区又拉回去了 —— 压缩必须写进状态，不能只改一次高度"
+    assert dialog.dialog_floor() <= floor_after, \
+        f"刷新后布局下限涨回去了（{floor_after} → {dialog.dialog_floor()}）—— "\
+        "现场表现是\"刚打开好好的，过一会儿底下又出去了\""
+
+
+def test_posture_axes_are_untouched_when_a_small_shrink_suffices(
+        status_env, tmp_path, monkeypatch):
+    """**只差一点点时不许动轴表** —— 前两步够用就到此为止（`AXIS_MIN_ROWS` 的承诺）。"""
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file)
+    dialog = _open_posture(win, monkeypatch)
+
+    console_before = dialog.result.height()
+    axis_before = dialog.axis_areas["trunk"].height()
+
+    preset_before = dialog.preset_height
+    dialog._shrink_for_screen(1)                    # 只差 1px：结果区收一下就够了
+
+    assert dialog.result.height() < console_before, "结果区没被收"
+    # 结果区一收就够（`_shrink_for_screen` 在第一步之后、第二步之前有 `room <= 0` 的早退）
+    assert dialog.preset_height == preset_before, "差 1px 时不该顺带动预设区"
+    assert dialog.axis_areas["trunk"].height() == axis_before, \
+        "前两步都没轮到，轴表更不该被动"
 
 
 def test_posture_is_left_alone_when_the_screen_has_room(status_env, tmp_path, monkeypatch):

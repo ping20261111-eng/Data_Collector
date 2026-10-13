@@ -11,7 +11,8 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QGroupBox, QLabel, QDialog, QLineEdit, QComboBox,
                              QInputDialog, QListWidget, QListWidgetItem,
                              QAbstractItemView, QProgressBar, QFileDialog, QMenu,
-                             QFrame, QSizePolicy, QApplication)
+                             QFrame, QSizePolicy, QApplication, QShortcut)
+from PyQt5.QtGui import QKeySequence
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QRect
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QPolygon
 from PyQt5.Qt import QDesktopServices
@@ -135,6 +136,12 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         # 所以这里拦住，而不是让用户缩到一个读不出参数的大小。
         self.setMinimumSize(860, 660)
 
+        #: F11 切换全屏（与「机器人控制 ▾」→「全屏显示」共用同一处实现）。
+        #: 快捷键挂在窗口上，默认是 `Qt.WindowShortcut` 作用域 —— 子对话框拿到焦点时
+        #: 不会误触发；反过来在全屏里按 F11 也一定退得出来，不必先找到标题栏。
+        self._fullscreen_shortcut = QShortcut(QKeySequence("F11"), self)
+        self._fullscreen_shortcut.activated.connect(self.on_toggle_fullscreen)
+
         # 主题：设计稿的令牌一次性铺到整个应用（各对话框一并生效，不用逐个设置）
         self.theme_mode = self.config.get_ui_theme()
         theme.apply_theme(QApplication.instance(), self.theme_mode)
@@ -211,6 +218,22 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
     def show_error(self, title, msg):
         logger.error(msg)
         QMessageBox.critical(self, title, msg)
+
+    @guard_slot
+    def on_toggle_fullscreen(self):
+        """全屏 / 退出全屏（F11 与「机器人控制 ▾」里那一项共用）。
+
+        全屏不只是"看着大"：它省掉标题栏与窗口边框（约 40px 高），而姿势控制页在
+        1080P + 1.33 缩放下正卡在这个高度上 —— 见 `PostureDialog._shrink_for_screen`。
+
+        **这个状态可回读**（`isFullScreen()`），所以菜单项文案据实显示，不像自锁那样
+        只能声明"本页下发过什么"。
+        """
+        if self.isFullScreen():
+            self.showNormal()
+        else:
+            self.showFullScreen()
+        logger.info("窗口已切到全屏" if self.isFullScreen() else "窗口已退出全屏")
 
     def _shutdown_threads(self, msec: int = 2000) -> list:
         """关闭前回收本界面的定时器与工作线程，返回未能按时停止的对象名。

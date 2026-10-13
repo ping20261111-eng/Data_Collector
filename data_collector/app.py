@@ -50,6 +50,7 @@ def main():
     app = QApplication(sys.argv)
     # 兜底护栏：未捕获异常留堆栈（logs/ui_error.log），别让界面"静默退出"
     install_excepthook()
+    _configure_ui_scale(app, cfg_mgr)
     win = MainWindow(cfg_mgr)
     # 外部信号（systemctl stop / pkill / 会话结束）默认会**静默杀掉**进程，
     # 现场表现就是"界面忽然没了、日志一个字没有"。这里让它变成可留证据的干净退出。
@@ -57,6 +58,30 @@ def main():
     _log_session_identity(cfg_mgr)
     win.show()
     sys.exit(app.exec_())
+
+
+def _configure_ui_scale(app, cfg_mgr) -> float:
+    """按屏幕（可被配置覆盖）定死全局缩放系数，**必须早于 `apply_theme`**。
+
+    为什么在启动时算一次、运行中不重算：`build_stylesheet()` 每次要拼三万多字符的
+    QSS 并重刷全站样式，放进 `resizeEvent` 里会在拖动窗口时明显卡顿与闪烁。
+    而"全屏"的宽度就是屏幕宽度，所以按屏幕算与全屏后算的**结果一致** ——
+    不会出现"全屏了才突然变大"的跳变。
+
+    日志里打出三个数（屏幕宽 / 配置值 / 最终系数）：现场反馈"字太大/太小"时，
+    看一眼启动日志就知道是屏幕量错了还是配置被覆盖了。
+    """
+    from . import theme
+
+    screen = app.primaryScreen()
+    width = screen.availableGeometry().width() if screen is not None else 0
+    override = cfg_mgr.get_ui_scale()
+    scale = theme.scale_for_screen(width, override)
+    theme.configure_scale(scale)
+    logger.info(f"界面缩放 {scale:.2f}×（屏幕可用宽 {width}px / 基准 "
+                f"{theme.BASE_SCREEN_WIDTH}px；配置 ui_scale="
+                f"{'未设（自动）' if override in (None, '') else override}）")
+    return scale
 
 
 def _log_session_identity(cfg_mgr: ConfigManager) -> None:

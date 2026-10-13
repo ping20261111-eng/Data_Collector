@@ -135,7 +135,7 @@ def test_no_single_ui_file_balloons():
 POSTURE_FILES = ("core_motion.py", "motion_kinematics.py", "motion_runner.py",
                  "ros_bridge.py", "ui/posture.py", "ui/posture_widgets.py",
                  "ui/posture_draw.py", "ui/posture_modules.py",
-                 "ui/posture_dialogs.py")
+                 "ui/posture_dialogs.py", "ui/posture_cards.py")
 
 
 def test_posture_modules_stay_under_the_line_limit():
