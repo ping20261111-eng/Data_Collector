@@ -2909,7 +2909,9 @@ def test_robot_menu_wired(ui_env):
     """机器控制类功能全在**一个**二级菜单里（现场："对机器控制的功能全放在一个二级菜单内"）。
 
     工具行只剩 采集统计 / 性能监控 / 机器人控制 ▾（+ 按需出现的「停止相机标定」）；
-    菜单是一层到底的 5 项，用分隔线分组，不做三级。
+    菜单是一层到底的 6 项，用分隔线分组，不做三级。
+    v6.4.15 加了「躯干自锁」（现场要求：不进页面就能锁）—— 它单独占一组：
+    上面那两条是"起节点"，它是"直接改机构状态"，混在一起会被读成"也是起个节点"。
 
     v6.0.0 起「模块使能…」已删（现场要求：并进「姿势控制」页），所以"开窗口"只剩三项。
     """
@@ -2924,14 +2926,15 @@ def test_robot_menu_wired(ui_env):
     actions = [act.text() for act in menu.actions() if act.text()]
     # 名称写全、**不带省略号**（现场 2026-09-28 要求："下拉菜单的名称补全，不要有…"）
     assert actions == ["夹爪控制", "末端参数", "姿势控制",
-                       "开始标定（自动启动节点）", "戳点"]
+                       "开始标定（自动启动节点）", "戳点", "躯干自锁"]
     assert not any(act.text().endswith("…") for act in menu.actions() if act.text())
-    # 分隔线代替层级：两条分隔线把"开窗口的三项"与"立即执行的两项"分开
-    assert sum(1 for act in menu.actions() if act.isSeparator()) == 1
+    # 分隔线代替层级：把"开窗口"、"起节点"、"直接改机构状态"三组分开
+    assert sum(1 for act in menu.actions() if act.isSeparator()) == 2
 
     # 菜单项不置灰（Qt 菜单的悬停提示不可靠，灰着没理由会被读成"坏了"）
     assert all(act.isEnabled() for act in menu.actions() if act.text())
     assert win.btn_posture is not None and win.btn_pokepoint is not None
+    assert win.btn_trunk_lock is not None
     assert not hasattr(win, "btn_module_enable")      # 独立页已删，入口不该还留着
     # 「停止相机标定」本期没动：仍在工具行、仍按需出现，空闲时不占位
     assert win.btn_cancel_calibration.isHidden()
@@ -3427,16 +3430,19 @@ def _inline_task_thread(monkeypatch):
         def wait(self, _msec=0):
             return True
 
-    # **每个 import 过 LocalTaskThread 的模块都要换**：主窗口面板（launch）与三个
-    # 硬件/配置页面（gripper / end_effector / posture / posture_modules）各有一份。
-    # 漏掉哪个，那个页面就会真起线程 —— 而且症状很隐蔽：动作确实会执行，只是**观测不到**
-    # （断言时按钮还没复位 / 还没收到回报），v6.2.0 把 posture 拆册时就又踩了一次。
+    # **每个 import 过 LocalTaskThread 的模块都要换**：主窗口面板（launch / status）与
+    # 硬件/配置页面（gripper / end_effector / posture / posture_modules / export_remote）
+    # 各有一份。漏掉哪个，那个页面就会真起线程 —— 而且症状很隐蔽：动作确实会执行，
+    # 只是**观测不到**（断言时按钮还没复位 / 还没收到回报），v6.2.0 把 posture 拆册时
+    # 就踩过一次；v6.4.15 把躯干自锁接到 status 面板时又踩了一次 —— 那一次更重：
+    # 真 QThread 在离屏用例里直接 **段错误**（exit=134）。
     monkeypatch.setattr(launch_panel, "LocalTaskThread", _InlineThread)
     from data_collector.ui import gripper as gripper_module
     from data_collector.ui import end_effector as end_effector_module
     from data_collector.ui import posture as posture_module
     from data_collector.ui import posture_modules as posture_modules_module
     from data_collector.ui.panels import export_remote as export_remote_module
+    from data_collector.ui.panels import status as status_module
     monkeypatch.setattr(gripper_module, "LocalTaskThread", _InlineThread)
     monkeypatch.setattr(end_effector_module, "LocalTaskThread", _InlineThread)
     monkeypatch.setattr(posture_module, "LocalTaskThread", _InlineThread)
@@ -3444,6 +3450,8 @@ def _inline_task_thread(monkeypatch):
     # v6.4.9 加入：服务器凭据探连（选「服务器」时的那个后台任务）。漏了它，
     # 相关用例会**真去连 SFTP** —— 离屏环境里表现为卡住或认证超时。
     monkeypatch.setattr(export_remote_module, "LocalTaskThread", _InlineThread)
+    # v6.4.15 加入：躯干自锁（工具行「机器人控制 ▾」那一项走的也是它，见 status.py）。
+    monkeypatch.setattr(status_module, "LocalTaskThread", _InlineThread)
 
 
 def test_stop_main_cleans_up_in_background_after_confirm(ui_env, monkeypatch):
@@ -5780,7 +5788,7 @@ def test_trunk_lock_sends_the_lock_then_flips_the_button(status_env, tmp_path, m
 
     row = dialog.module_rows["trunk"]
     assert calls == [True], "应当按 locked=True 下发"
-    assert dialog._trunk_lock_sent is True
+    assert win.trunk_lock_sent is True
     assert row.btn_lock.text() == "解除自锁"
     text = dialog.result.toPlainText()
     assert "无法回读" in text, "必须说明这个状态读不回来"
@@ -5811,7 +5819,7 @@ def test_trunk_unlock_goes_through_the_two_step_path(status_env, tmp_path, monke
     dialog.on_trunk_lock_action(False)
 
     assert calls == [True, False]
-    assert dialog._trunk_lock_sent is False
+    assert win.trunk_lock_sent is False
     assert dialog.module_rows["trunk"].btn_lock.text() == "自锁"
 
 
@@ -5829,7 +5837,7 @@ def test_trunk_lock_failure_keeps_the_record_untouched(status_env, tmp_path, mon
 
     dialog.on_trunk_lock_action(True)
 
-    assert dialog._trunk_lock_sent is None, "没发出去就不该记成「下发过」"
+    assert win.trunk_lock_sent is None, "没发出去就不该记成「下发过」"
     assert dialog.module_rows["trunk"].btn_lock.text() == "自锁"
     assert "未完成" in dialog.result.toPlainText()
 
@@ -5851,12 +5859,87 @@ def test_trunk_lock_blocks_trunk_motion_but_not_the_arms(status_env, tmp_path, m
 
     assert dialog._enable_reason("trunk") == "", "自锁前躯干是可动的"
 
-    dialog._trunk_lock_sent = True
+    win.trunk_lock_sent = True
     reason = dialog._enable_reason("trunk")
     assert "自锁" in reason and "解除自锁" in reason, f"拦截原因要指路，实际：{reason!r}"
 
     # 手臂那条路不受影响（`_enable_reason("left")` 走的是 arms）
     assert dialog._enable_reason("left") == "", "自锁只针对躯干，不该连带挡住手臂"
+
+
+def test_robot_menu_has_the_trunk_lock_item(status_env):
+    """工具行「机器人控制 ▾」里要有「躯干自锁」—— 现场要求"不进页面就能锁"。"""
+    win, _cm, _status = status_env
+
+    assert hasattr(win, "btn_trunk_lock"), "菜单里应当挂着自锁这一项"
+    assert win.btn_trunk_lock in win.btn_robot_menu.menu().actions()
+    assert win.btn_trunk_lock.text() == "躯干自锁"
+
+
+def test_robot_menu_lock_label_follows_the_record(status_env):
+    """菜单项文案跟着**记录**走。
+
+    这个菜单的既有约定是「一律可点、不置灰」（Qt 菜单项的悬停提示不可靠，灰着又没理由
+    会被读成"坏了"），所以"点下去会做什么"只能靠文案说清。
+    """
+    win, _cm, _status = status_env
+
+    for record, want in ((None, "躯干自锁"), (True, "解除自锁"), (False, "躯干自锁")):
+        win.trunk_lock_sent = record
+        win._sync_robot_menu()
+        assert win.btn_trunk_lock.text() == want, f"记录={record} 时文案应为「{want}」"
+
+
+def test_robot_menu_lock_infers_the_direction_from_the_record(status_env, monkeypatch):
+    """菜单里点一下的方向由记录推断：没下发过 → 自锁；已下发过自锁 → 解除。
+
+    菜单项只有一个，两个方向共用它 —— 所以"这一次点下去是哪个方向"必须有确定来源，
+    否则就成了"点两次才知道会怎样"。
+    """
+    win, _cm, _status = status_env
+    # **必须换掉同步替身**：`on_trunk_lock` 走 `status` 模块的 `LocalTaskThread`，
+    # 用真 QThread 时这里会连起两个线程、第一个被引用覆盖后回收 —— 那是段错误
+    # （实测 exit=134，崩点就在 `status.py` 的那一行）。平时由 `_open_posture` 顺手换，
+    # 这条用例不开页面，所以要自己来。
+    _inline_task_thread(monkeypatch)
+    monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    calls = []
+    monkeypatch.setattr(win.launcher, "set_trunk_locked",
+                        lambda locked: (calls.append(locked),
+                                        {"ok": True, "steps": [], "reason": ""})[1])
+
+    win.trunk_lock_sent = None
+    win.on_trunk_lock()
+    win.trunk_lock_sent = True
+    win.on_trunk_lock()
+
+    assert calls == [True, False], f"方向推断错了：{calls}"
+
+
+def test_the_menu_entry_and_the_posture_page_share_one_record(status_env, tmp_path, monkeypatch):
+    """两个入口读**同一个记录**：从菜单锁完，姿势页那一行也要跟着翻。
+
+    各记一份的实现就地暴露 —— 菜单锁了、页面还显示「自锁」，用户会以为没锁上，
+    再去点一次（那就成了"解除"），于是越点越乱。
+    """
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file, trunk=True, arms=True)
+    dialog = _open_posture(win, monkeypatch)
+    monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    monkeypatch.setattr(win.launcher, "set_trunk_locked",
+                        lambda locked: {"ok": True, "steps": [], "reason": ""})
+
+    row = dialog.module_rows["trunk"]
+    assert row.btn_lock.text() == "自锁"
+
+    win.on_trunk_lock()                    # 走菜单那条路（locked=None → 按记录推断）
+
+    assert win.trunk_lock_sent is True
+    assert dialog._trunk_locked() is True, "页面必须读同一个记录，不能自己再记一份"
+    assert row.btn_lock.text() == "解除自锁", "菜单锁完，页面那一行的文案也要跟着翻"
 
 
 def test_posture_single_arm_gets_disable_button(status_env, tmp_path, monkeypatch):

@@ -118,6 +118,12 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         self._end_effector_dialog = None            # 「末端参数」独立页面（单例）
         self.posture_action_in_flight = False  # 姿势动作进行中（姿势控制页面置位）
         self._posture_dialog = None                  # 「姿势控制」独立页面（单例）
+        # 躯干自锁的**记录**（None = 本次运行没下发过 / True = 已下发自锁 / False = 已下发解除）。
+        # 放在主窗口上是刻意的：它有两个入口（工具行「机器人控制 ▾」那一项、姿势控制页里
+        # 躯干那一行的按钮），两处必须读同一个值 —— 各记一份就会互相矛盾。
+        # 语义是「下发过什么」，不是「现在是不是自锁」：ROS 侧没有自锁状态话题。
+        self.trunk_lock_sent = None
+        self._trunk_lock_thread = None               # 自锁下发的后台线程（见 status.py）
 
         # 连接信号
         self.progress_signal.connect(self.update_progress_label)

@@ -16,9 +16,19 @@
 #    `app_config.yaml` 的 `point_labels` 播种生成）。带进去有两个坏处：一是会把开发机上
 #    试打的标签（曾实测混进一条 "asda"）发到现场；二是覆盖掉现场自己维护的标签。
 #    要改初始标签，改 `app_config.yaml` 的 `point_labels` 播种段。
+# 5. **不带 `configs/app_config.yaml`**（v6.4.15 加的，现场报障后补的）：
+#    它**不是程序的一部分，是"这台机器自己的配置"** —— 远端密码、移动硬盘挂载点、
+#    序列号、导出目标这些都是现场特有的值。带进去有两个坏处：
+#      ① **现场解包就把自己那份覆盖掉**。实测过整条链：包里那份的
+#         `remote_password` 是空的（开发机本来就没填），解包后现场密码被清空 →
+#         「远端目录打不开」（SFTP 认证失败）。而界面上只表现为
+#         "未配置远端 SFTP 密码"，几乎不可能联想到是包覆盖的。
+#      ② 工作区那份**一旦填了密码，就等于每次交付都在外发凭据**。
+#    程序首次启动会自己从 `configs/app_config.example.yaml` 生成一份（见 `app.py`），
+#    所以不带它不影响新环境部署。**要改默认值，改 example 那份。**
 #
-# 打包末尾会**自检**：包里只要还有 `logs/` 下的文件、或带上 `configs/point_labels.yaml`，
-# 就直接失败退出，不靠人记得检查。
+# 打包末尾会**自检**：包里只要还有 `logs/` 下的文件、或带上
+# `configs/point_labels.yaml` / `configs/app_config.yaml`，就直接失败退出，不靠人记得检查。
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -56,6 +66,7 @@ tar -C "$PROJECT_ROOT" \
     --exclude='*.pid' \
     --exclude='dist' \
     --exclude='configs/point_labels.yaml' \
+    --exclude='configs/app_config.yaml' \
     -cf - . | tar -C "$STAGE/Data_Collector" -xf -
 
 TARGET="$STAGE/Data_Collector"
@@ -92,7 +103,15 @@ if tar -tzf "$TARBALL" | grep -qE 'configs/point_labels\.yaml$'; then
     exit 1
 fi
 
+# 现场自己的配置（远端密码 / 挂载点 / 序列号）绝不能被包覆盖 —— 见文件头规矩 5。
+if tar -tzf "$TARBALL" | grep -qE 'configs/app_config\.yaml$'; then
+    echo "✗ 自检失败：包里带上了 configs/app_config.yaml" >&2
+    echo "  （那是现场自己的配置；覆盖后现场表现为「远端目录打不开」——密码被清空）" >&2
+    rm -f "$TARBALL"
+    exit 1
+fi
+
 ENTRIES="$(tar -tzf "$TARBALL" | wc -l | tr -d ' ')"
 SIZE="$(du -h "$TARBALL" | cut -f1)"
 echo "✓ 已打包：$TARBALL"
-echo "  条目 $ENTRIES，大小 $SIZE，logs 内容 0 项 + 未带运行时标签文件（自检通过）"
+echo "  条目 $ENTRIES，大小 $SIZE，logs 内容 0 项 + 未带运行时标签文件与现场配置（自检通过）"

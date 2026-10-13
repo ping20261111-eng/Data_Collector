@@ -5,10 +5,12 @@
 """
 from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout,
                              QPushButton, QCheckBox, QLabel, QProgressBar, QMenu,
-                             QFrame, QSizePolicy, QAction)
+                             QFrame, QSizePolicy, QAction, QMessageBox)
 from ... import theme
+from ...core_motion import TRUNK_LOCK_AXES_TEXT
 
 from ..common import (SP, make_panel_head)
+from ..threads import LocalTaskThread
 from .export_target import ExportTargetMixin
 
 
@@ -259,6 +261,23 @@ class ActionsMixin(ExportTargetMixin):
         self.btn_pokepoint.setToolTip("直接启动戳点节点（会起节点，不必先开标定）")
         self.btn_pokepoint.triggered.connect(self.on_pokepoint)
 
+        # 躯干自锁（v6.4.15，现场要求）：把 H1~H3 转成「仅上电」—— 还能读角度，
+        # 但**不接受运动指令**。现场要的是"不进页面、在菜单里点一下就锁"。
+        #
+        # 与姿势控制页里躯干那一行的「自锁」按钮**共用同一个方法**（`on_trunk_lock`）：
+        # 逻辑只有一处，两个入口只是两个触发点；**记录也只有一份**
+        # （`MainWindow.trunk_lock_sent`），不会出现"页面说已自锁、菜单说可以自锁"。
+        #
+        # 单独占一组（前面再加一条分隔线）：上面那两条是"起节点"，
+        # 这条是**直接改机构状态**（让电机退出使能）—— 混在一组里会被读成"也是起个节点"。
+        self.btn_trunk_lock = QAction("躯干自锁", self)
+        self.btn_trunk_lock.setToolTip(
+            f"把躯干 {TRUNK_LOCK_AXES_TEXT}（脚踝 / 膝 / 大腿）切成「仅上电」："
+            "之后仍然能读角度，但不接受运动指令。\n"
+            "再点一次即可解除（那一下会重新使能，躯干会抬头）。\n"
+            "提示：自锁等于「关节失去保持力矩」—— 若躯干当前不在支撑位，可能自行下沉")
+        self.btn_trunk_lock.triggered.connect(self.on_trunk_lock)
+
         robot_menu = QMenu(self)
         robot_menu.addAction(self.btn_gripper)
         robot_menu.addAction(self.btn_end_effector)
@@ -266,12 +285,18 @@ class ActionsMixin(ExportTargetMixin):
         robot_menu.addSeparator()          # 分隔线代替层级：上面是"开窗口"，下面是"立即执行"
         robot_menu.addAction(self.btn_start_calibration)
         robot_menu.addAction(self.btn_pokepoint)
+        robot_menu.addSeparator()          # 上面是"起节点"，这条是"直接改机构状态"
+        robot_menu.addAction(self.btn_trunk_lock)
+        # 菜单项名字随「本页下发过什么」变（自锁 / 解除自锁）。本菜单的约定是
+        # **一律可点、不置灰**（Qt 菜单项的悬停提示不可靠，灰着又没理由会被读成"坏了"），
+        # 所以"现在点下去会做什么"只能靠文案说清 —— 每次弹出前刷一次。
+        robot_menu.aboutToShow.connect(self._sync_robot_menu)
 
         self.btn_robot_menu = QPushButton("机器人控制 ▾")
         self.btn_robot_menu.setProperty("variant", "ghost")
         self.btn_robot_menu.setMenu(robot_menu)
         self.btn_robot_menu.setToolTip("机器控制类功能：夹爪控制 / 末端参数 / 姿势控制 / "
-                                       "开始标定 / 戳点"
+                                       "开始标定 / 戳点 / 躯干自锁"
                                        "（都直接操作机器人本体；上、下使能在「姿势控制」页里）")
 
         # 停止相机标定：只在标定节点运行期间出现 —— 空闲时既不该占位、也不该
