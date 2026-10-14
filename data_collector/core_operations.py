@@ -11,6 +11,7 @@ from collections import namedtuple
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
+from .errors import AppError, ErrorCode
 from .core import (
     logger, run_in_terminal, run_background, run_background_captured,
     run_background_with_log, run_with_env, terminate,
@@ -3045,6 +3046,39 @@ class Launcher:
             script, "遥操作", mode="background", need_setup=True,
             log_file=log_file, proc_name="run_teleop")
 
+    #: 录制脚本里那行落盘目录的**合法写法**：必须允许被环境变量覆盖。
+    #: 只认这一种形状 —— 其余（尤其 `BAG_DIR="$NERV_DIR/bag"` 这种硬编码赋值）
+    #: 会让上位机导出的 `BAG_DIR` 被无声吃掉，见 `_require_bag_dir_override`。
+    _BAG_DIR_OVERRIDABLE = (
+        re.compile(r'^\s*BAG_DIR="\$\{BAG_DIR:-[^"]*\}"\s*$', re.M),
+    )
+
+    def _require_bag_dir_override(self, script: Path) -> None:
+        """确认录制脚本认 `BAG_DIR` 环境变量；不认就**拒绝起录**。
+
+        为什么宁可拒绝也不继续：不认的后果是数据写到**另一个**目录，而界面、录制
+        清单、打点、可用空间预检全都按"写在盘上"理解 —— 一次采集几百 GB 落到
+        `/var/nerv/bag`，现场按界面提示拔盘交付时才发现盘是空的。
+        **静默写错位置比当场报错严重得多**，所以这里选报错。
+
+        （机器侧那 3 个录制脚本已经改成可覆盖式；但那些文件**不在版本控制里**，
+        一次重刷就可能退回去，所以每次真正改落盘位置时都现查一遍。）
+        """
+        try:
+            text = script.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            logger.warning(f"读取录制脚本失败，跳过 BAG_DIR 覆盖检查：{exc}")
+            return                  # 读不到不在这里拦，交给产出巡检兜底
+        if any(pat.search(text) for pat in self._BAG_DIR_OVERRIDABLE):
+            return
+        raise AppError(
+            ErrorCode.SCRIPT_FAILED,
+            f"录制脚本不认 BAG_DIR 覆盖：{script}\n"
+            f"这一份把落盘目录写死了，改成别的位置会被忽略（数据仍落在脚本内置的目录）。\n"
+            f"改法：把脚本里那一行换成 BAG_DIR=\"${{BAG_DIR:-$NERV_DIR/bag}}\" 后再试。"
+            f"本次未起录。",
+        )
+
     def launch_record(self, script_type: str, name: str = "", desc: str = "",
                       label: str = "", action_id: Optional[int] = None) -> subprocess.Popen:
         """启动录制。
@@ -3069,11 +3103,24 @@ class Launcher:
         if desc_parts:
             args.append(shlex.quote(f"desc={' '.join(desc_parts)}"))
 
-        # 录制在 bag_dir 下执行（脚本按相对路径落 bag），故 cwd 与 workspace 不同
+        # 录制在 bag_dir 下执行（脚本按相对路径落 bag），故 cwd 与 workspace 不同。
+        # `bag_dir` 取的是**有效**落盘目录：本次会话选了移动硬盘时它就是盘上那个目录
+        # （`ConfigManager.get_bag_dir` 的会话级覆盖），录制脚本的 `BAG_DIR` 走同一个值。
         bag_dir = self.config.get_bag_dir()
+        # 本次真的把落盘位置**改**了才查这一条（正常路径上不产生任何额外开销）：
+        # 机器侧的录制脚本必须认 `BAG_DIR` 环境变量（`BAG_DIR="${BAG_DIR:-…}"`）。
+        # 若它写回硬编码赋值，环境变量会被**无声吃掉** —— 数据落回 /var/nerv/bag，
+        # 而界面以为写到了盘上；等到现场拔盘去读，盘上什么也没有。
+        # 机器侧那些脚本**不在版本控制里**（工作空间不是 git 仓库），一次重刷就可能
+        # 把它退回去，所以在起录这一点上现查一次，比在文档里写一句"请勿回退"可靠。
+        if bag_dir != self.config.get_configured_bag_dir():
+            self._require_bag_dir_override(script)
+        # 建目录这一步**不吞失败**（原先写成 `|| true`）：目录建不出来时 `cd` 也进不去，
+        # 吞掉只会把"盘没插好/不可写"退化成后面一句看不懂的"脚本启动后立即退出"。
+        # 真正的用户可读原因由界面层的起录前预检给出（见 `_apply_record_target`）。
         return self._run_script(
             script, f"录制({script_type})", args, mode="background", cwd=bag_dir,
-            prelude=f"mkdir -p {shlex.quote(str(bag_dir))} 2>/dev/null || true && ",
+            prelude=f"mkdir -p {shlex.quote(str(bag_dir))} && ",
             proc_name=f"record_{script_type}")
 
     def launch_play_bag(self, bag_path: str = "", with_rviz: bool = False) -> subprocess.Popen:

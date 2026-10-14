@@ -947,6 +947,13 @@ class ConfigManager:
     def __init__(self, config_path: Path):
         self.config_path = config_path
         self.app_config = load_yaml(config_path)
+        #: 本次运行选的**录制落盘位置**（键：`disk_export` 里的 `local` / `disk`）。
+        #: `None` = 还没选过 → 界面按"有没有可用数据盘"自动定默认值。
+        #: **只放内存、不写回 app_config** —— 理由见 `get_bag_dir` 的说明。
+        self._record_target_key: Optional[str] = None
+        #: 会话级的落盘目录覆盖：`None` = 用配置里的 `bag_dir`。
+        #: 选「移动硬盘」时是盘上那个目录；选「本机数据盘」时清回 `None`。
+        self._record_dir_override: Optional[Path] = None
         self.workspace = Path(self.app_config["workspace_root"]).expanduser()
         self.teleop_config_path = self.workspace / self.app_config["teleop_config_path"]
         # 末端参数（arm_control_config.yaml）：与标定配置一样**按工作空间存放**。
@@ -1461,8 +1468,14 @@ class ConfigManager:
         return parse_version_details(text)
 
     # ---------- 路径 / 远程主机配置（带默认值，兼容旧配置文件） ----------
-    def get_bag_dir(self) -> Path:
-        """数据目录：优先 bag_dir；否则相对 nerv_dir（默认 /var/nerv）。"""
+    def get_configured_bag_dir(self) -> Path:
+        """**配置里**的数据目录：优先 `bag_dir`；否则相对 `nerv_dir`（默认 /var/nerv）。
+
+        刻意与 `get_bag_dir()` 分开：本方法是"这台机器平时把数据放哪"（配置事实），
+        后者是"**这一次**录到哪"（可能被本次会话的选择覆盖）。
+        「保存位置」选项里「本机数据盘」显示的必须是**本**方法的值 ——
+        否则选过一次移动硬盘之后，那个选项会跟着漂成盘上的路径。
+        """
         raw = self.app_config.get("bag_dir")
         if raw:
             return Path(str(raw)).expanduser()
@@ -1470,6 +1483,44 @@ class ConfigManager:
         if nerv_dir:
             return Path(str(nerv_dir)).expanduser() / "bag"
         return DEFAULT_BAG_DIR
+
+    def get_bag_dir(self) -> Path:
+        """**有效**的数据/落盘目录 = 本次会话的选择 > `bag_dir` 配置 > 默认。
+
+        录制脚本的 `BAG_DIR`（`get_script_env`）、打点目录、数据列表、回放列表、
+        可用空间预检、清单（manifest）**全部**走它 —— 单一出口，接入处不会漏。
+
+        ## 为什么是"会话级覆盖"而不是写回 `app_config.yaml`
+
+        `bag_dir` 描述的是"这台机器的数据目录"；而"这一次录到移动硬盘上"是**一次
+        会话的决定**。写回配置有个真陷阱：**盘拔了配置还指着它** → 下一次起录直接
+        失败，而且失败点在最不该出问题的地方（连界面都还没起来就该能录了）。
+        放在内存里则天然自愈：程序重开就回到配置值，界面再按"有没有可用数据盘"给默认。
+        """
+        if self._record_dir_override is not None:
+            return self._record_dir_override
+        return self.get_configured_bag_dir()
+
+    def set_record_target(self, key: str, path: Optional[Path] = None) -> None:
+        """记住本次会话选的落盘位置（`key` 见 `disk_export.LOCAL_TARGET/DISK_TARGET`）。
+
+        选「本机数据盘」时把覆盖清回 `None` —— 于是它**不会被上一次的选择黏住**，
+        取值回到配置里的 `bag_dir`。
+        """
+        self._record_target_key = str(key)
+        if key == "disk" and path is not None:
+            self._record_dir_override = Path(path)
+        else:
+            self._record_dir_override = None
+
+    def record_target_key(self) -> Optional[str]:
+        """本次会话选过的落盘位置键；`None` = 没选过（界面按检测给默认）。"""
+        return self._record_target_key
+
+    def clear_record_target(self) -> None:
+        """放弃本次会话的选择，回到"按检测给默认"。"""
+        self._record_target_key = None
+        self._record_dir_override = None
 
     def get_log_dir(self) -> Path:
         """日志目录：优先 log_dir；否则相对 nerv_dir（默认 /var/nerv）。"""

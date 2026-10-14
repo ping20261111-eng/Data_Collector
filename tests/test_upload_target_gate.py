@@ -247,6 +247,16 @@ def _fake_disk(monkeypatch, recorded, redirect_to):
             self.require_volume_id = False
             self.warn_file_bytes = 0
 
+        def is_mounted(self):
+            """落盘位置功能（v6.4.17）先问挂载点、再判"源是不是已经在盘上"。
+
+            这些用例的 bag 都在挂载点**之外**，所以给 True 也不会触发"同盘跳过"
+            （挂载点判定本身在 `test_disk_export.py` 里单测）。
+            **替身要跟生产代码收敛**：`_export_to_disk` 现在会问它，缺了就是
+            AttributeError，不是"少测一点"。
+            """
+            return True
+
         def prepare(self, subpath, total_bytes=0):
             recorded.append(subpath)
             return self.mount_point / subpath
@@ -346,6 +356,16 @@ def test_both_keeps_the_remote_subpath_for_the_server_half(tmp_path, monkeypatch
             self.mount_point = Path(tmp_path / "fake-mount")
             self.require_volume_id = False
             self.warn_file_bytes = 0
+
+        def is_mounted(self):
+            """落盘位置功能（v6.4.17）先问挂载点、再判"源是不是已经在盘上"。
+
+            这些用例的 bag 都在挂载点**之外**，所以给 True 也不会触发"同盘跳过"
+            （挂载点判定本身在 `test_disk_export.py` 里单测）。
+            **替身要跟生产代码收敛**：`_export_to_disk` 现在会问它，缺了就是
+            AttributeError，不是"少测一点"。
+            """
+            return True
 
         def prepare(self, subpath, total_bytes=0):
             disk_spans.append(subpath)

@@ -23,6 +23,8 @@
 """
 import os
 import shutil
+from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -288,3 +290,178 @@ def _quiet_unlink(path: Path) -> None:
 
 def _mb(value: float) -> str:
     return f"{value / 1024 / 1024:.0f}MB"
+
+
+# ---------- 录制落盘目标（本机数据盘 / 移动硬盘） ----------
+#
+# 「这一次录到哪里」是**一次会话的决定**，不是机器配置 —— 所以这里只负责把两种落点
+# **算出来**（含可用性与不可用原因），由「录制设置」界面选、由
+# `ConfigManager.set_record_target()` 记住（**不写回 app_config**：
+# 把它写死会有个真陷阱 —— 盘拔了配置还指着它，起录直接失败）。
+#
+# 判定口径**与导出到硬盘完全共用**同一个 `DiskExportTarget`（挂载点 + 盘标识）——
+# 否则会出现"能导出却录不进去"这种自相矛盾。
+
+#: 两个候选落点的键。界面、`ConfigManager` 与录制脚本的 `BAG_DIR` 都按它分派。
+LOCAL_TARGET = "local"
+DISK_TARGET = "disk"
+
+#: 读不到序列号时的占位目录名。**刻意不静默扁平**：扁平（直接写挂载点根）会让
+#: "两台机器的数据混在一根目录"这件事在盘上完全看不出来 —— 而这个盘本来就是
+#: 多台机器轮着插的。一个显眼的 `unknown-serial` 让它在盘上一眼可见。
+UNKNOWN_SERIAL_DIR = "unknown-serial"
+
+
+def safe_dir_name(raw: str) -> str:
+    """把序列号变成一个安全的单层目录名（挡住分隔符与相对路径）。
+
+    序列号要被拼进文件系统路径，读到 `../../etc` 这种值时**拼路径这一步就该失败**，
+    而不是把数据写到挂载点外面去。
+    """
+    cleaned = "".join(ch for ch in str(raw) if ch.isalnum() or ch in "-_")
+    return cleaned.strip("-_")
+
+
+def read_serial(config) -> str:
+    """本机序列号（`Product.json` 的 `serial_number`）；读不到用占位名。
+
+    读的是顶栏「序列号」那同一个字段（`ConfigManager.get_product_info`）——
+    顶栏显示什么，落点目录名就是什么，不出现"界面一个样、目录另一个样"。
+    """
+    if config is None:
+        return UNKNOWN_SERIAL_DIR
+    try:
+        raw = str(config.get_product_info().get("serial_number") or "").strip()
+    except Exception as exc:               # noqa: BLE001 —— 配置层异常不该让录制整体失败
+        logger.warning(f"读取序列号失败，用占位目录名：{exc}")
+        return UNKNOWN_SERIAL_DIR
+    return safe_dir_name(raw) or UNKNOWN_SERIAL_DIR
+
+
+def capture_date(folder: Optional[Path] = None) -> str:
+    """采集日期（`YYYY-MM-DD`）；`folder=None` 表示"还没发生的这一次"，取今天。
+
+    ## 已有目录为什么用 mtime 而不是"今天"
+
+    现场有一件很平常的事：**今天导出昨天甚至上周录的数据**。按导出日期分层，
+    那批数据会被归进今天 —— 而盘上那天可能有当天的正常采集，两批不同的数据混进
+    同一个目录，现场谁也分不出来。mtime 是"这份数据什么时候产生的"，用它分层，
+    "盘上按日期分目录"才真的等于"按采集日期分目录"；补录/重传同一批也自然落到同一天。
+
+    ## "还没发生的这一次"为什么必须用今天
+
+    `bag_dir` 是上次采集建的，它的 mtime 是**上一次**的时间；拿它顶替会让预览显示成
+    上次的日期，而本次采集显然在今天。
+    """
+    if folder is None:
+        stamp = datetime.now()
+    else:
+        try:
+            stamp = datetime.fromtimestamp(Path(folder).stat().st_mtime)
+        except OSError as exc:
+            logger.warning(f"读取目录时间失败，按当天分层：{exc}")
+            stamp = datetime.now()
+    return stamp.strftime("%Y-%m-%d")
+
+
+def disk_subpath(serial: str, folder: Optional[Path] = None) -> str:
+    """盘上相对挂载点的分层：`<序列号>/<YYYY-MM-DD>`。
+
+    与「导出到移动硬盘」的落点**逐层一致** —— 于是"录制直接写盘"与"录完再导出"
+    两种来路，交出去的盘长得一模一样；现场不必按来路记两套目录习惯。
+    """
+    return f"{serial}/{capture_date(folder)}"
+
+
+@dataclass(frozen=True)
+class RecordTarget:
+    """一个候选落盘位置。
+
+    `path` 就是**选它时会被当成 `BAG_DIR` 传给录制脚本的那个目录**；
+    `available=False` 时 `reason` 说明为什么不能用（界面据此置灰并给出原因）。
+    """
+
+    key: str
+    label: str
+    path: Path
+    available: bool
+    reason: str = ""
+
+    def describe(self) -> str:
+        if self.available:
+            return f"{self.label}（{self.path}）"
+        return f"{self.label}（不可用：{self.reason}）"
+
+
+def _disk_target_object(config) -> DiskExportTarget:
+    """按配置造一个 `DiskExportTarget`（与 `DataUploader._disk_export_target` 同源）。"""
+    settings = config.get_export_settings() if config is not None else {}
+    return DiskExportTarget(
+        mount_point=settings.get("mount_point", ""),
+        volume_id_file=settings.get("volume_id_file", ".nerv_volume"),
+        require_volume_id=bool(settings.get("require_volume_id")),
+        min_free_margin_mb=int(settings.get("min_free_margin_mb", 2048)),
+        warn_file_bytes=int(settings.get("warn_file_bytes", 3_800_000_000)),
+    )
+
+
+def local_record_target(config) -> RecordTarget:
+    """本机数据盘：配置里的 `bag_dir`（**不含会话覆盖** —— 否则选项会跟着上次的选择漂）。"""
+    if config is None:
+        path = Path("/var/nerv/bag")
+    else:
+        path = Path(config.get_configured_bag_dir())
+    return RecordTarget(LOCAL_TARGET, "本机数据盘", path, True, "")
+
+
+def disk_record_target(config, folder: Optional[Path] = None) -> RecordTarget:
+    """移动硬盘：`<挂载点>/<序列号>/<采集日期>`。
+
+    三级判定，逐级给出**可照做**的原因：挂载点没配 / 没插（不存在或不是挂载点）/
+    插了但不是数据盘（缺标识文件）。
+    """
+    disk = _disk_target_object(config)
+    mount = disk.mount_point
+    if not mount or str(mount) in ("", "."):
+        return RecordTarget(
+            DISK_TARGET, "移动硬盘", mount, False,
+            "未配置移动硬盘挂载点（app_config.yaml 的 disk_export.mount_point）")
+    path = Path(mount) / disk_subpath(read_serial(config), folder)
+    if not Path(mount).exists():
+        return RecordTarget(DISK_TARGET, "移动硬盘", path, False,
+                            f"未检测到移动硬盘（{mount} 不存在）")
+    if not disk.is_mounted():
+        return RecordTarget(DISK_TARGET, "移动硬盘", path, False,
+                            f"未检测到移动硬盘（{mount} 不是已挂载的设备目录）")
+    if disk.require_volume_id and not disk.has_volume_marker():
+        # 原因里**不带完整路径**：这一句要放进「录制设置」的提示行，太长会多占一行
+        # （实测第 3 行会被下一行的标签压住）。挂载点本身在导出面板里看得见；
+        # 需要完整路径的场合是起录失败的那个错误框，那里再补。
+        marker = Path(disk.volume_id_file).name if disk.volume_id_file else ""
+        return RecordTarget(
+            DISK_TARGET, "移动硬盘", path, False,
+            f"该盘不是数据盘（缺标识文件 {marker}；挂载点 {mount}）")
+    return RecordTarget(DISK_TARGET, "移动硬盘", path, True, "")
+
+
+def record_targets(config, folder: Optional[Path] = None) -> List[RecordTarget]:
+    """两个候选落点，顺序固定：**本机在前、硬盘在后**（界面按此顺序列出）。"""
+    return [local_record_target(config), disk_record_target(config, folder)]
+
+
+def target_by_key(config, key: str, folder: Optional[Path] = None) -> Optional[RecordTarget]:
+    """按键取候选；键不认识返回 None（界面据此回退到默认）。"""
+    for target in record_targets(config, folder):
+        if target.key == key:
+            return target
+    return None
+
+
+def default_record_target_key(config, folder: Optional[Path] = None) -> str:
+    """默认选中哪个：**插了可用的数据盘就用它，否则本机**。
+
+    这是"后续采集可能直接存到移动硬盘"这条需求的自动半边 —— 现场把盘插上就不用
+    再点一下；拔了也自动回到本机（**不会因为配置指着盘而起录失败**，因为选择根本
+    不写回配置）。
+    """
+    return DISK_TARGET if disk_record_target(config, folder).available else LOCAL_TARGET

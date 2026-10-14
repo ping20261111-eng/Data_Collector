@@ -220,6 +220,12 @@ class RecordDialog(QDialog):
 
     NAME_ROLE = Qt.UserRole + 1
 
+    #: 最小宽度。**「保存位置」下面那行提示必须能换行显示完整落点** ——
+    #: 实测按内容自适应时只有 269px 宽，那句"本次将写入：<长路径>/"会被裁掉，
+    #: 还会和下一行的「名称（name）」标签叠在一起（自截图里一眼能看到）。
+    #: 与本文件另一个对话框的 MIN_WIDTH 同性质。
+    MIN_WIDTH = 520
+
     def __init__(self, parent=None, config=None, action_labels=None):
         super().__init__(parent)
         self.setWindowTitle("录制设置")
@@ -237,6 +243,28 @@ class RecordDialog(QDialog):
         # bag/vla/cmd 对应配置项 record_<type>_script（scripts/record_bag.sh 等）
         self.type_combo.addItems(["bag", "vla", "cmd"])
         layout.addWidget(self.type_combo)
+
+        # ---- 保存位置（v6.4.17）----
+        #
+        # 为什么放在这个对话框里：它和「录制类型 / 名称 / 采集任务」是同一类问题 ——
+        # "**这一次**怎么录"。默认值按"有没有插数据盘"自动定，插上就不用再点
+        # （现场的主要场景就是"后续采集可能直接存到移动硬盘"）。
+        #
+        # 两个候选**始终都列出来**（不可用的置灰 + 写明原因）：隐藏会让人以为
+        # 程序不支持；而置灰不说明原因，现场只会反复点它。
+        layout.addWidget(field_label("保存位置"))
+        self.target_combo = QComboBox()
+        self.target_combo.setToolTip(
+            "这次录制把数据写到哪里。插了数据盘默认就是盘（可直接交出去，"
+            "不必再导一遍）；拔了自动回到本机数据盘 —— 选择不写进配置文件，"
+            "所以不会出现「盘拔了、程序还指着盘」而起录失败")
+        layout.addWidget(self.target_combo)
+        self.target_hint = QLabel()
+        self.target_hint.setObjectName("Hint")
+        self.target_hint.setWordWrap(True)
+        layout.addWidget(self.target_hint)
+        self._reload_targets()
+        self.target_combo.currentIndexChanged.connect(self._sync_target_hint)
 
         layout.addWidget(field_label("名称（name）"))
         self.name_edit = QLineEdit()
@@ -280,6 +308,92 @@ class RecordDialog(QDialog):
         hbox.addWidget(cancel)
         hbox.addWidget(ok)
         layout.addLayout(hbox)
+        self.setMinimumWidth(self.MIN_WIDTH)
+
+    # ---------- 保存位置（本机数据盘 / 移动硬盘） ----------
+
+    def _reload_targets(self):
+        """重建「保存位置」下拉。
+
+        默认值优先级：**本次运行选过的** > 按"有没有可用数据盘"自动定。
+        选过的那个若已经不可用（盘拔了），自动回落到默认 —— 不能把一个已不可用的
+        选项留在选中态，否则要到点「开始录制」时才发现写不进去。
+        """
+        from ..disk_export import (default_record_target_key, record_targets,
+                                   target_by_key)
+
+        self._targets = record_targets(self.config)
+        remembered = self.config.record_target_key() if self.config is not None else None
+        chosen = target_by_key(self.config, remembered) if remembered else None
+        chosen_key = (chosen.key if chosen is not None and chosen.available
+                      else default_record_target_key(self.config))
+
+        self.target_combo.blockSignals(True)
+        self.target_combo.clear()
+        for target in self._targets:
+            # 下拉里只放**短标签**：路径与不可用原因都放下面那行提示。
+            # （实测：把路径拼进选项文字时，QComboBox 会按最长项撑开 ——
+            #   本对话框在"插盘/拔盘"两态之间宽度从 560 跳到 816，很难看。
+            #   而且两块盘路径长短不同时，同一个界面宽度还会再变。）
+            suffix = "（已插入）" if (target.key == "disk" and target.available) else ""
+            if target.key == "disk" and not target.available:
+                suffix = "（不可用）"
+            self.target_combo.addItem(f"{target.label}{suffix}", target.key)
+            item = self.target_combo.model().item(self.target_combo.count() - 1)
+            if item is not None:
+                # 不可用项**列出来但不可选**：原因写在下面那行提示里，不必去猜
+                item.setEnabled(target.available)
+        index = self.target_combo.findData(chosen_key)
+        self.target_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.target_combo.blockSignals(False)
+        self._sync_target_hint()
+
+    def current_target(self):
+        """当前选中的落盘目标（`disk_export.RecordTarget`）；没有候选时返回 None。"""
+        key = self.target_combo.currentData()
+        for target in getattr(self, "_targets", []):
+            if target.key == key:
+                return target
+        return None
+
+    def _sync_target_hint(self, *_args):
+        """把"这次会写到哪"说全 —— 目录是拼出来的，别让现场去猜。
+
+        不可用的那一项，**原因也写在这里**（下拉里只放短标签，见 `_reload_targets`）。
+        """
+        if getattr(self, "target_hint", None) is None:
+            return
+        target = self.current_target()
+        if target is None:
+            self.target_hint.setText("")
+            return
+        lines = [f"本次将写入：{target.path}/ —— "
+                 + ("直接写在移动硬盘上，录完可直接拔盘交付" if target.key == "disk"
+                    else "本机数据盘")]
+        blocked = [t for t in getattr(self, "_targets", [])
+                   if t.key != target.key and not t.available]
+        for other in blocked:
+            lines.append(f"{other.label}不可用：{other.reason}")
+        self.target_hint.setText("\n".join(lines))
+        self._fit_target_hint()
+
+    def _fit_target_hint(self) -> None:
+        """按当前宽度重算提示行的高度。
+
+        **必须自己算**：`QLabel` 开了 `setWordWrap(True)` 之后 `sizeHint()` 的高度
+        只按**一行**给，而布局照这个高度排 —— 多出来的第 2、3 行会被裁掉、压在下一行
+        的标签上（实测：「移动硬盘不可用：…」那行的末尾就被「名称（name）」盖住了；
+        代码里没有任何东西会报错，只有截图能看出来）。
+        """
+        label = self.target_hint
+        margins = self.layout().contentsMargins()
+        width = max(200, self.width() - margins.left() - margins.right())
+        rect = label.fontMetrics().boundingRect(0, 0, width, 0, Qt.TextWordWrap, label.text())
+        label.setMinimumHeight(rect.height())
+
+    def resizeEvent(self, event):        # noqa: N802 (Qt 命名)
+        super().resizeEvent(event)
+        self._fit_target_hint()          # 宽度变了，换行数也变
 
     def label_items(self):
         """当前可选任务：[{name, action_id}]。"""
@@ -310,7 +424,12 @@ class RecordDialog(QDialog):
         self.reload_labels()
 
     def get_settings(self):
-        """返回录制参数。label 是纯任务名，action_id 是可选的编号（一般为 None）。"""
+        """返回录制参数。label 是纯任务名，action_id 是可选的编号（一般为 None）。
+
+        额外带出「保存位置」：`record_target` 是键（`local` / `disk`），
+        `record_dir` 是**要落到的目录**（`local` 时为 None —— 表示用配置里的
+        `bag_dir`，而不是"某个具体路径"，这样"选本机"不会被上一次的选择黏住）。
+        """
         text = self.label_combo.currentText().strip()
         index = self.label_combo.currentIndex()
         action_id = self.label_combo.currentData()
@@ -319,12 +438,16 @@ class RecordDialog(QDialog):
         else:
             name = text          # 用户手输的自由文本，没有对应编号
             action_id = None
+        target = self.current_target()
         return {
             "type": self.type_combo.currentText(),
             "name": self.name_edit.text().strip(),
             "desc": self.desc_edit.text().strip(),
             "label": name,
             "action_id": action_id,
+            "record_target": target.key if target is not None else "local",
+            "record_dir": (target.path if target is not None and target.key == "disk"
+                           else None),
         }
 
 

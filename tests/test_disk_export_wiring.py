@@ -512,6 +512,17 @@ def test_both_mode_keeps_the_remote_subpath_for_the_server_half(tmp_path, monkey
             disk_spans.append(subpath)
             return self.mount_point / subpath
 
+        def is_mounted(self):
+            """落盘位置功能（v6.4.17）会先问这个、再判"源是不是已经在盘上"。
+
+            这些用例的 bag 都在挂载点**之外**，所以给 True 也不会触发"同盘跳过"
+            （挂载点判定本身在 `test_disk_export.py` 里单测）。
+            **替身要跟生产代码收敛**：生产里 `_export_to_disk` 现在会问它，
+            缺了就是 AttributeError —— 而不是"少测一点"。
+            """
+            return True
+
+
         def warn_oversize(self, entries):
             return []
 

@@ -357,6 +357,9 @@ class ExportTargetMixin(RemoteCredentialMixin):
     def _show_export_panel(self) -> None:
         """真正把面板显示出来（由 `_toggle_export_panel` 延后一轮调用）。"""
         panel = self.export_panel
+        # 打开时刷一次落点预览：录制之后「保存位置」可能已经切到盘上（v6.4.17），
+        # 那一行要说的话随之变了 —— 不刷会显示上一轮的信息。
+        self._refresh_landing_preview()
         panel.show()
         panel.raise_()
 
@@ -773,7 +776,26 @@ class ExportTargetMixin(RemoteCredentialMixin):
             f'<span style="color:{colors["muted2"]}">/</span>'
             f'<span style="color:{colors["accent"]}">{html_escape(date)}</span>'
             f'<span style="color:{colors["muted2"]}">/&lt;本次采集目录&gt;/</span>')
+        # 本次录制若**已经直接写在盘上**（v6.4.17 的「保存位置」选了移动硬盘），
+        # 就把这件事说出来 —— 否则现场会以为"还得再导一遍"，白等一次全量拷贝。
+        # 逻辑层也会跳过同盘拷贝，但那是兜底、不作解释；界面先说清才不会让人
+        # 对着一个没动静的进度条猜。
+        if self._records_directly_to_disk(mount):
+            self.lb_landing_preview.setText(
+                self.lb_landing_preview.text()
+                + f'<br><span style="color:{colors["warn"]}">'
+                  f'本次录制的数据已直接写在盘上 —— 无需再导出，直接拔盘即可</span>')
         self.lb_landing_preview.setVisible(True)
+
+    def _records_directly_to_disk(self, mount: str) -> bool:
+        """本次录制的落盘目录是否就在这块盘上（判据封装在 `disk_export` 里）。"""
+        try:
+            from ...core import is_within
+            # 问的是"本次录制的落盘目录在不在这块盘上"（不是"目标会不会在源里面"）
+            return is_within(self.config.get_bag_dir(), mount)
+        except Exception as exc:            # noqa: BLE001 —— 预览失败不该弹错
+            logger.warning(f"判断录制落点是否已在盘上失败：{exc}")
+            return False
 
     def _start_disk_probe_timer(self) -> None:
         """低频探测：让芯片上的状态**跟着盘的实际状态变**。

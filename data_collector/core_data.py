@@ -14,7 +14,8 @@ from typing import Optional, List, Callable, Tuple
 import paramiko
 
 from .core import (logger, DEFAULT_BAG_DIR, DEFAULT_LOG_DIR, DEFAULT_REMOTE_HOST,
-                   DEFAULT_REMOTE_PORT, DEFAULT_REMOTE_USER, DEFAULT_REMOTE_BASE)
+                   DEFAULT_REMOTE_PORT, DEFAULT_REMOTE_USER, DEFAULT_REMOTE_BASE,
+                   is_within)
 from .errors import AppError, ErrorCode, describe, is_retryable
 from .manifest import (
     MANIFEST_NAME,
@@ -29,6 +30,10 @@ from .verify import sha256_file, sha256_sftp, write_sha256_sidecar
 #: 顶��导入会把「导入 core_data」与「读配置」两件事绑死 ——
 #: 单元测试里只想用 `_pack_folder` 时也会被迫构造一份配置。
 #: 真正的使用点在 `DataUploader._export_to_disk`，那里才需要配置。
+#: v6.4.17 起，「序列号 / 采集日期 / 盘上分层」这套口径也统一放在那里
+#: （录制直接写盘与录完导出必须给出**同一套**落点），所以 `DataUploader` 的
+#: 三个小助手改为委托调用。仍然是延迟导入 —— 与上面同一个理由。
+import data_collector.disk_export as disk_export
 
 
 def _current_operator() -> str:
@@ -229,6 +234,19 @@ class RecorderManager:
         # 本次录制对应的 bag 目录（写manifest 用）；启动瞬间可能还找不到，
         # 收尾时会再兜一次
         self._manifest_dir: Optional[Path] = None
+        #: **本次会话**起录时用的落盘根目录（快照）。健康巡检 / 清单 / 可用空间
+        #: 都读它而不是实时读配置 —— 免得"起录之后落盘位置被改"导致巡检去看
+        #: 另一个目录，把正常录制误报成「没有新文件落盘」。开新一次录制时覆盖。
+        self._session_bag_dir: Optional[Path] = None
+
+    def session_bag_dir(self) -> Path:
+        """本次会话的落盘根目录：起录时快照优先，否则实时取当前值。
+
+        实时兜底是给"没走过 start（例如只做预检）"的调用方用的。
+        """
+        if self._session_bag_dir is not None:
+            return self._session_bag_dir
+        return Path(self.config.get_bag_dir()) if self.config is not None else DEFAULT_BAG_DIR
 
     def start(self, script_type: str, name: str = "", desc: str = "",
               label: str = "", action_id=None, settle_seconds: float = 0.5) -> bool:
@@ -250,6 +268,11 @@ class RecorderManager:
         # manifest 也会写到上一个 bag 目录里 —— 现场表现就是"第二次录不停"
         # （stop 时按旧 manifest 收尾，界面状态与实际进程对不上）。
         self._reap_dead_proc("启动新录制前")
+        # 快照本次的落盘目录。放在 launch **之前**：录制脚本的 `BAG_DIR` 环境变量
+        # 是在 launch 里组装的，而随后所有"该看哪个目录"的判断（产出巡检、清单、
+        # 可用空间）都以这个快照为准。开新一次录制时自动覆盖。
+        self._session_bag_dir = (
+            Path(self.config.get_bag_dir()) if self.config is not None else None)
         try:
             self.current_proc = self.launcher.launch_record(
                 script_type, name, desc, label, action_id
@@ -341,7 +364,7 @@ class RecorderManager:
 
     def _latest_bag_dir(self) -> Optional[Path]:
         try:
-            bag_root = Path(self.config.get_bag_dir())
+            bag_root = self.session_bag_dir()
         except Exception as exc:
             logger.warning(f"读取 bag 目录失败：{exc}")
             return None
@@ -371,7 +394,7 @@ class RecorderManager:
             if not manifest.exists():
                 self._begin_manifest("", "", "")
                 manifest = BagManifest(bag_dir)
-            produced = self._files_since(Path(self.config.get_bag_dir()),
+            produced = self._files_since(self.session_bag_dir(),
                                          (self._started_at or time.time()) - 1.0)[0]
             if produced <= 0:
                 manifest.mark_interrupted("录制已停止，但未检测到新数据落盘")
@@ -419,7 +442,7 @@ class RecorderManager:
     def disk_free(self) -> Optional[int]:
         """bag 目录所在分区的可用字节数；读不到返回 None（不猜、不当成 0）。"""
         try:
-            bag_dir = Path(self.config.get_bag_dir())
+            bag_dir = self.session_bag_dir()
             # 分区可能还没建出来（第一次录制前），那就近找一层存在的祖先
             probe = bag_dir
             while not probe.exists() and probe != probe.parent:
@@ -502,7 +525,7 @@ class RecorderManager:
         if self._started_at is None or self.config is None:
             return {"alive": True, "producing": True, "message": ""}
 
-        bag_dir = Path(self.config.get_bag_dir())
+        bag_dir = self.session_bag_dir()
         # 文件系统的 mtime 精度可能低于 time.time()（tmpfs / 网络盘尤其明显），
         # 留 1 秒容差，避免录制刚开始那一瞬间被误判成"没有产出"而误报。
         count, newest = self._files_since(bag_dir, self._started_at - 1.0)
@@ -526,7 +549,11 @@ class DataUploader:
         settings = config.get_remote_settings() if config is not None else {}
         upload = config.get_upload_settings() if config is not None else {}
         self.config = config
-        self.bag_dir = config.get_bag_dir() if config is not None else DEFAULT_BAG_DIR
+        #: 落盘目录的**实例级覆盖**（None = 跟随 config）。做成 property 而不是在
+        #: `__init__` 拷一份快照：本次会话可能把录制切到移动硬盘（config 上的会话级
+        #: 覆盖随之变化），而快照会让「数据列表 / 回放列表 / 上传源」停在旧目录上 ——
+        #: 现场表现就是"刚录的数据在界面上看不到"。
+        self._bag_dir_override: Optional[Path] = None
         self.remote_host = settings.get("host", DEFAULT_REMOTE_HOST)
         self.remote_port = int(settings.get("port", DEFAULT_REMOTE_PORT))
         self.remote_user = settings.get("user", DEFAULT_REMOTE_USER)
@@ -582,6 +609,26 @@ class DataUploader:
     def describe_last_error(self) -> str:
         """给界面用的完整文案：原始信息 + 归属 + 可执行建议。"""
         return describe(self.last_code, self.last_error)
+
+    # ---------- 落盘目录（跟随配置的会话级选择） ----------
+
+    @property
+    def bag_dir(self) -> Path:
+        """**当前**数据目录：实例覆盖 > `ConfigManager.get_bag_dir()`（含会话级选择）。
+
+        不缓存成属性字段，是因为它会随「录制设置」里选的保存位置而变 ——
+        缓存就会让"刚录的数据在界面上看不到"（列表还盯着旧目录）。
+        """
+        if self._bag_dir_override is not None:
+            return self._bag_dir_override
+        if self.config is not None:
+            return Path(self.config.get_bag_dir())
+        return DEFAULT_BAG_DIR
+
+    @bag_dir.setter
+    def bag_dir(self, value) -> None:
+        """允许直接指定（测试与"手动挑一个目录"的用法都靠它）。"""
+        self._bag_dir_override = Path(value)
 
     def get_bag_folders(self) -> List[Path]:
         if not self.bag_dir.exists():
@@ -1059,6 +1106,22 @@ class DataUploader:
         # 落点：挂载点/<序列号>/<采集日期>/<bag 名>/（理由见 `_disk_subpath`）
         subpath = f"{self._disk_subpath(folder)}/{folder.name}"
 
+        # ⑤ 同盘不再自我复制（v6.4.17）：录制若**直接写在盘上**（落盘位置选了移动硬盘），
+        #    落点会与源目录**是同一个目录** —— 于是这次"导出"就是把采集拷进它自己：
+        #    白占一倍空间 + 一次全量拷贝，盘上还会多出 `…/<bag>/<bag>.zip` 这种嵌套。
+        #
+        #    判据取"**目标目录是否落在源目录里面**"而不是"源在不在挂载点之内"：
+        #    后者会把"盘挂载点正好是数据目录的祖先"这种正常部署也一起跳过 ——
+        #    那种情况下用户确实是想把数据按标准分层拷到盘上，不该拦。
+        #    并额外要求挂载点**确实是挂载点**：否则只是路径撞名（盘没插），不该跳过。
+        target_dir = disk.mount_point / subpath
+        if disk.is_mounted() and is_within(target_dir, folder):
+            message = (f"本次数据已在移动硬盘上（录制时直接写入 {folder}）：跳过重复拷贝")
+            logger.info(message)
+            if progress_cb:
+                progress_cb(message)
+            return True
+
         # ---------- 导出前四道检查，按序执行 ----------
         # 顺序不是随手排的：前一道是"这个盘能不能用"，后一道才是"这批数据放不放得下"。
         # 反过来先报"空间不足"，而盘根本没挂载的话，这个提示会指向错误的方向。
@@ -1165,7 +1228,9 @@ class DataUploader:
     #: 扁平（直接写挂载点根）会让"两台机器的数据混在一根目录"这件事
     #: 在盘上完全看不出来 —— 而这个盘本来就是多台机器轮着插的。
     #: 一个显眼的 `unknown-serial` 让这件事在盘上一眼可见。
-    UNKNOWN_SERIAL_DIR = "unknown-serial"
+    #: 取值与落点分层统一在 `disk_export` 里实现 —— **同一套口径同时服务
+    #: 「录制直接写盘」与「录完导出」两条路**，这里只是取用点（别再各写一份）。
+    UNKNOWN_SERIAL_DIR = disk_export.UNKNOWN_SERIAL_DIR
 
     def _serial_number(self) -> str:
         """本机序列号（`Product.json` 的 `serial_number`）；读不到用占位名。
@@ -1173,14 +1238,7 @@ class DataUploader:
         读的是顶栏「序列号」那同一个字段（`ConfigManager.get_product_info`）——
         顶栏显示什么，落点目录名就是什么，不出现"界面一个样、目录另一个样"。
         """
-        if self.config is None:
-            return self.UNKNOWN_SERIAL_DIR
-        try:
-            raw = str(self.config.get_product_info().get("serial_number") or "").strip()
-        except Exception as exc:               # 配置层异常不该让导出整体失败
-            logger.warning(f"读取序列号失败，用占位目录名：{exc}")
-            return self.UNKNOWN_SERIAL_DIR
-        return self._safe_dir_name(raw) or self.UNKNOWN_SERIAL_DIR
+        return disk_export.read_serial(self.config)
 
     @staticmethod
     def _safe_dir_name(raw: str) -> str:
@@ -1190,8 +1248,7 @@ class DataUploader:
         读到 `../../etc` 这种值时，**拼路径这一步就该失败**，
         而不是把文件写到挂载点外面去。
         """
-        cleaned = "".join(ch for ch in raw if ch.isalnum() or ch in "-_")
-        return cleaned.strip("-_")
+        return disk_export.safe_dir_name(raw)
 
     @staticmethod
     def _capture_date(folder: Path) -> str:
@@ -1207,12 +1264,7 @@ class DataUploader:
         "盘上按日期分目录"才真的等于"按采集日期分目录"。
         补录/重传同一批数据也自然落到同一天，便于核对。
         """
-        try:
-            stamp = datetime.fromtimestamp(folder.stat().st_mtime)
-        except OSError as exc:
-            logger.warning(f"读取 bag 目录时间失败，按当天分层：{exc}")
-            stamp = datetime.now()
-        return stamp.strftime("%Y-%m-%d")
+        return disk_export.capture_date(folder)
 
     def _disk_subpath(self, folder: Optional[Path] = None) -> str:
         """磁盘落点（相对挂载点）：`<序列号>/<YYYY-MM-DD>/`。
@@ -1225,11 +1277,7 @@ class DataUploader:
         `bag_dir` 是上次采集建的，它的 mtime 是**上一次**的时间，
         拿它算会让预览显示成上次的日期，而本次采集显然在今天。
         """
-        if folder is None:
-            date = datetime.now().strftime("%Y-%m-%d")
-        else:
-            date = self._capture_date(folder)
-        return f"{self._serial_number()}/{date}"
+        return disk_export.disk_subpath(self._serial_number(), folder)
 
     def _remote_target(self, archive_name: str, remote_subpath: str = "") -> tuple:
         remote_dir = self.remote_base + (f"/{remote_subpath}" if remote_subpath else "")

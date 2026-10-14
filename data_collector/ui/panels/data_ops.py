@@ -147,6 +147,11 @@ class DataOpsMixin:
         if self.recorder.is_active():
             self.show_error("录制冲突", "已有录制任务正在进行")
             return
+        # 落盘位置：**起录之前**先确认目标真的能用，再把它记进本次会话。
+        # 必须在这里而不是交给脚本 —— 起录后才发现盘写不进去，界面只剩一句从脚本
+        # 退出来的"启动后立即退出"，现场完全看不出是盘的问题。
+        if not self._apply_record_target(settings):
+            return
         if self.recorder.start(settings["type"], settings["name"], settings["desc"],
                                settings["label"], settings["action_id"]):
             tag = settings["label"] or "(无)"
@@ -184,6 +189,47 @@ class DataOpsMixin:
             code = getattr(self.recorder, "last_code", None)
             detail = describe(code, self.recorder.last_error) or "请检查脚本是否存在、依赖是否完整"
             self.show_error("录制启动失败", detail)
+
+    # ---------- 保存位置（本机数据盘 / 移动硬盘） ----------
+
+    def _apply_record_target(self, settings: dict) -> bool:
+        """把「保存位置」的选择落到本次会话，并对移动硬盘做起录前预检。
+
+        返回 False = 不该起录（原因已弹给用户）。
+
+        预检为什么放在界面层、而不是交给录制脚本：`ros2 bag record` 写不进去时的
+        表现是"进程秒退"，界面只能显示一句"启动后立即退出"，真实原因（盘没挂载 /
+        不是数据盘 / 空间不足）在机器人自己的日志里、没人会去查。这里三种都能说清。
+
+        选择**只记在内存里**（`ConfigManager.set_record_target`）：盘拔了下次自动回到
+        本机，不会出现"配置还指着那块盘、起录直接失败"。
+        """
+        from ...disk_export import DISK_TARGET, disk_record_target
+
+        if (settings.get("record_target") or "local") != DISK_TARGET:
+            self.config.set_record_target("local")
+            self.append(f"本次录制保存位置：{self.config.get_bag_dir()}（本机数据盘）")
+            return True
+
+        # 重新解析一次而不是用对话框里那份快照：从打开对话框到现在，盘可能已经被拔了
+        target = disk_record_target(self.config)
+        if not target.available:
+            self.show_error(
+                "移动硬盘不可用",
+                f"{target.reason}。\n\n"
+                f"可以改用「本机数据盘」录制，或插好硬盘后重新打开「录制设置」。")
+            return False
+        try:
+            target.path.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            self.show_error(
+                "移动硬盘不可用",
+                f"无法在移动硬盘上创建目录：{target.path}\n{exc}\n\n"
+                f"请确认硬盘已插好、可写；必要时改用「本机数据盘」。")
+            return False
+        self.config.set_record_target(DISK_TARGET, target.path)
+        self.append(f"本次录制保存位置：{target.path}（移动硬盘；录完可直接拔盘交付）")
+        return True
 
     @guard_slot
     def on_stop_record(self):
