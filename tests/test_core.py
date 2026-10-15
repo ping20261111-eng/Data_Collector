@@ -4139,8 +4139,14 @@ def test_stream_job_args_values_path_is_unchanged():
     assert args[args.index("--values") + 1] == "55,100,45,0,0,0"
 
 
-def test_head_to_data_position_builds_a_single_axis_forced_job(tmp_path, monkeypatch):
-    """`head_to_data_position` 的 job：**只改 H6 → -32**，并带 `force`。"""
+def test_head_to_data_position_runs_the_dedicated_script(tmp_path, monkeypatch):
+    """`head_to_data_position` 的 job：**起专用脚本**（`head_minus32.py`），不带参数。
+
+    为什么必须是专用脚本、而不是复用 `motion_stream.py`：两者的**准备阶段间隔不同** ——
+    专用那份是现场实测能用的 2s（用户提供的 `to-32.py`），通用那份是 0.3s。
+    `motor_mode` 改完会让控制节点重连电机，**重连期间发出去的目标会被静默丢弃**
+    （"命令发了、订阅者也匹配、机构就是不动"）。现场实测过的时序是"能动"的直接证据。
+    """
     from data_collector import core_motion, core_operations
 
     launcher, _sent, _slept, _cm = _trunk_lock_launcher(tmp_path, monkeypatch)
@@ -4149,8 +4155,9 @@ def test_head_to_data_position_builds_a_single_axis_forced_job(tmp_path, monkeyp
     def fake_streams(_self, jobs, on_line=None, is_aborted=None, timeout=None):
         # 第一个参数是 `self`：`run_motion_streams` 是实例方法，把普通函数 setattr 到
         # 类上之后照样按描述符绑定 —— 漏了它会报
-        # `got multiple values for argument 'on_line'`（上次做自锁兜底时也踩过同一处）。
+        # `got multiple values for argument 'on_line'`（做自锁兜底时踩过同一处）。
         captured["jobs"] = list(jobs)
+        captured["timeout"] = timeout
         return {core_motion.stream_job_key(job): True for job in jobs}
 
     monkeypatch.setattr(core_operations.Launcher, "run_motion_streams",
@@ -4163,12 +4170,12 @@ def test_head_to_data_position_builds_a_single_axis_forced_job(tmp_path, monkeyp
     assert result["value"] == core_motion.HEAD_DATA_TARGET_DEG == -32.0
     job = captured["jobs"][0]
     assert job["kind"] == "trunk"
-    assert job["set_axes"] == {5: -32.0}, f"应当只改 H6：{job['set_axes']}"
-    assert job["values"] is None, "不许同时给完整目标（那会把其余轴带向 0）"
-    assert job["force"] is True, "越界必须带 force，否则脚本会拦下"
-    assert (job["duration"], job["hold"], job["rate"]) == (
-        core_motion.HEAD_DATA_DURATION_SEC, core_motion.HEAD_DATA_HOLD_SEC,
-        core_motion.HEAD_DATA_RATE)
+    assert job["script"] == core_motion.HEAD_STREAM_SCRIPT == "head_minus32.py", (
+        "必须起专用脚本（时序现场实测过），不是通用的 motion_stream.py")
+    assert job["args"] == [], "专用脚本没有参数（目标与节奏都写死在它里面）"
+    assert job["label"] == "头部至 -32°", f"日志里要能一眼看出是哪件事：{job.get('label')}"
+    assert captured["timeout"] == core_motion.HEAD_DATA_STREAM_TIMEOUT, (
+        "这个动作的准备阶段就要 6s，等待上限必须用专用常量（不能用通用那条估算）")
 
 
 def test_head_to_data_position_reports_unconfirmed_when_there_is_no_exit_code(
@@ -4202,4 +4209,9 @@ def test_the_head_target_is_the_only_place_that_exceeds_the_documented_range():
     assert (h6[1], h6[2]) == (-30.0, 30.0), "H6 的量程应当仍是文档写的 ±30"
     assert core_motion.HEAD_DATA_TARGET_DEG == -32.0
     assert core_motion.HEAD_DATA_TARGET_DEG < h6[1], (
-        "这个动作之所以要 force，正因为目标低于文档下限 —— 两者必须同时成立")
+        "这个动作之所以特殊，正因为目标低于文档下限 —— 两者必须同时成立")
+
+    # **通用脚本的量程表也不能跟着放宽** —— 改它等于放行所有实时流
+    stream_text = (PROJECT_ROOT / "scripts" / "motion_stream.py").read_text(encoding="utf-8")
+    assert "(-30.0, 30.0)" in stream_text, (
+        "motion_stream.py 的 H6 量程应当仍是文档写的 ±30（它走的是通用路径）")

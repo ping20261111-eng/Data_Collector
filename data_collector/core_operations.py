@@ -20,7 +20,8 @@ from .core import (
 )
 # 姿势控制用到的常量与 payload 构造函数（话题名/消息类型/单位换算只有一处定义 —— 见 core_motion）
 from .core_motion import (BOOL_MSG, HEAD_DATA_AXIS_INDEX, HEAD_DATA_DURATION_SEC,
-                          HEAD_DATA_HOLD_SEC, HEAD_DATA_RATE, HEAD_DATA_TARGET_DEG,
+                          HEAD_DATA_HOLD_SEC, HEAD_DATA_RATE, HEAD_DATA_STREAM_TIMEOUT,
+                          HEAD_DATA_TARGET_DEG, HEAD_STREAM_SCRIPT,
                           MOTION_STREAM_SCRIPT, STREAM_TIMEOUT_PAD,
                           TRUNK_CONNECT_TOPIC, TRUNK_LOCK_AXES_TEXT,
                           TRUNK_LOCK_INDEXES, TRUNK_LOCK_LAYOUT_OFFSET,
@@ -2040,22 +2041,31 @@ class Launcher:
         if not self.config.check_workspace():
             emit(f"工作空间不存在（{self.config.workspace}），没有下发任何实时流")
             return {key: False for key in keys}
-        script = self.config.resolve_script_path(MOTION_STREAM_SCRIPT)
-        if not script.is_file():
-            emit(f"找不到实时流脚本 {script} —— 它随上位机交付包发布在 scripts/ 下")
-            return {key: False for key in keys}
+        # 每个 job 可以带自己的脚本（专用动作就是一份专用脚本）；不带就用通用的那份。
+        scripts = {}
+        for job, key in zip(jobs, keys):
+            script = self.config.resolve_script_path(job.get("script") or MOTION_STREAM_SCRIPT)
+            if not script.is_file():
+                emit(f"找不到实时流脚本 {script} —— 它随上位机交付包发布在 scripts/ 下")
+                return {key: False for key in keys}
+            scripts[key] = script
 
         if timeout is None:
-            timeout = max((job["duration"] + job["hold"] for job in jobs), default=0.0) \
-                + STREAM_TIMEOUT_PAD
+            timeout = max((job.get("duration", 0.0) + job.get("hold", 0.0)
+                           for job in jobs), default=0.0) + STREAM_TIMEOUT_PAD
 
         procs: Dict[str, subprocess.Popen] = {}
         readers: Dict[str, threading.Thread] = {}
         queues: Dict[str, "queue.Queue"] = {}
         for job, key in zip(jobs, keys):
-            args = " ".join(shlex.quote(item) for item in stream_job_args(job))
+            # `args` 显式给了就直接用 —— 专用脚本的参数形状与 `stream_job_args` 无关
+            job_args = job.get("args")
+            if job_args is None:
+                job_args = stream_job_args(job)
+            args = " ".join(shlex.quote(item) for item in job_args)
             cmd = (f"cd {shlex.quote(str(self.config.workspace))} && {self._env_prefix()}"
-                   f"{self._source_setup_prefix()}python3 {shlex.quote(str(script))} {args}")
+                   f"{self._source_setup_prefix()}python3 {shlex.quote(str(scripts[key]))}"
+                   f"{(' ' + args) if args else ''}")
             logger.warning(f"实时流（{key}）: {cmd}")
             try:
                 # `start_new_session`：让脚本自己占一个进程组，中止时能整组收到信号
@@ -2159,21 +2169,25 @@ class Launcher:
         """【采数专用】把头部 **H6** 走到 `HEAD_DATA_TARGET_DEG`（-32°），其余轴保持当前角度。
 
         现场（2026-10-15）要的动作：**点一下就到位**，然后在这个位姿采数。
-        实现方式与现场脚本（用户给的 `to-32.py`）是同一套做法，但**复用本仓既有的实时流**：
-        `scripts/motion_stream.py` 本来就是
-        `connect → motor_mode 1 → connect`（`--prepare`）+ 100Hz `easeInOutCubic` 逐帧发目标，
-        而且它的**起点就是它自己读到的当前角度** —— 与现场脚本里"读当前角度写进
-        `start_position`"那一步是同一个语义（见 `run_trunk`）。所以这里不需要再写一份脚本。
+        起的是**专用脚本** `scripts/head_minus32.py` —— 它的时序**逐字来自现场实测能用的
+        那份脚本**（用户提供的 `to-32.py`）：
 
-        为什么走"只改一个轴"（`set_axes`）而不是让界面先读一遍角度、再拼 6 个值传过来：
-        那是**两次读数**（界面读一次、脚本再读一次），两次之间的差异会变成其余 5 轴的
-        一次无谓运动；让脚本用它自己读到的那一帧当基准，其余轴就真的不动。
+            connect → 等 2s → motor_mode 1 → 等 2s → connect → 等 2s
+            → 100Hz easeInOutCubic 插值 5s → 按目标保持 3s
+
+        **为什么不复用 `motion_stream.py`**：那份的准备阶段每步只等 0.3s，而 `motor_mode`
+        改完会让控制节点重新连电机 —— **重连期间发出去的目标会被静默丢弃**
+        （表现是"命令发了、订阅者也匹配、机构就是不动"）。现场那份脚本 2s 的间隔是
+        "能动"的直接证据，所以以它为准。
+
+        **"读当前角度 → 只改 H6"这两步都在脚本里**，所以这里不预先读一遍：若在界面侧先读
+        一次、脚本再读一次，两次读数之间的差异会变成其余 5 轴的一次无谓运动。
 
         **读不到当前角度就不动**：脚本自己判（退出码 3），这里如实回报，不假装成功。
 
-        ⚠️ **H6 的 -32° 超出 SDK 文档写的量程下限 -30°**，所以这个 job 带 `force=True`
-        （原因与依据见 `core_motion.HEAD_DATA_TARGET_DEG`）。**只有这一个动作允许越界**；
-        通用下发路径（轴表 / 预设 / 手动输入）仍是文档量程。
+        ⚠️ **H6 的 -32° 超出 SDK 文档写的量程下限 -30°** —— 越界只发生在**那份专用脚本
+        内部**（它不做量程检查，目标常量是现场定的）；通用下发路径（轴表 / 预设 /
+        手动输入 / `motion_stream.py`）仍是文档量程。
 
         Returns:
             ``{ok, axis, value, reason}``；`ok` 取 `True`（脚本正常退出，它走到位才退）/
@@ -2181,15 +2195,12 @@ class Launcher:
         """
         job = {
             "kind": "trunk",
-            "side": None,
-            "values": None,                 # 走 set_axes：目标由脚本读到的当前角度构造
-            "set_axes": {HEAD_DATA_AXIS_INDEX: HEAD_DATA_TARGET_DEG},
-            "duration": HEAD_DATA_DURATION_SEC,
-            "hold": HEAD_DATA_HOLD_SEC,
-            "rate": HEAD_DATA_RATE,
-            "force": True,                  # -32 超出文档量程 -30，见本方法 docstring
+            "label": f"头部至 {HEAD_DATA_TARGET_DEG:g}°",
+            "script": HEAD_STREAM_SCRIPT,     # 专用脚本（时序现场实测过，见常量说明）
+            "args": [],                       # 目标与节奏都写在那份脚本里
         }
-        results = self.run_motion_streams([job], on_line=on_line, is_aborted=is_aborted)
+        results = self.run_motion_streams([job], on_line=on_line, is_aborted=is_aborted,
+                                          timeout=HEAD_DATA_STREAM_TIMEOUT)
         ok = results.get(stream_job_key(job))
         if ok is None:
             reason = "没有得到退出码 —— 未经确认（可能已超时或被中止）"
