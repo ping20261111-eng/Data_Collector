@@ -17,6 +17,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 PANEL_MIXINS = (
     "TopbarMixin", "LayoutMixin", "ActionsMixin", "StatusMixin",
     "LaunchMixin", "TeleopMixin", "DataOpsMixin", "UploadMixin",
+    "ConvertToolMixin",
 )
 
 # 包的对外名字：历史代码与测试直接用这些
@@ -45,7 +46,7 @@ MAIN_WINDOW_METHODS = (
     "on_launch", "on_monitor_performance", "on_play_data", "on_record",
     "on_release_emergency_stop", "on_select_version", "on_stop_main", "on_stop_record",
     "on_stop_teleop", "on_teleop", "on_teleop_exit", "on_teleop_started",
-    "on_teleop_startup_timeout", "on_toggle_robot_monitor", "on_toggle_theme",
+    "on_teleop_startup_timeout",     "on_toggle_robot_monitor", "on_toggle_theme",
     "on_upload", "on_upload_finished", "on_view_data", "refresh_hand_display",
     "refresh_robot_status", "refresh_topbar_facts", "show_error", "show_upload_progress",
     "update_progress_label", "update_record_time", "update_teleop_time",
@@ -58,6 +59,10 @@ MAIN_WINDOW_METHODS = (
     "_set_teleop_button", "_shutdown_threads", "_sync_theme_button", "_teleop_elapsed_text",
     "_teleop_log_path", "_update_robot_status", "_watch_estop_process",
     "_watch_product_setup",
+    # 数据转换入口（ADR-003）
+    "on_convert", "_sync_convert_button", "_apply_convert_running",
+    "_start_convert_alive_timer", "_stop_convert_alive_timer",
+    "_on_convert_poll", "_adopt_running_convert", "_shutdown_convert_on_exit",
 )
 
 # 单个界面文件的行数上限。拆分前是 3455 行；给足余量，只在"又长回巨型文件"时触发。
@@ -78,7 +83,7 @@ def test_package_exports_public_names():
 
 
 def test_main_window_composes_panel_mixins():
-    """MainWindow 由 8 个面板 Mixin 组合而成（方法归位后的结构）。"""
+    """MainWindow 由 9 个面板 Mixin 组合而成（方法归位后的结构）。"""
     from data_collector.ui import MainWindow
 
     bases = [c.__name__ for c in MainWindow.__mro__]

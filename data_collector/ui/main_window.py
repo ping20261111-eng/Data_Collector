@@ -36,12 +36,13 @@ from .common import (SP, TELEOP_STARTUP_TIMEOUT_MS, file_link, schedule_once)
 
 from .panels import (TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin,
                     LaunchMixin, TeleopMixin, DataOpsMixin, UploadMixin,
-                    VisionMixin)
+                    VisionMixin, ConvertToolMixin)
 from .safety import guard_slot
 
 
 class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixin,
-                 TeleopMixin, DataOpsMixin, UploadMixin, VisionMixin, QMainWindow):
+                 TeleopMixin, DataOpsMixin, UploadMixin, VisionMixin,
+                 ConvertToolMixin, QMainWindow):
     """主窗口：装配各面板、持有配置与 Launcher、管理生命周期。"""
 
     progress_signal = pyqtSignal(str)   # 进度文字更新信号
@@ -125,6 +126,14 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         # 语义是「下发过什么」，不是「现在是不是自锁」：ROS 侧没有自锁状态话题。
         self.trunk_lock_sent = None
         self._trunk_lock_thread = None               # 自锁下发的后台线程（见 status.py）
+
+        # 数据转换工具（nerv_lerobot，独立进程，见 ADR-003）：
+        # _convert_proc 是本会话起的那个窗口的句柄（用户自己起的那没有句柄，
+        # 此时为 None，只靠按钮文案表达状态）；其余三项是这个窗口自己的小状态。
+        self._convert_proc = None
+        self._convert_target = None           # 最近一次探测结果，供 tooltip 用
+        self._convert_alive_timer = None      # 只在窗口开着期间存在的轮询定时器
+        self._convert_exit_noted = False      # 退出只提示一次，不刷屏
 
         # 连接信号
         self.progress_signal.connect(self.update_progress_label)
@@ -247,6 +256,9 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
                       getattr(self, "record_timer", None)):
             if timer is not None:
                 timer.stop()
+        # 数据转换窗口的存活轮询：与界面同寿，不回收的话它会在窗口销毁后
+        # 继续触发、回调落到已析构的对象上（`common.schedule_once` 记过同款坑）。
+        self._stop_convert_alive_timer()
 
         workers = (
             ("遥操作日志", "teleop_thread", "stop"),
@@ -325,4 +337,12 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         for line in self.launcher.stop_aux_nodes():
             logger.info(line)
         self.vision_node_proc = None
+
+        # 数据转换界面：与遥操作刻意不同 —— **不杀、不问**，只留一句痕迹。
+        # 转换是几十分钟量级的长任务，关界面就杀掉等于丢数据；它也不占机器人本体。
+        convert_note = self._shutdown_convert_on_exit()
+        if convert_note:
+            logger.info(convert_note)
+            self.append(convert_note)
+
         super().closeEvent(event)

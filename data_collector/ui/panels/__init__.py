@@ -12,6 +12,7 @@ from .teleop import TeleopMixin
 from .data_ops import DataOpsMixin
 from .vision import VisionMixin
 from .upload import UploadMixin
+from .convert import ConvertToolMixin
 
 __all__ = [
     "TopbarMixin",
@@ -23,4 +24,5 @@ __all__ = [
     "DataOpsMixin",
     "VisionMixin",
     "UploadMixin",
+    "ConvertToolMixin",
 ]

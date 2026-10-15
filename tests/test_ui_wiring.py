@@ -7270,3 +7270,167 @@ def test_no_slang_left_in_user_visible_strings(status_env):
     for word in ("盘已就绪", "未插好", "送到", "两者都送", "将保存到", "本次采集名"):
         assert word not in seen, f"口语化残留：{word}（出现在 {seen!r}）"
     assert "未就绪" in win.lb_chip_caption.text(), "未就绪态芯片文案应是「未就绪」"
+
+
+# ============ 数据转换入口（ADR-003） ============
+# 三条纪律在这里各钉一条：不可用就置灰、灰了必须写理由、点击只起一次。
+
+
+def _convert_repo(tmp_path: Path) -> Path:
+    """搭一个"装好了"的 nerv_lerobot 仓库，供界面探测。
+
+    只搭完整的那一种：**不完整**的四种失效场景（没装 / 版本没 GUI /
+    目录不完整 / 没 uv sync）由 `tests/test_convert_tool.py` 逐条钉住，
+    界面这一侧只需确认"探测结果怎么变成按钮状态"。
+    """
+    import stat as _stat
+
+    repo = tmp_path / "nerv_lerobot"
+    gui = repo / "tools" / "gui"
+    gui.mkdir(parents=True, exist_ok=True)
+    script = gui / "run.sh"
+    script.write_text("#!/usr/bin/env bash\nsleep 60\n", encoding="utf-8")
+    script.chmod(script.stat().st_mode | _stat.S_IXUSR)
+    (gui / "run_gui.py").write_text("# gui\n", encoding="utf-8")
+    venv_bin = repo / ".venv" / "bin"
+    venv_bin.mkdir(parents=True, exist_ok=True)
+    py = venv_bin / "python"
+    py.write_text("#!/bin/sh\n", encoding="utf-8")
+    py.chmod(py.stat().st_mode | _stat.S_IXUSR)
+    return repo
+
+
+def test_convert_button_is_greyed_out_when_the_tool_is_missing(ui_env, tmp_path):
+    """没装就置灰 —— 但**按钮必须在**（不是隐藏）。
+
+    隐藏会让现场以为"根本没这个功能"；置灰 + 理由才让人知道
+    "有这回事、缺什么、怎么补"（同 `disk_record_targets` 的占位候选）。
+    """
+    win, cm = ui_env
+    cm.app_config["convert_tool_root"] = str(tmp_path / "not-installed")
+    win._sync_convert_button()
+
+    # 没有显式 setVisible(False)：置灰走的是 setEnabled(False)。
+    # 一旦有人改成"藏起来"，这里会红 —— 那正是要防的退化。
+    assert win.btn_convert.isHidden() is False
+    assert win.btn_convert.isEnabled() is False
+
+
+def test_convert_button_explains_why_it_is_greyed(ui_env, tmp_path):
+    """灰着不给理由会被现场读成"坏了" —— 本项目为此立过规矩。
+
+    覆盖**没装**这一支：理由必须同时含"缺什么"和"怎么办"（去哪儿改配置）。
+    另一支（装了但版本没有 GUI / 没同步依赖）由 test_convert_tool.py 逐条钉住。
+    """
+    win, cm = ui_env
+    cm.app_config["convert_tool_root"] = str(tmp_path / "not-installed")
+    win._sync_convert_button()
+
+    tip = win.btn_convert.toolTip()
+
+    assert "不可用" in tip
+    assert "未找到" in tip
+    assert "convert_tool_root" in tip
+
+
+def test_convert_button_is_enabled_when_everything_is_in_place(ui_env, tmp_path, monkeypatch):
+    win, cm = ui_env
+    cm.app_config["convert_tool_root"] = str(_convert_repo(tmp_path))
+    # 这台机器上不该真有转换界面在跑（否则按钮会进"运行中"态）
+    monkeypatch.setattr(win.launcher, "convert_tool_running", lambda: False)
+
+    win._sync_convert_button()
+
+    assert win.btn_convert.isEnabled() is True
+    assert win.btn_convert.text() == "数据转换"
+
+
+def test_convert_button_says_running_instead_of_allowing_a_second_launch(ui_env, tmp_path, monkeypatch):
+    """已在跑时按钮禁用并写明"运行中"：两个转换界面写同一个输出目录。"""
+    win, cm = ui_env
+    cm.app_config["convert_tool_root"] = str(_convert_repo(tmp_path))
+    win._sync_convert_button()
+    monkeypatch.setattr(win.launcher, "convert_tool_running", lambda: True)
+
+    win._sync_convert_button()
+
+    assert win.btn_convert.isEnabled() is False
+    assert "运行中" in win.btn_convert.text()
+
+
+def test_clicking_convert_launches_exactly_one_process(ui_env, tmp_path, monkeypatch):
+    """点一次只起一个 —— 拦截顺序：已在跑 → 不重复启动。"""
+    win, cm = ui_env
+    cm.app_config["convert_tool_root"] = str(_convert_repo(tmp_path))
+    win._sync_convert_button()
+
+    calls = []
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self):
+            return None                      # 一直活着
+
+    def _fake_launch():
+        calls.append(1)
+        return _FakeProc()
+
+    monkeypatch.setattr(win.launcher, "launch_convert_tool", _fake_launch)
+    monkeypatch.setattr(win.launcher, "convert_tool_running", lambda: False)
+
+    win.on_convert()
+    win.on_convert()                         # 第二次应当被"已有句柄"拦下
+
+    assert len(calls) == 1
+
+
+def test_clicking_a_grey_convert_button_reports_the_reason(ui_env, tmp_path, monkeypatch):
+    """环境没就绪时点它，必须把原因说出来。
+
+    为什么不直接 `btn_convert.click()`：Qt 里 disabled 按钮不响应鼠标事件
+    （这本身是对的）。但触屏设备、键盘激活、以及"探测之后环境又变了"
+    这几条路都可能真的进到槽里 —— 所以槽自己必须再拦一道并说清原因，
+    而不是静默返回让人以为界面坏了。
+    """
+    win, cm = ui_env
+    cm.app_config["convert_tool_root"] = str(tmp_path / "not-installed")
+    win._sync_convert_button()
+
+    errors = []
+    monkeypatch.setattr(win, "show_error",
+                        lambda title, msg: errors.append((title, msg)))
+    monkeypatch.setattr(win.launcher, "launch_convert_tool",
+                        lambda: pytest.fail("不该尝试启动"))
+
+    win.on_convert()                          # 直接进槽，模拟绕过 disabled 的那条路
+
+    assert errors, "环境没就绪时必须给出原因"
+    assert "未找到" in errors[0][1]
+    assert "convert_tool_root" in errors[0][1]
+
+
+def test_closing_the_window_leaves_the_convert_gui_alone(ui_env, tmp_path, monkeypatch):
+    """关界面**不杀**转换界面。
+
+    转换是几十分钟量级的长任务，杀掉等于丢数据；它也不占机器人本体
+    （与遥操作刻意不同 —— 遥操作退出前要问一句）。
+    """
+    win, cm = ui_env
+    cm.app_config["convert_tool_root"] = str(_convert_repo(tmp_path))
+
+    class _FakeProc:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(win.launcher, "launch_convert_tool", lambda: _FakeProc())
+    monkeypatch.setattr(win.launcher, "convert_tool_running", lambda: False)
+
+    win.on_convert()
+    note = win._shutdown_convert_on_exit()
+
+    assert "未中断" in note or "仍在运行" in note
+    # 关键：不许去 kill
+    assert win._convert_proc.poll() is None

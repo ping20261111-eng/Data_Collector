@@ -214,6 +214,22 @@ class ActionsMixin(ExportTargetMixin):
         self.btn_monitor_perf.setToolTip("录制性能监控（录制开始后自动采样，结束自动汇总）")
         self.btn_monitor_perf.clicked.connect(self.on_monitor_performance)
 
+        # 数据转换（v6.6.0）：起 `nerv_lerobot` 仓里的转换界面（独立进程、独立窗口，
+        # 详见 ADR-003）。三条设计：
+        #   ① **放工具行而不是机器人控制菜单**：它不操作机器人本体，是离线数据处理；
+        #      而菜单项一律不置灰（Qt 菜单项的悬停提示在触屏上不可靠），"环境没就绪
+        #      要说清楚"这件事在按钮上才做得成 —— 见 `convert_tool.py` 的模块说明。
+        #   ② **就地状态按钮**（纪律一）：转换界面起来后按钮变「运行中」，
+        #      界面崩 / 被关掉后自己复位。现场不用猜"点了到底起没起"。
+        #   ③ **不可用时置灰而不是隐藏**：不给人"功能不存在"的错觉，
+        #      tooltip 写清缺什么 / 查了哪 / 怎么补（同 `disk_record_targets`
+        #      的占位候选哲学）。
+        self.btn_convert = QPushButton("数据转换")
+        self.btn_convert.setProperty("variant", "ghost")
+        self.btn_convert.clicked.connect(self.on_convert)
+        # 首帧先按探测结果定状态，不等用户点
+        self._sync_convert_button()
+
         # ---- 机器人控制（一个二级菜单，一层到底）----
         # 现场要求："对机器控制的功能全放在一个二级菜单内"。理由在这里写清楚，
         # 免得以后有人又往工具行加按钮：
@@ -326,8 +342,8 @@ class ActionsMixin(ExportTargetMixin):
         tools = QHBoxLayout()
         tools.setSpacing(SP["sp2"])
         tools.addWidget(tool_label)
-        for btn in (self.btn_bag_stat, self.btn_monitor_perf, self.btn_robot_menu,
-                    self.btn_cancel_calibration):
+        for btn in (self.btn_bag_stat, self.btn_monitor_perf, self.btn_convert,
+                    self.btn_robot_menu, self.btn_cancel_calibration):
             tools.addWidget(btn)
         tools.addStretch()
         body.addLayout(tools)

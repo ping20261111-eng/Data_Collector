@@ -151,6 +151,10 @@ class TopbarMixin:
         self.append(f"工作空间已切换为: {path}")
         self.refresh_topbar_facts()
         self.refresh_hand_display()
+        # 数据转换工具的可用性跟着刷新：切版本可能连着换了工具版本
+        # （或把 convert_tool_root 指到了新位置），不重探就会让按钮停在上一次
+        # 的结论上 —— 表现是"明明装了却一直灰着"。
+        self._sync_convert_button()
 
     def _sync_theme_button(self):
         self.btn_theme.setText("暗色" if self.theme_mode == "light" else "明色")

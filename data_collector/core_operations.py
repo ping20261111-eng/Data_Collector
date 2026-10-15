@@ -21,6 +21,8 @@ from .core import (
 # 姿势控制用到的常量与 payload 构造函数（话题名/消息类型/单位换算只有一处定义 —— 见 core_motion）
 from .core_motion import (BOOL_MSG, MOTION_STREAM_SCRIPT, STREAM_TIMEOUT_PAD,
                           stream_job_args, stream_job_key)
+# 数据转换工具（nerv_lerobot）的探测与启动契约（见 ADR-003）
+from . import convert_tool
 # 常驻命令通道（v6.2.0）：姿态控制的下发走它，起不来就降级到一次性 CLI
 from .ros_bridge import RosBridge
 
@@ -3177,6 +3179,36 @@ class Launcher:
             return False
         self.pm.terminate_by_name("robot_monitor")
         return True
+
+    # ---------- 数据转换工具（nerv_lerobot 的图形界面，见 ADR-003） ----------
+    def probe_convert_tool(self):
+        """探测数据转换工具是否可用（只读 stat，不执行）。"""
+        return convert_tool.probe_convert_tool(
+            convert_tool.convert_tool_repo(self.config))
+
+    def launch_convert_tool(self) -> subprocess.Popen:
+        """起数据转换界面（独立进程组，独立窗口）。
+
+        **不走 `_run_script`**：那条路径统一用 bash/python3 跑 `scripts/` 下的
+        脚本，而转换界面跑在自己的 Python 3.12 虚拟环境里（`lerobot` 锁 3.12，
+        本工具是 3.10），必须由它自己的 `run.sh` 启动。硬套进来等于用 3.10
+        去 import 3.12 的依赖，起来的是一个报 ImportError 的窗口。
+
+        刻意**不在关界面时杀它**（`closeEvent` 不收它）：转换是几十分钟量级的
+        长任务，杀掉等于丢数据。它跟遥操作不同 —— 遥操作占着机器人本体，
+        所以退出要问一句；转换只占 CPU 与磁盘，跑完就完事。
+        """
+        target = self.probe_convert_tool()
+        if not target.available:
+            raise FileNotFoundError(target.describe())
+        proc = convert_tool.launch_convert_tool(
+            target, log_file=convert_tool.convert_tool_log_file(self.config))
+        self.pm.register(proc, "convert_gui")
+        return proc
+
+    def convert_tool_running(self) -> bool:
+        """转换界面是否已在运行（含用户手动起的情况，见 convert_tool 的说明）。"""
+        return convert_tool.is_convert_tool_running()
 
     # ---------- 急停 ----------
     def launch_emergency_stop(self, engage: bool = True) -> subprocess.Popen:

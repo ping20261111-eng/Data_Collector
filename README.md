@@ -2635,11 +2635,12 @@
 | `ui/data_view.py` | 数据浏览对话框 |
 | `ui/remote_browser.py` | 远端 SFTP 目录浏览器 |
 | `ui/main_window.py` | 主窗口：类级信号 + `__init__` 装配 + 生命周期 + 日志输出 |
-| `ui/panels/*.py` | 8 个面板 Mixin：顶栏 / 骨架 / 动作区 / 状态 / 启动 / 遥操作 / 数据操作 / 上传 |
+| `ui/panels/*.py` | 9 个面板 Mixin：顶栏 / 骨架 / 动作区 / 状态 / 启动 / 遥操作 / 数据操作 / 上传 / 数据转换入口 |
+| `convert_tool.py` | 数据转换工具（`nerv_lerobot`）的**探测与启动契约**：纯逻辑、不 import Qt，可脱离界面单测；`ui/panels/convert.py` 把它翻成按钮状态（见 ADR-003） |
 | `data_collector/theme.py` | 设计令牌（色值 / 字阶 / 间距）+ QSS 生成。**视觉语言为 B 方案「自然洁净 · 临床白」**：白卡片 + 冷灰描边 + 青碧强调（#0E7C86）+ 大圆角 + 药丸徽章 + 圆形红色急停钮；电量是环形进度，急停柱顶部是安全导轨 |
 | `data_collector/app.py` | 启动入口：装配 ConfigManager 与 MainWindow，并打印启动自检 |
 
-`MainWindow` 由 8 个面板 Mixin 组合而成（`MainWindow -> TopbarMixin -> ... -> QMainWindow`）。
+`MainWindow` 由 9 个面板 Mixin 组合而成（`MainWindow -> TopbarMixin -> ... -> QMainWindow`）。
 要改某块界面，打开 `ui/panels/` 下对应的那一个文件即可。
 
 `ui/` 目录里**不允许出现硬编码色值**（有测试扫描整个包钉住），要调外观请改 `theme.py` 的令牌。
@@ -2657,7 +2658,7 @@
 │          │  启动参数（末端手型 / joy / rviz / use_sim / rgb_only）  │
 │          │  运行状态（遥操作 … / 录制 …）                          │
 │ 解除急停  │  数据（上传 / 抓取日志 / 查看数据 / 播放数据）           │
-│          │  监控（性能监控 / 采集统计）                            │
+│          │  工具（采集统计 / 性能监控 / 数据转换 / 机器人控制 ▾）     │
 │          ├─ 运行日志 ─────────────────────────────────────────────┤
 └──────────┴──────────────────────────────────────────────────────┘
 ```
@@ -2800,6 +2801,68 @@ labels:
 | `pokepoint_package` / `pokepoint_node` | `pokepoint` / `pokepoint_node` | 戳点节点 |
 | `video_streamer_package` / `video_streamer_node` | `teleop_video_streamer` / `teleop_video_streamer_node` | 视频流节点 |
 | `start_video_stream` | `true` | 拉起标定/戳点时一并启动视频流；现场已手动起好时可关掉，避免重复实例抢话题 |
+
+## 数据转换：只做入口（`nerv_lerobot` 的图形界面）
+
+把录好的 bag 转成训练数据集，用的是 `nerv_lerobot` 仓里的 `tools/gui`。
+上位机**只提供一个入口**，不碰它的任何代码。完整取舍见 `ADR-003_数据转换工具入口.md`。
+
+入口在操作区**「工具」行**，常驻按钮「数据转换」。
+
+### 为什么是独立进程，不是嵌进主界面
+
+这是硬约束，不是取舍：
+
+| | Data_Collector | nerv_lerobot/tools/gui |
+| --- | --- | --- |
+| Python | 3.10（系统） | 3.12（自带 `.venv`） |
+| 依赖 | PyQt5 | PyQt5 + `lerobot[dataset]==0.6.1` |
+
+`lerobot` 在 `pyproject.toml` 里声明 `requires-python = ">=3.12,<3.13"`，而本工具跑系统
+3.10 —— 同进程里不可能同时满足。退一步说，两个 `QApplication` 共存本身也是错的。
+所以入口的职责只有两件：**只读探测** + **子进程启动**。
+
+### 按钮的四种状态
+
+| 状态 | 条件 | 表现 |
+| --- | --- | --- |
+| 可用 | 仓库、`tools/gui/run.sh`、`run_gui.py`、`.venv/bin/python` 四项齐全 | 「数据转换」，可点 |
+| 灰 · 没装 | 仓库根不存在 | 置灰，tooltip 写明查了哪个路径、去哪儿改配置 |
+| 灰 · 版本不对 | 缺 `run.sh` 或 `run_gui.py` | 置灰，写明缺哪个文件 |
+| 灰 · 没同步依赖 | `.venv/bin/python` 不存在或不可执行 | 置灰，写明在该仓执行 `uv sync` |
+| 运行中 | 转换界面已开着 | 「数据转换 · 运行中」，禁用，防起第二个写同一输出目录 |
+
+**不隐藏、只置灰**：隐藏会让人以为"根本没这个功能"。灰着但写清理由，才知道
+"有这回事、缺什么、怎么补" —— 与移动硬盘占位候选是同一哲学。
+
+**启动自检**里这一项标 `warn` 而不是 `fail`：它只影响"录完之后转格式"这一步，
+缺了完全不影响采集与回传。写成 fail 会让没装它的机器一开界面就弹红框。
+
+### 生命周期：关本工具不会中断它
+
+转换是几十集 bag 的长任务，退出时杀掉等于丢数据；它也不占机器人本体 ——
+所以与遥操作**刻意不同**：遥操作退出前要问一句，转换只留一句日志痕迹。
+输出落在 `logs/convert_gui.log`（排障用；管道没人读会写满 64KB 把进程卡死）。
+
+防重复启动用 `pgrep -f tools/gui/run_gui.py`，**只在点击那一刻判一次** ——
+用户手动在终端起的情况也算数，否则会起第二个实例。
+
+### 为什么不拷贝它的代码进来
+
+ADR-002 曾经把机器侧的录制脚本拷进本仓维护，那套成立的前提是"对方文件不在版本
+控制里"。`nerv_lerobot` 是独立仓、有 `.git`、有 `uv.lock`，本身即真源 —— 拷过来就是
+制造第二份必然漂移的副本。`scripts/run_teleop.sh` 的两份副本已经分叉（193 行 vs 115 行），
+就是这条路的结局。
+
+启动走它自己的 `run.sh`（那份脚本里已经解决过 `XDG_RUNTIME_DIR` 与无 X 退回 offscreen
+的问题），**启动契约归对方，我们只调用**。
+
+### 配置
+
+| 配置 | 默认 | 说明 |
+| --- | --- | --- |
+| `convert_tool_root` | `~/test_ws/nerv_lerobot` | 仓库根。装在别处就填这里（留空取默认） |
+
 
 ## 查看数据
 
