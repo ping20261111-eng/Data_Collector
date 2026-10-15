@@ -7295,3 +7295,58 @@ def test_no_slang_left_in_user_visible_strings(status_env):
         assert word not in seen, f"口语化残留：{word}（出现在 {seen!r}）"
     assert "未就绪" in win.lb_chip_caption.text(), "未就绪态芯片文案应是「未就绪」"
 
+
+
+def test_trunk_lock_result_says_when_it_fell_back_to_the_cli(status_env, tmp_path,
+                                                             monkeypatch):
+    """走了一次性 CLI 时，结果区**必须说明** —— 现场看到"订阅者 -1"会以为没发出去。
+
+    一次性 CLI 拿不到订阅者数（`matched` 只能是 -1），而常驻通道那条有真实数字。
+    两边混在同一个汇报模板里，不说明的话现场无从判断"到底发没发"。
+    """
+    win, _cm, status_file = status_env
+    _seed_motion_presets(tmp_path)
+    _posture_status(status_file)
+    dialog = _open_posture(win, monkeypatch)
+    monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    monkeypatch.setattr(win.launcher, "set_trunk_locked", lambda locked, **kw: {
+        "ok": True,
+        "steps": [{"name": "躯干自锁（H1~H3 转为仅上电）", "sent": 1,
+                   "matched": -1, "channel": "一次性 CLI"}],
+        "reason": ""})
+
+    dialog.on_trunk_lock_action(True)
+
+    text = dialog.result.toPlainText()
+    assert "一次性 CLI" in text, f"结果区要说清走了哪条通道：{text}"
+    assert "ros2 topic pub" in text, "要让人知道这条路与手敲那条是等价的"
+
+
+def test_trunk_lock_does_not_pass_a_callback_into_the_worker_thread(status_env,
+                                                                   tmp_path,
+                                                                   monkeypatch):
+    """⚠️ **不许把 `report` 当 `on_line` 传进后台线程** —— 那是段错误。
+
+    `on_line` 是在 `LocalTaskThread` 的工作线程里被调的，而两个入口的 `report`
+    线程安全性不同：主窗口那个走 `log_signal.emit`（Qt 信号跨线程自动排队，安全），
+    **姿势控制页那个（`PostureDialog._report`）是直接碰控件**
+    （`self.result.append` / `setText`）—— Qt 控件只能在主线程动，从工作线程调
+    就是 C 层段错误。自锁有**两个入口**，其中一个就是姿势页那条。
+
+    所以这条守卫不是"断言文案"，是**钉住"不传"**：一旦有人为了显示"已切换通道"
+    那行提示把 `on_line=report` 加回来，这条就红（现场表现是偶发段错误，
+    极难复现、极难归因）。
+    """
+    import inspect
+
+    from data_collector.ui.panels import status as status_panel
+
+    source = inspect.getsource(status_panel.StatusMixin.on_trunk_lock)
+    assert "on_line=report" not in source and "on_line=sink" not in source, (
+        "不要把 report 当 on_line 传给后台线程：姿势控制页的 _report 直接碰控件，"
+        "在工作线程里调就是段错误（见这条用例的 docstring）")
+    # 那行提示该出现在**结果区**里 —— 通过读 step 的 channel 字段实现
+    assert "一次性 CLI" in inspect.getsource(
+        status_panel.StatusMixin._on_trunk_lock_done), (
+        "通道切换的提示要写在结果区（读 step['channel']），不是走 on_line")

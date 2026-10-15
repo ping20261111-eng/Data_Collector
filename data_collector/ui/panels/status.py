@@ -292,6 +292,13 @@ class StatusMixin:
         # 线程引用必须**自己留着**：`LocalTaskThread` 刻意不接收 parent（挂到窗口上当
         # 子对象，会让 Qt 在销毁窗口时连带销毁还在收尾的线程 —— 那就是 C 层段错误），
         # 所以生命周期由这里持有的引用负责。
+        #
+        # ⚠️ **刻意不传 `on_line`**：这个回调是在后台线程里被调的，而两个入口的
+        # `report` 都不保证线程安全 —— 主窗口那个走 `log_signal.emit`（安全），
+        # 但姿势控制页那个（`PostureDialog._report`）是**直接碰控件**
+        # （`self.result.append` / `setText`），Qt 控件只能在主线程动 → 段错误。
+        # 而通道切换的提示本来就可以在最终结果里说明（见 `_on_trunk_lock_done`
+        # 读 `step["channel"]`），没必要为一行字冒这个险。
         self._trunk_lock_thread = LocalTaskThread(
             lambda value=locked: self.launcher.set_trunk_locked(value))
         self._trunk_lock_thread.finished.connect(
@@ -304,9 +311,17 @@ class StatusMixin:
         """下发回报。**只报"发出去了"，不报"生效了"** —— 自锁状态读不回来。"""
         verb = "自锁" if locked else "解除自锁"
         if ok and isinstance(payload, dict) and payload.get("ok"):
-            for step in payload.get("steps") or []:
+            steps = payload.get("steps") or []
+            for step in steps:
                 report(f"    {step.get('name')}：已发 {step.get('sent', 0)} 次"
                        f"（订阅者 {step.get('matched', -1)}）")
+            # 走了哪条通道**要说出来**：常驻通道起不来时会自动改用一次性 CLI
+            # （自锁那条指令本来就是一次性的，两条路都合法）。现场看到"订阅者 -1"
+            # 会以为没发出去，其实那只是"一次性 CLI 无法统计订阅者"。
+            channels = {step.get("channel") for step in steps if step.get("channel")}
+            if "一次性 CLI" in channels:
+                report("    （本次走的是一次性 CLI：常驻通道未起，用的是与现场"
+                       "手敲等价的那条 `ros2 topic pub --once`）")
             self.trunk_lock_sent = bool(locked)
             record = ("（记录：已下发自锁 —— 再点一次即可解除）" if locked
                       else "（记录：已下发解除）")
