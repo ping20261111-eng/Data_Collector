@@ -863,11 +863,10 @@ class ExportTargetMixin(RemoteCredentialMixin):
     def _records_directly_to_disk(self, mount) -> bool:
         """本次录制的落盘目录是否就在这块盘上（判据封装在 `core.is_within` 里）。
 
-        `mount` 是**字符串**（`ed_disk_mount.text()` 的返回值），所以必须先转成
-        `Path` —— `is_within` 内部直接调 `.resolve()`，接字符串会抛
-        `AttributeError`。这个错误原先被下面的 `except` 吞成一条警告日志，
-        于是「本次录制的数据已直接写在盘上 —— 无需再导出」那行提示**从来没显示过**
-        （实测 v6.5.1 出图时日志里出现
+        `mount` 是**字符串**（`ed_disk_mount.text()` 的返回值），必须先转 `Path` ——
+        `is_within` 内部直接调 `.resolve()`，接字符串抛 `AttributeError`，而那个异常
+        被下面的 `except` 吞成一条警告日志，于是「已直接写在盘上、无需再导出」那行提示
+        **从来没显示过**（v6.5.1 出图时在日志里看到过：
         `判断录制落点是否已在盘上失败：'str' object has no attribute 'resolve'`）。
         """
         try:
