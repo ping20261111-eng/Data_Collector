@@ -60,3 +60,54 @@ def test_pack_script_excludes_logs(tmp_path):
     # 不带版本控制与缓存
     for forbidden in (".git/", "__pycache__/", ".pytest_cache/", ".ruff_cache/"):
         assert not any(forbidden in n for n in names), f"包里混进了 {forbidden}"
+
+
+# ---------- 自检本身：别让它退回"管道 + grep -q"（v6.5.0） ----------
+def test_pack_selfchecks_do_not_read_the_listing_through_a_pipe():
+    """自检**不许**写成 `tar -tzf "$TARBALL" | grep -q ...`。
+
+    这是实测踩出来的坑，不是洁癖：`grep -q` 一找到就退出，tar 立刻收到 SIGPIPE
+    并**以 2 退出**；pack.sh 开头有 `set -o pipefail`，管道状态就成了 2 ——
+    于是 `if tar | grep -q ...; then` 在**命中时反而判假**。同一个包、同一行模式实测：
+
+        无 pipefail                → 0 0 0 0 0（命中）
+        有 pipefail + 管道 + -q     → 2 2 2 2 2（也"命中"，但状态是 2）
+        先取清单再 grep（无管道）    → 0 0 0（命中）
+
+    也就是说下面几道"禁止项"防线（logs / point_labels / app_config / 副本齐全）
+    此前是**时好时坏**的：包里真带了它们也不一定报出来。改成先
+    `LIST="$(tar -tzf "$TARBALL")"` 再在 $LIST 上查，这条不许退回去。
+    """
+    text = PACK_SCRIPT.read_text(encoding="utf-8")
+    bad = [line.strip() for line in text.splitlines()
+           if "tar -tzf" in line and "| grep" in line and not line.strip().startswith("#")]
+    assert bad == [], f"自检又用管道读清单了（会因 SIGPIPE 变成时好时坏）：{bad}"
+    assert 'LIST="$(tar -tzf "$TARBALL")"' in text, "清单应当只取一次再在它上面查"
+
+
+def test_pack_requires_our_record_script_copies(tmp_path):
+    """副本缺失必须让打包**失败**（规矩 6）。
+
+    少了它们不会立刻报错，只会让起录制**静默回落**到机器侧那份脚本 —— 于是
+    "重刷后退回硬编码 → 落盘位置失效"这个坑又回来了，现场看到的仍是一句
+    "脚本启动后立即退出"。所以这道自检不能漏。
+
+    用一个**最小项目**跑 pack.sh：`PROJECT_ROOT` 是按脚本自身位置推导的，
+    所以把 pack.sh 复制到临时目录，它就会从那儿当项目根 —— 正好能造出"没有副本"的世界。
+    """
+    if not shutil.which("bash") or not shutil.which("tar"):
+        pytest.skip("环境缺少 bash/tar")
+
+    project = tmp_path / "mini_project"
+    (project / "data_collector").mkdir(parents=True)
+    (project / "data_collector" / "__init__.py").write_text(
+        '__version__ = "0.0.1"\n', encoding="utf-8")
+    shutil.copy(PACK_SCRIPT, project / "pack.sh")
+
+    completed = subprocess.run(["bash", str(project / "pack.sh"), str(tmp_path / "out")],
+                               capture_output=True, text=True, timeout=300)
+    output = completed.stdout + completed.stderr
+    assert completed.returncode == 1, f"缺副本时应当打包失败：\n{output}"
+    assert "包里缺 scripts/record_vla.sh" in output
+    assert "静默回落" in output, "失败提示要说清后果（会静默回落到机器侧那份）"
+    assert not list((tmp_path / "out").glob("*.tar.gz")), "失败时不该留下包"

@@ -1184,12 +1184,17 @@ class ConfigManager:
     def resolve_script_path(self, value: str) -> Path:
         """解析脚本路径，兼容四种配置写法：
 
-        - 绝对路径：原样使用；
+        - 绝对路径：原样使用（现场要指定别的副本时走这条）；
         - 项目内相对路径（如 scripts/record_bag.sh）：按项目根目录解析；
         - 裸文件名（如 record_bag.sh）：按统一脚本目录 scripts/ 解析；
-        - 工作空间脚本：机器人侧维护的脚本不在这里放镜像，直接用工作空间里的那份
-          （根目录如 run_nodes.sh / setup_product.sh，或 scripts/ 子目录如 record_bag.sh），
-          避免两处分叉。
+        - 工作空间脚本：run_nodes.sh / connect_sequence.py 这类**只在机器侧维护**的，
+          直接用工作空间里的那份（根目录或 scripts/ 子目录），上位机不放镜像。
+
+        候选顺序即优先级：**统一脚本目录排在工作空间之前**。所以录制脚本
+        （record_bag/vla/cmd.sh）我们自己在 `scripts/` 下维护一份，起录制用的就是它 ——
+        机器侧那三个文件不在版本控制里（重刷会退回"忽略 BAG_DIR"的老写法，落盘位置就
+        会静默失效）。机器侧那份只作派生来源与副本缺失时的回落。
+        `tests/test_record_script_copies.py` 钉住这个顺序，也钉住副本没被改坏。
         """
         if not value:
             raise ValueError("脚本配置为空")
@@ -1200,8 +1205,8 @@ class ConfigManager:
         for candidate in (PROJECT_ROOT / path, scripts_dir / path):
             if candidate.exists():
                 return candidate
-        # 机器人侧脚本真源：工作空间根目录 / 工作空间 scripts/ 目录。
-        # 用户确认"机器人侧改过的版本为准"，上位机不再维护镜像。
+        # 机器侧脚本（run_nodes.sh 等）：只在机器人工作空间里，
+        # 根目录与 scripts/ 子目录都找一遍。
         for candidate in (self.workspace / path.name,
                           self.workspace / "scripts" / path.name):
             if candidate.exists():
@@ -1502,13 +1507,18 @@ class ConfigManager:
         return self.get_configured_bag_dir()
 
     def set_record_target(self, key: str, path: Optional[Path] = None) -> None:
-        """记住本次会话选的落盘位置（`key` 见 `disk_export.LOCAL_TARGET/DISK_TARGET`）。
+        """记住本次会话选的落盘位置（`key` 见 `disk_export.record_targets`）。
 
         选「本机数据盘」时把覆盖清回 `None` —— 于是它**不会被上一次的选择黏住**，
         取值回到配置里的 `bag_dir`。
+
+        外接盘的键是 `disk:<挂载点>`（v6.5.1 起可能有多块盘，键必须能区分），
+        所以判定"是不是选了外接盘"要看**前缀**而不是 `== "disk"`。
+        （前缀写成本地常量而不引 `disk_export.DISK_TARGET`：`disk_export` 已经
+        `from .core import logger`，反向再引就是循环导入。）
         """
         self._record_target_key = str(key)
-        if key == "disk" and path is not None:
+        if str(key).startswith("disk:") and path is not None:
             self._record_dir_override = Path(path)
         else:
             self._record_dir_override = None

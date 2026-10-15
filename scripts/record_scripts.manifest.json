@@ -1,0 +1,34 @@
+{
+  "_readme": [
+    "录制脚本派生清单。scripts/ 下这三份是**真源**（在版本控制里）；",
+    "机器侧 wheeled_robot_pkg/scripts/ 下同名文件只是派生来源 + 副本缺失时的回落。",
+    "为什么要有真源：机器侧那三个文件不在版本控制里（无 .git），一次重刷就可能",
+    "把「BAG_DIR 可覆盖」退回硬编码 → 数据静默落回 /var/nerv/bag。",
+    "差异清单写在每份脚本的头注释里；tests/test_record_script_copies.py 盯住本文件。"
+  ],
+  "derived_at": "2026-10-15",
+  "refresh": "改了 scripts/record_*.sh 之后，用下面这行刷新本文件里的 our_sha256：python3 -c \"import hashlib,json,pathlib;p=pathlib.Path('scripts/record_scripts.manifest.json');d=json.loads(p.read_text(encoding='utf-8'));[r.__setitem__('our_sha256', hashlib.sha256(pathlib.Path(r['our_path']).read_bytes()).hexdigest()) for r in d['records']];p.write_text(json.dumps(d, ensure_ascii=False, indent=2)+chr(10), encoding='utf-8')\"",
+  "records": [
+    {
+      "name": "record_vla.sh",
+      "our_path": "scripts/record_vla.sh",
+      "machine_side_path": "<机器人工作空间>/scripts/record_vla.sh",
+      "our_sha256": "44c2e0b9f4490f9cc975cd6e1ff2d703161c1aedec9f8c37cef9ff39da722a15",
+      "machine_sha256_at_derivation": "44a44e330e9ebc5e1416a54d5fcfdb058160f09670aa98b66af5f91ef1c04d9b"
+    },
+    {
+      "name": "record_bag.sh",
+      "our_path": "scripts/record_bag.sh",
+      "machine_side_path": "<机器人工作空间>/scripts/record_bag.sh",
+      "our_sha256": "10691bb768370303afcfcd95d7bbe62508a898f14a214316c4d914ea01c34ea5",
+      "machine_sha256_at_derivation": "cab6a6e27da045594f6c51ade0d521cf06bcb555889efb75fa591a2c7f80b9af"
+    },
+    {
+      "name": "record_cmd.sh",
+      "our_path": "scripts/record_cmd.sh",
+      "machine_side_path": "<机器人工作空间>/scripts/record_cmd.sh",
+      "our_sha256": "541d1fffe7a29bdbc2785129a17a902ebc5994364fbfe032de0cf16b1d538b08",
+      "machine_sha256_at_derivation": "390e7158895ebb16646e010aad40b4c33ecf262a5103a365d6fae0739e4cb1ab"
+    }
+  ]
+}

@@ -438,15 +438,14 @@ def test_launcher_monitor_performance_uses_script(launcher_env):
 
 def test_launcher_record_maps_type_to_script_and_args(launcher_env):
     """录制类型 bag/vla/cmd -> record_<type>_script，名称/描述按 name=/desc= 传递。"""
-    launcher, tmp, _cfg, calls = launcher_env
-    # 真机脚本真源在工作空间 scripts/ 目录
-    (tmp / "scripts").mkdir(exist_ok=True)
-    (tmp / "scripts" / "record_vla.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    launcher, _tmp, _cfg, calls = launcher_env
 
     launcher.launch_record("vla", name="my bag", desc="first")
 
     command, _cwd = calls["background"]
-    assert f"bash {tmp / 'scripts' / 'record_vla.sh'}" in command
+    # 录制脚本的真源是**我们仓里** scripts/ 下那份（v6.5.0 起，见 ADR-002）——
+    # 它排在工作空间之前，所以工作空间里那份同名脚本不会被选中。
+    assert f"bash {PROJECT_ROOT / 'scripts' / 'record_vla.sh'}" in command
     assert "'name=my bag'" in command
     assert "desc=first" in command
     assert "export BAG_DIR=/var/nerv/bag" in command
@@ -1300,14 +1299,12 @@ def test_normalize_hand_type_maps_legacy_short_names(temp_dir):
 # ---------- 录制：标签随参数传给脚本 ----------
 def test_launcher_record_merges_label_into_desc(launcher_env):
     """真机脚本不解析 label=/action_id=，动作标签并进 desc（脚本会写进 info.json）。"""
-    launcher, tmp, _cfg, calls = launcher_env
-    (tmp / "scripts").mkdir(exist_ok=True)
-    (tmp / "scripts" / "record_bag.sh").write_text("#!/bin/bash\n", encoding="utf-8")
+    launcher, _tmp, _cfg, calls = launcher_env
 
     launcher.launch_record("bag", name="采集1", desc="演示", label="挥手", action_id=4)
 
     command, _cwd = calls["background"]
-    assert f"bash {tmp / 'scripts' / 'record_bag.sh'}" in command
+    assert f"bash {PROJECT_ROOT / 'scripts' / 'record_bag.sh'}" in command
     assert "'name=采集1'" in command
     assert "desc=演示 挥手 #4" in command          # desc + label + action_id
     assert "label=" not in command                 # 不再传 label 参数
@@ -1941,7 +1938,9 @@ def test_check_environment_flags_missing_record_script(tmp_path):
         "teleop_config_path": "t.yaml",
         "bag_dir": str(tmp_path / "bag"),
         "run_nodes_script": "run_nodes.sh",
-        "record_bag_script": "record_bag.sh",
+        # 用**绝对路径**指向那份已被删掉的脚本：裸文件名现在会命中我们仓里的真副本
+        # （v6.5.0 起录制脚本真源在本仓），"缺失"的前提得靠绝对路径才成立。
+        "record_bag_script": str(tmp_path / "scripts" / "record_bag.sh"),
         "record_vla_script": "record_vla.sh",
         "record_cmd_script": "record_cmd.sh",
     })
