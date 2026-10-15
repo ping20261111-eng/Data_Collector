@@ -1,0 +1,13 @@
+# `git archive`（"从某个提交导出交付包"用）时必须排除的文件。
+#
+## 为什么要有这个
+`pack.sh` 里已经有六条排除规矩与对应的自检，但**从 git 导出**（`git archive`）
+完全绕过 pack.sh —— 那六条一条都不生效。实测已经漏过一次：
+## `configs/point_labels.yaml`（**运行时产物**，由界面「打点 → 管理标签」维护）
+## 跟着进了包，现场一解包就覆盖掉自己维护的标签。
+##
+## 规则（`export-ignore`）只对 `git archive` 生效，不影响 `git status` / 提交。
+## 改了这份文件记得重新打包并**回读核对**清单 —— 别只信"打包成功"。
+
+# 运行时产物：每台机器自己维护，不该随包分发
+configs/point_labels.yaml export-ignore
