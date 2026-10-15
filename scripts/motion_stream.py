@@ -23,6 +23,10 @@
     # 躯干：connect → motor_mode 1 → connect，再从当前角度缓动走到目标（6 个**度**）
     python3 scripts/motion_stream.py trunk --values 30,54,24,0,0,0 --duration 2.5 --prepare
 
+    # 躯干：**只改一个轴**，其余保持脚本自己读到的当前角度（现场采数用的形态）
+    #       轴写序号或轴名；-32 超出文档量程，所以要 --force（见"安全"那节）
+    python3 scripts/motion_stream.py trunk --set 6=-32 --duration 5 --hold 3 --prepare --force
+
     # 手臂：follow_position_set=true → 125Hz 流（7 个**弧度**）→ set=false
     python3 scripts/motion_stream.py arm --side left --values 1.086,1.192,-0.394,0.389,0.551,0.302,0
 
@@ -34,9 +38,16 @@
 安全
 ----
 * **读不到当前角度就不动**（退出码 3）：没有当前值就没法插值，硬发一条目标等于全速冲刺。
+  这一条对 `--values` 与 `--set` **两种给法都成立**。
+* `--set`（只改指定轴）的目标是**脚本自己读到的那一帧当前角度** —— 其余轴因此不会动。
+  调用方不要"先自己读一遍角度再拼 6 个值发 --values"：那是两次读数，两次之间的差异会
+  变成其余轴的一次无谓运动。
+* **`--force` 会跳过量程检查**（`check_trunk_limits`）：只在该越界是**明确要求**时才给。
+  当前唯一的用处是"头部至 -32°"（文档写 H6 为 ±30°，现场采数要 -32）——
+  它由 `core_motion.HEAD_DATA_TARGET_DEG` 那一处常量供出，通用路径不带 `--force`。
 * 手臂的 `follow_position_set=false` 在 `finally` 里发 —— 少了它，`*_arm_move`（预设走的那条）会被忽略，
   表现就是"预设点了没反应"。Ctrl+C / SIGTERM 也走这个 `finally`。
-* 收到停止信号时**中止在当前角度**（不再往目标走），并如实打印。
+* 收到停止信号时中止在当前角度（不再往目标走），并如实打印。
 
 输出约定
 --------
@@ -163,6 +174,51 @@ def check_trunk_limits(values):
         if value < low or value > high:
             problems.append(f"H{index} {value:g} 超出 {low:g}~{high:g}")
     return problems
+
+
+def parse_set_axes(items, expected: int = TRUNK_AXIS_COUNT):
+    """解析 `--set`：``["5=-32"]`` / ``["H6=-32"]`` → ``({5: -32.0}, "")``。
+
+    为什么要有它（现场采数要的形态）：**只想动一个轴、其余保持当前角度**。
+    若只能用 `--values`，调用方就得先自己读一遍当前角度、再拼 6 个值发过来 ——
+    那是**两次读数**，两次之间的差异会变成其余 5 轴的一次无谓运动（读数本身还带噪声）。
+    所以让**脚本用它自己读到的那一帧**当基准：目标 = 当前，再覆写指定的轴。
+
+    轴可以写序号（1~6，与界面 H1~H6 一致）或 `H6` 这种轴名。
+    返回 ``(覆写表, 错误说明)``；出错时覆写表为 None。
+    """
+    overrides = {}
+    for item in items or []:
+        text = str(item).strip()
+        if "=" not in text:
+            return None, f"--set 要写成「轴=值」，收到 {text!r}"
+        raw_axis, raw_value = text.split("=", 1)
+        axis = raw_axis.strip().upper().lstrip("H")
+        try:
+            index = int(axis) - 1
+        except ValueError:
+            return None, f"--set 的轴要写成序号或轴名（如 6 或 H6），收到 {raw_axis!r}"
+        if not 0 <= index < expected:
+            return None, f"--set 的轴序号应在 1~{expected}，收到 {raw_axis!r}"
+        try:
+            overrides[index] = float(raw_value)
+        except ValueError:
+            return None, f"--set 的值不是数字：{raw_value!r}"
+    if not overrides:
+        return None, "--set 至少要给一项"
+    return overrides, ""
+
+
+def apply_set_axes(current, overrides) -> list:
+    """目标 = **当前角度**，再把 `overrides` 指定的轴换掉（纯函数，便于单测）。
+
+    这就是现场那句「读取现在躯干的角度 → 把 H6 改为 -32」的那一步。
+    没被覆写到的轴**原样保持当前角度**，所以它们在这一趟里不会动。
+    """
+    target = [float(item) for item in current]
+    for index, value in (overrides or {}).items():
+        target[int(index)] = float(value)
+    return target
 
 
 def stream_line(index: int, total: int, values) -> str:
@@ -349,7 +405,7 @@ def prepare_trunk(streamer, verbose: bool = False) -> list:
     streamer.spin(PREPARE_GAP)
     lines.append(f"    已把躯干切到实时模式（connect → motor_mode {TRUNK_MODE_REALTIME} → connect）")
     if verbose:
-        lines.append("    说明：实时模式的**目标由本机插值**逐条下发，控制节点不再内部插值")
+        lines.append("    说明：实时模式的目标由本机插值逐条下发，控制节点不再内部插值")
     return lines
 
 
@@ -367,7 +423,7 @@ def run_stream(streamer, publish, start, target, duration: float, rate: int,
     started = time.monotonic()
     for index in range(total + 1):
         if STOP["requested"]:
-            lines.append("    收到停止信号：**中止在当前角度**（不再往目标走）")
+            lines.append("    收到停止信号：中止在当前角度（不再往目标走）")
             break
         ratio = index / total
         publish(interpolate(start, target, ease_in_out_cubic(ratio)))
@@ -405,12 +461,13 @@ def hold_at(streamer, publish, target, seconds: float, rate: int) -> list:
 
 
 # ============ 躯干 / 手臂两条流程 ============
-def run_trunk(streamer, args, values) -> int:
-    limits = check_trunk_limits(values)
-    if limits and not args.force:
-        say("ERROR: 目标值超出量程（**没有下发**；确认无误可加 --force）："
-            + "、".join(limits))
-        return EXIT_USAGE
+def run_trunk(streamer, args, values, overrides=None) -> int:
+    if overrides is None:
+        limits = check_trunk_limits(values)
+        if limits and not args.force:
+            say("ERROR: 目标值超出量程（没有下发；确认无误可加 --force）："
+                + "、".join(limits))
+            return EXIT_USAGE
     if args.prepare:
         for line in prepare_trunk(streamer, args.verbose):
             say(line)
@@ -423,14 +480,29 @@ def run_trunk(streamer, args, values) -> int:
             "没有当前值就无法插值，**这一条没有下发**。")
         say(streamer.trunk_missing_reason())
         return EXIT_NO_DATA
+    if overrides is not None:
+        # `--set`：目标 = **脚本自己刚读到的这一帧**，只覆写指定的那几个轴。
+        # 量程检查挪到这里（此刻才知道完整的 6 个值），拦下的含义与 `--values` 那条一致。
+        target = apply_set_axes(current, overrides)
+        limits = check_trunk_limits(target)
+        if limits and not args.force:
+            say("ERROR: 目标值超出量程（没有下发；确认无误可加 --force）："
+                + "、".join(limits))
+            return EXIT_USAGE
+    else:
+        target = list(values)
+    # 报了"只改哪几个轴"——现场看到的就是这一行，不用自己去比两串数字
+    note = ("（只改 " + "、".join(f"H{index + 1}={value:g}"
+                                  for index, value in sorted(overrides.items()))
+            + "，其余保持当前角度）") if overrides is not None else ""
     say("躯干实时流：" + "、".join(f"{item:.1f}" for item in current)
-        + " → " + "、".join(f"{item:.1f}" for item in values)
-        + f"（{args.duration:g}s / {args.rate}Hz）")
+        + " → " + "、".join(f"{item:.1f}" for item in target)
+        + f"（{args.duration:g}s / {args.rate}Hz）" + note)
     started = time.monotonic()
-    for line in run_stream(streamer, streamer.publish_trunk, current, values,
+    for line in run_stream(streamer, streamer.publish_trunk, current, target,
                            args.duration, args.rate, args.verbose):
         say(line)
-    for line in hold_at(streamer, streamer.publish_trunk, values, args.hold, args.rate):
+    for line in hold_at(streamer, streamer.publish_trunk, target, args.hold, args.rate):
         say(line)
     elapsed = time.monotonic() - started
     if STOP["requested"]:
@@ -488,7 +560,10 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="kind", required=True)
 
     trunk = sub.add_parser("trunk", help="躯干实时流（6 个**度**）")
-    trunk.add_argument("--values", required=True, help="逗号分隔的 6 个关节角（度）")
+    trunk.add_argument("--values", help="逗号分隔的 6 个关节角（度）")
+    trunk.add_argument("--set", dest="set_axes", action="append", metavar="轴=值",
+                       help="只改指定轴、其余保持**当前角度**（与 --values 二选一）。"
+                            "可重复；轴写序号或轴名：--set 6=-32 或 --set H6=-32")
     trunk.add_argument("--duration", type=float, default=DEFAULT_TRUNK_SEC)
     trunk.add_argument("--hold", type=float, default=DEFAULT_HOLD)
     trunk.add_argument("--rate", type=int, default=DEFAULT_TRUNK_RATE)
@@ -521,10 +596,21 @@ def _install_signal_handlers() -> None:
 def main(argv=None, streamer_factory=None) -> int:
     args = build_parser().parse_args(argv)
     expected = TRUNK_AXIS_COUNT if args.kind == "trunk" else ARM_AXIS_COUNT
-    values, error = parse_values(args.values, expected)
-    if values is None:
-        say(f"ERROR: {error}")
-        return EXIT_USAGE
+    overrides = None
+    values = None
+    if args.kind == "trunk" and getattr(args, "set_axes", None):
+        if args.values:
+            say("ERROR: --values 与 --set 只能给一个（前者是完整目标，后者只改指定轴）")
+            return EXIT_USAGE
+        overrides, error = parse_set_axes(args.set_axes, expected)
+        if overrides is None:
+            say(f"ERROR: {error}")
+            return EXIT_USAGE
+    else:
+        values, error = parse_values(args.values, expected)
+        if values is None:
+            say(f"ERROR: {error}")
+            return EXIT_USAGE
     if not 1 <= args.rate <= MAX_RATE:
         say(f"ERROR: --rate 应在 1~{MAX_RATE}，收到 {args.rate}")
         return EXIT_USAGE
@@ -537,7 +623,7 @@ def main(argv=None, streamer_factory=None) -> int:
     streamer = factory()
     try:
         if args.kind == "trunk":
-            return run_trunk(streamer, args, values)
+            return run_trunk(streamer, args, values, overrides)
         return run_arm(streamer, args, values)
     finally:
         streamer.shutdown()

@@ -332,7 +332,7 @@ class LaunchMixin:
             risks.append(f"机器人主程序正在运行（PID {pid}）——"
                          "关掉它机器人会停机，正在进行的作业会被中断。")
         if getattr(self, "teleop_running", False):
-            risks.append("遥操作正在运行 —— 遥操作进程**不会**被这次清理关闭"
+            risks.append("遥操作正在运行 —— 遥操作进程不会被这次清理关闭"
                          "（它在放过名单里），但它依赖的机器人主节点会消失："
                          "结果是遥操作还在、机器人却不动，现场容易误判成卡死。")
         if self.recorder.is_active():

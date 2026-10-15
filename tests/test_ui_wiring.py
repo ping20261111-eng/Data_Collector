@@ -2952,7 +2952,8 @@ def test_robot_menu_wired(ui_env):
     actions = [act.text() for act in menu.actions() if act.text()]
     # 名称写全、**不带省略号**（现场 2026-09-28 要求："下拉菜单的名称补全，不要有…"）
     assert actions == ["夹爪控制", "末端参数", "姿势控制",
-                       "开始标定（自动启动节点）", "戳点", "躯干自锁", "全屏显示"]
+                       "开始标定（自动启动节点）", "戳点", "躯干自锁",
+                       "头部至 -32°（采数）", "全屏显示"]
     assert not any(act.text().endswith("…") for act in menu.actions() if act.text())
     # 分隔线代替层级：把"开窗口"、"起节点"、"直接改机构状态"、"操作窗口"四组分开
     assert sum(1 for act in menu.actions() if act.isSeparator()) == 3
@@ -7350,3 +7351,131 @@ def test_trunk_lock_does_not_pass_a_callback_into_the_worker_thread(status_env,
     assert "一次性 CLI" in inspect.getsource(
         status_panel.StatusMixin._on_trunk_lock_done), (
         "通道切换的提示要写在结果区（读 step['channel']），不是走 on_line")
+
+
+# ==================== 头部至 -32°（采数）：入口 / 确认 / 回报 ====================
+
+def test_head_to_minus32_is_reachable_from_the_robot_menu(status_env):
+    """「机器人控制 ▾」里有「头部至 -32°（采数）」—— 现场点的就是这一项。
+
+    放菜单而不是姿势控制页，是有意的：现场说「启动遥操作后点它」，而姿势控制页在
+    遥操作运行期间会挡住下发（那一页的规矩是"先停止遥操作"）。菜单项不受那个门禁。
+    """
+    win, _cm, _status_file = status_env
+    assert hasattr(win, "btn_head_minus32"), "机器人控制菜单里应当有这个动作"
+    assert win.btn_head_minus32.text() == "头部至 -32°（采数）"
+    assert win._head_stream_thread is None
+
+
+def test_head_to_minus32_asks_before_moving_and_does_nothing_on_cancel(status_env,
+                                                                      monkeypatch):
+    """**动机构的动作一律先二次确认**（与自锁 / 预设 / 整组下发同一条纪律）。
+
+    点「否」时**一个任务都不该起** —— 否则"确认框"只是摆设。
+    """
+    win, _cm, _status_file = status_env
+    lines = []
+    monkeypatch.setattr(win, "append", lambda text: lines.append(text))
+    monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.No)
+    started = []
+    monkeypatch.setattr(win.launcher, "head_to_data_position",
+                        lambda **kwargs: started.append(kwargs) or {"ok": True})
+
+    win.on_head_minus32()
+
+    assert started == [], "点了「否」就不该下发"
+    assert any("已取消" in line for line in lines), f"应当说一句已取消：{lines}"
+
+
+def test_head_to_minus32_says_when_it_is_unconfirmed(status_env, monkeypatch):
+    """拿不到退出码时窗口里要写「未经确认」——**不能写成"已到位"**（与自锁同一条）。
+
+    同时钉住**进度回调必须是主窗口的 `append`**：`on_line` 是在工作线程里被调的，
+    主窗口的 `append` 走 `log_signal.emit`（跨线程排队，安全），而姿势控制页那个
+    `_report` 是**直接碰控件** —— 从工作线程调就是段错误（v6.5.2 踩过一次）。
+    """
+    win, _cm, _status_file = status_env
+    lines = []
+    monkeypatch.setattr(win, "append", lambda text: lines.append(text))
+    _inline_task_thread(monkeypatch)
+    monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+
+    def fake_head(**kwargs):
+        assert kwargs.get("on_line") == win.append, (
+            "进度回调必须走主窗口的 append（走信号、线程安全）")
+        return {"ok": None, "axis": 6, "value": -32.0, "reason": "没有得到退出码"}
+
+    monkeypatch.setattr(win.launcher, "head_to_data_position", fake_head)
+
+    win.on_head_minus32()
+
+    joined = "\n".join(lines)
+    assert "未经确认" in joined, f"应当如实说未经确认：{joined}"
+    assert "已到位" not in joined, "拿不到退出码时不能写成已到位"
+
+
+def test_head_to_minus32_writes_the_actual_command_into_the_log(status_env, monkeypatch):
+    """走到位时的回报要**带上是哪个轴、哪个角度**（现场要能对上自己点的那一下）。"""
+    win, _cm, _status_file = status_env
+    lines = []
+    monkeypatch.setattr(win, "append", lambda text: lines.append(text))
+    _inline_task_thread(monkeypatch)
+    monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    monkeypatch.setattr(win.launcher, "head_to_data_position",
+                        lambda **kwargs: {"ok": True, "axis": 6, "value": -32.0,
+                                          "reason": ""})
+
+    win.on_head_minus32()
+
+    joined = "\n".join(lines)
+    assert "已到位" in joined and "H6" in joined and "-32" in joined, joined
+
+
+# ==================== 角度读数：丢负号那个缺陷（现场「躯干角度显示不全」） ====================
+
+def test_the_current_angle_label_can_never_lose_its_minus_sign():
+    """⚠️「当前角度」那格必须是**带省略号的截断控件**。
+
+    原先它是纯 `QLabel` + `setFixedWidth(62)` + 右对齐：文本比控件宽时 Qt 会**从左边**
+    把文本裁掉，于是
+
+        -10.093  →  显示成  0.093
+        -42.942  →  显示成  2.942
+
+    **负号消失** —— 现场照着界面读数会把负角读成正角。改成继承 `_ElidedLabel`
+    （`Qt.ElideRight`：保留左侧、省略号在右端）之后，超宽时丢的是**小数位**，
+    符号永远在，而且看得出被截断了（不是静默丢字符）。
+    """
+    from data_collector.ui.posture_widgets import _ClickLabel, _ElidedLabel
+
+    assert issubclass(_ClickLabel, _ElidedLabel), (
+        "「当前」那格必须可截断：纯 QLabel + 固定宽 + 右对齐时 Qt 会从左边裁掉负号")
+    label = _ClickLabel("初始")
+    assert hasattr(label, "double_clicked"), "「双击取当前值」那个功能不能丢"
+    assert hasattr(label, "fullText"), "完整读数要能取到（悬停提示用）"
+
+
+def test_the_angle_column_width_is_computed_from_the_widest_literal(qapp):
+    """「当前 / 目标」两格的宽度**按字体度量算**，装得下最宽的字面量（`-150.0929`）。
+
+    硬编码 62 / 74 的毛病是"不跟字号"：这一页的行高与卡片高都跟着 `theme.ui_scale()`
+    放大，而这两个宽度不跟 —— 字号一大就装不下 `-42.942`，Qt 从左边裁掉、负号消失。
+    所以宽度改成 `angle_column_width()` 现算，这里钉住"算出来的确实装得下"。
+    """
+    from PyQt5.QtWidgets import QLabel
+
+    from data_collector.ui import posture_widgets as pw
+
+    probe = QLabel()
+    needed = probe.fontMetrics().horizontalAdvance(pw.ANGLE_WIDEST_TEXT)
+    for base in (62, 74):
+        width = pw.angle_column_width(probe, base)
+        assert width >= needed, (
+            f"基准 {base} 下算出的宽度 {width} 装不下 {pw.ANGLE_WIDEST_TEXT}（需要 {needed}）")
+        assert width >= pw.scaled(base), "不该比原来的硬编码宽度更窄"
+    assert pw.ANGLE_WIDEST_TEXT == "-150.0929", (
+        "最宽字面量由 `fmt_number(round(v, 4))` 与 H2 的 ±150 量程推出："
+        "负号 + 3 位整数 + 小数点 + 4 位小数")

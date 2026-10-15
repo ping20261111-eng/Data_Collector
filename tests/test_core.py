@@ -4100,3 +4100,106 @@ def test_trunk_lock_settle_matches_the_bridge_constant():
     assert float(match.group(1)) == core_motion.TRUNK_LOCK_SETTLE, (
         f"两条通道的自锁等待不一致：通道 {match.group(1)}s vs "
         f"兜底 {core_motion.TRUNK_LOCK_SETTLE}s")
+
+
+# ==================== 【采数】头部至 -32°：job 形状与"越界只在这一处" ====================
+# 现场 2026-10-15：点一下把 H6 走到 -32°，其余轴保持当前角度。
+# 目标 -32 超出文档量程（H6 写的是 ±30），所以这个 job 带 force —— 下面既钉 job 形状，
+# 也钉"文档量程没被顺手放宽"。
+
+
+def test_stream_job_args_uses_set_instead_of_values_for_a_single_axis_job():
+    """只改一个轴的 job 拼成 `--set 6=-32`，**不拼 `--values`**。
+
+    两种给法互斥（见 `motion_stream.parse_set_axes`）。拼错了就会走"完整目标"那条路，
+    而那条路要求 6 个值 —— 一旦为它填 0，其余 5 轴就跟着冲向 0°（采数前的定位动作
+    会变成一次全身大动作）。
+    """
+    from data_collector import core_motion
+
+    job = {"kind": "trunk", "side": None, "values": None, "set_axes": {5: -32.0},
+           "duration": 5.0, "hold": 3.0, "rate": 100, "force": True}
+    args = core_motion.stream_job_args(job)
+    assert "--values" not in args, f"set_axes 的 job 不该拼 --values：{args}"
+    assert args[args.index("--set") + 1] == "6=-32", f"--set 的写法不对：{args}"
+    assert "--force" in args, "越界的 job 必须带 --force（否则脚本会把它拦下）"
+    assert args[0] == "trunk"
+    assert "--prepare" in args and "--hold" in args
+
+
+def test_stream_job_args_values_path_is_unchanged():
+    """既有的 `values` 路径**一字不变**（回归守卫）：加新参数不能改到老行为。"""
+    from data_collector import core_motion
+
+    job = {"kind": "trunk", "side": None, "values": [55.0, 100.0, 45.0, 0.0, 0.0, 0.0],
+           "duration": 2.5, "hold": 0.8, "rate": 100}
+    args = core_motion.stream_job_args(job)
+    assert "--set" not in args
+    assert "--force" not in args, "默认不该带 --force"
+    assert args[args.index("--values") + 1] == "55,100,45,0,0,0"
+
+
+def test_head_to_data_position_builds_a_single_axis_forced_job(tmp_path, monkeypatch):
+    """`head_to_data_position` 的 job：**只改 H6 → -32**，并带 `force`。"""
+    from data_collector import core_motion, core_operations
+
+    launcher, _sent, _slept, _cm = _trunk_lock_launcher(tmp_path, monkeypatch)
+    captured = {}
+
+    def fake_streams(_self, jobs, on_line=None, is_aborted=None, timeout=None):
+        # 第一个参数是 `self`：`run_motion_streams` 是实例方法，把普通函数 setattr 到
+        # 类上之后照样按描述符绑定 —— 漏了它会报
+        # `got multiple values for argument 'on_line'`（上次做自锁兜底时也踩过同一处）。
+        captured["jobs"] = list(jobs)
+        return {core_motion.stream_job_key(job): True for job in jobs}
+
+    monkeypatch.setattr(core_operations.Launcher, "run_motion_streams",
+                        fake_streams, raising=True)
+
+    result = launcher.head_to_data_position()
+
+    assert result["ok"] is True
+    assert result["axis"] == core_motion.HEAD_DATA_AXIS_INDEX + 1 == 6
+    assert result["value"] == core_motion.HEAD_DATA_TARGET_DEG == -32.0
+    job = captured["jobs"][0]
+    assert job["kind"] == "trunk"
+    assert job["set_axes"] == {5: -32.0}, f"应当只改 H6：{job['set_axes']}"
+    assert job["values"] is None, "不许同时给完整目标（那会把其余轴带向 0）"
+    assert job["force"] is True, "越界必须带 force，否则脚本会拦下"
+    assert (job["duration"], job["hold"], job["rate"]) == (
+        core_motion.HEAD_DATA_DURATION_SEC, core_motion.HEAD_DATA_HOLD_SEC,
+        core_motion.HEAD_DATA_RATE)
+
+
+def test_head_to_data_position_reports_unconfirmed_when_there_is_no_exit_code(
+        tmp_path, monkeypatch):
+    """拿不到退出码 → **如实报"未经确认"**，不写成"已到位"（与自锁同一条纪律）。"""
+    from data_collector import core_motion, core_operations
+
+    launcher, _sent, _slept, _cm = _trunk_lock_launcher(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        core_operations.Launcher, "run_motion_streams",
+        lambda _self, jobs, **kwargs: {core_motion.stream_job_key(job): None
+                                       for job in jobs},
+        raising=True)
+
+    result = launcher.head_to_data_position()
+
+    assert result["ok"] is None
+    assert "未经确认" in result["reason"]
+
+
+def test_the_head_target_is_the_only_place_that_exceeds_the_documented_range():
+    """**越界只允许在"头部至 -32°"这一处**：轴表仍是文档量程（H6 为 -30~30）。
+
+    这条守的是"越界只拦下、不静默钳位"那条纪律不被悄悄放宽 —— 有人为了让 -32 通过，
+    顺手把 `TRUNK_AXES` 的 H6 下限改成 -35 的话，**通用路径**（手动输入 / 预设 / 整组下发）
+    就一起越界了，而那条路上没有任何理由去动超出机构文档的行程。
+    """
+    from data_collector import core_motion
+
+    h6 = [item for item in core_motion.TRUNK_AXES if item[0] == "H6"][0]
+    assert (h6[1], h6[2]) == (-30.0, 30.0), "H6 的量程应当仍是文档写的 ±30"
+    assert core_motion.HEAD_DATA_TARGET_DEG == -32.0
+    assert core_motion.HEAD_DATA_TARGET_DEG < h6[1], (
+        "这个动作之所以要 force，正因为目标低于文档下限 —— 两者必须同时成立")

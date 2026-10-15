@@ -200,8 +200,20 @@ class _ElidedLabel(QLabel):
             self._applying = False
 
 
-class _ClickLabel(QLabel):
-    """双击可点的标签（"当前"那一格：双击 = 把这个值取到目标）。"""
+class _ClickLabel(_ElidedLabel):
+    """双击可点的标签（"当前"那一格：双击 = 把这个值取到目标）。
+
+    **v6.5.3 起继承 `_ElidedLabel`**（原先直接继承 `QLabel`）。原因是一处会误导读数的
+    缺陷（现场报「躯干角度显示不全」）：纯 QLabel 配上 `setFixedWidth` + 右对齐时，
+    文本比控件宽的部分会被 Qt **从左边裁掉** —— 于是
+
+        -10.093  →  显示成  0.093
+        -42.942  →  显示成  2.942
+
+    **负号被吃掉**，读数会被反着理解（这在"照着界面填目标值"的场景里是直接的错误来源）。
+    继承 `_ElidedLabel` 之后走 `Qt.ElideRight`：保留左侧（负号 + 整数部分）、省略号在右端，
+    既**保得住符号**、又**看得出被截断了**（不是静默丢字符）。
+    """
 
     double_clicked = pyqtSignal()
 
@@ -255,7 +267,11 @@ class AxisRow(QFrame):
 
         self.current_label = _ClickLabel(UNKNOWN)
         self.current_label.setObjectName("AxisAngle")
-        self.current_label.setFixedWidth(62)
+        # 宽度**按当前字体度量算**，不再写死 62（v6.5.3）：写死的话，字号随
+        # `theme.ui_scale()` 放大之后 `-42.942` 就装不下，Qt 会**从左边**裁掉文本、
+        # 负号消失（现场报的「躯干角度显示不全」就是这个）。
+        theme.repolish(self.current_label)          # 先把 QSS 落到字体上，再量宽度
+        self.current_label.setFixedWidth(angle_column_width(self.current_label, 62))
         self.current_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.current_label.setToolTip("机器人侧 state 话题报的当前角度（不是目标值）；"
                                       "双击 = 把它取到目标")
@@ -269,7 +285,10 @@ class AxisRow(QFrame):
         line.addWidget(arrow)
 
         self.edit = TargetEdit()
-        self.edit.setFixedWidth(74)
+        # 与"当前"那一格同一套宽度（目标值也是同一批字面量 —— 现场会填 `-32` 这类负数，
+        # 同样是硬编码 74 在放大字号下装不下的问题）
+        theme.repolish(self.edit)
+        self.edit.setFixedWidth(angle_column_width(self.edit, 74))
         # 无障碍：屏幕阅读器读到的是"L4 目标角度"，不是"一个只读编辑框"
         self.edit.setAccessibleName(f"{self.key} 目标角度")
         self.edit.setAccessibleDescription(
@@ -669,3 +688,29 @@ def scaled(value: int) -> int:
     于是开发机与既有守卫量的都还是 214 / 124 / 60。
     """
     return max(1, round(value * theme.ui_scale()))
+
+
+#: 读数那一格要放得下的**最坏情况字面量**。读数是 `fmt_number(round(v, 4))` 出来的，
+#: 最长形态就是"负号 + 3 位整数 + 小数点 + 4 位小数"—— 躯干 H2 的量程是 ±150，
+#: 所以是 `-150.0929`（9 个字符）。宽度只跟**字体**有关，与当时的具体数值无关。
+ANGLE_WIDEST_TEXT = "-150.0929"
+
+
+def angle_column_width(widget, base: int) -> int:
+    """「当前 / 目标」这两格该多宽：按**当前字体**量最宽的字面量，再套 `scaled()`。
+
+    为什么不能硬编码（v6.5.3 修的缺陷）：这一页的行高、卡片高都跟着
+    `theme.ui_scale()` 一起放大，而 `setFixedWidth(62)` / `setFixedWidth(74)` 这种
+    硬编码**不跟** —— 字号一大，`-42.942` 就装不下，Qt 会**从左边**把文本裁掉：
+
+        -42.942  →  2.942      -10.093  →  0.093      （负号消失）
+
+    现场报的「躯干角度显示不全」就是这个。修法有两层：宽度按字体度量算（这里），
+    以及控件本身改成带省略号的截断（`_ClickLabel`）—— 后者保证**即使还装不下，
+    也绝不会把负号丢掉**。
+
+    `base` 是原硬编码的基准值，用 `max` 兜住：新算出来的只会比它宽，不会更窄。
+    """
+    metrics = widget.fontMetrics()
+    needed = metrics.horizontalAdvance(ANGLE_WIDEST_TEXT) + scaled(10)
+    return max(scaled(base), needed)

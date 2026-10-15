@@ -1310,6 +1310,136 @@ def test_motion_stream_limits_and_rate_match_the_robot_side_sources(stream_modul
         assert round(1000 / 8) == stream_module.DEFAULT_ARM_RATE
 
 
+# ==================== 【采数】头部至 -32°：只改一个轴 ====================
+# 现场 2026-10-15 的要求：点一下把 H6 走到 -32°，**其余轴保持当前角度**。
+# 做法是给 `motion_stream.py` 加了 `--set`（目标 = 脚本自己读到的当前角度 + 覆写指定的轴），
+# 而不是让上位机先读一遍角度、再拼 6 个值发 `--values` —— 那是两次读数，两次之间的差异
+# 会变成其余 5 轴的一次无谓运动。下面这几条盯的就是"其余轴真的不动"与"读不到就别动"。
+
+class _HeadStreamRecorder:
+    """只记录、不做任何 IO 的 streamer 替身（`main(..., streamer_factory=...)` 用）。"""
+
+    def __init__(self, current=(55.0, 100.0, 45.0, 0.0, 0.0, 0.0)):
+        self.current = None if current is None else list(current)
+        self.trunk_targets = []          # 只记 `publish_trunk`（prepare 的 bool/byte 不算目标）
+        self.other = []
+
+    def start_listening(self):
+        pass
+
+    def wait_trunk(self, timeout=0):
+        return None if self.current is None else list(self.current)
+
+    def spin(self, seconds):
+        pass
+
+    def publish_trunk(self, values):
+        self.trunk_targets.append([float(item) for item in values])
+
+    def publish_bool(self, topic, value):
+        self.other.append(("bool", topic, value))
+
+    def publish_byte(self, topic, value):
+        self.other.append(("byte", topic, value))
+
+    def trunk_missing_reason(self):
+        return "（替身）读不到当前角度"
+
+    def shutdown(self):
+        pass
+
+
+def test_apply_set_axes_keeps_every_other_axis_at_the_current_value(stream_module):
+    """目标 = 当前角度，**只有被点名的轴变** —— 这就是"只动 H6"这句话的全部含义。
+
+    这条守卫的价值在反例：若把目标误写成"只有被改的轴有值、其余填 0"，躯干 H1~H5 会一起
+    冲向 0°（脚踝 / 膝 / 大腿 / 腰 / 颈全动）—— 采数前的一次定位动作会变成一次全身大动作。
+    所以逐轴断言"没被点名的轴与当前值**完全相等**"。
+    """
+    current = [55.0, 100.0, 45.0, 0.0, 0.0, 7.5]
+    target = stream_module.apply_set_axes(current, {5: -32.0})
+    assert target == [55.0, 100.0, 45.0, 0.0, 0.0, -32.0]
+    assert target[:5] == current[:5], "没被点名的轴必须原样保持当前角度"
+    assert current == [55.0, 100.0, 45.0, 0.0, 0.0, 7.5], "不该改动入参（纯函数）"
+
+
+def test_parse_set_axes_accepts_index_and_axis_name(stream_module):
+    """轴写 `6` 或 `H6` 都认（现场手敲这两种写法都会用）；写错要给出原因。"""
+    assert stream_module.parse_set_axes(["6=-32"]) == ({5: -32.0}, "")
+    assert stream_module.parse_set_axes(["H6=-32"]) == ({5: -32.0}, "")
+    assert stream_module.parse_set_axes(["h6=-32"]) == ({5: -32.0}, "")
+    assert stream_module.parse_set_axes(["1=10", "6=-32"]) == ({0: 10.0, 5: -32.0}, "")
+    for bad in ("6", "0=-32", "7=-32", "X=-32", "6=abc", ""):
+        overrides, error = stream_module.parse_set_axes([bad])
+        assert overrides is None, f"{bad!r} 应当被判为不合法"
+        assert error, f"{bad!r} 应当给出人能看懂的原因"
+
+
+def test_main_set_mode_refuses_out_of_range_without_force(stream_module, capsys):
+    """-32 超出文档量程（H6 是 ±30）→ **不给 `--force` 就拦下，一个值都不发**。
+
+    守的是"越界只拦下、不静默钳位"那条纪律在新加的 `--set` 这条路上同样成立
+    （新参数最容易只做对 happy path）。`--force` 的唯一用处见
+    `core_motion.HEAD_DATA_TARGET_DEG`。
+    """
+    streamer = _HeadStreamRecorder()
+    code = stream_module.main(
+        ["trunk", "--set", "6=-32", "--duration", "1", "--rate", "100"],
+        streamer_factory=lambda: streamer)
+    assert code == stream_module.EXIT_USAGE, "越界没被拦下"
+    assert streamer.trunk_targets == [], "越界时一个目标值都不该发出去"
+    assert "超出量程" in capsys.readouterr().out
+
+
+def test_main_set_mode_walks_from_the_current_angle_and_moves_only_that_axis(stream_module):
+    """带 `--force` 时：起点 = **脚本读到的当前角度**，终点 = 目标，**其余轴全程不动**。
+
+    这就是现场那句「读取现在躯干的角度，写入 start_position，然后将 H6 改为 -32」。
+    """
+    current = [55.0, 100.0, 45.0, 0.0, 0.0, 0.0]
+    streamer = _HeadStreamRecorder(current=current)
+    code = stream_module.main(
+        ["trunk", "--set", "6=-32", "--duration", "0.2", "--rate", "100",
+         "--hold", "0", "--prepare", "--force"],
+        streamer_factory=lambda: streamer)
+    assert code == stream_module.EXIT_OK
+    targets = streamer.trunk_targets
+    assert targets, "应当发出目标"
+    assert targets[0] == current, f"起点必须是当前角度：{targets[0]}"
+    assert targets[-1] == [55.0, 100.0, 45.0, 0.0, 0.0, -32.0], \
+        f"终点必须是目标：{targets[-1]}"
+    for frame in targets:
+        assert frame[:5] == current[:5], f"没被点名的轴动了：{frame}"
+    # `--prepare` 必须真的做了（connect → motor_mode 1 → connect）
+    assert [item[:2] for item in streamer.other].count(("bool", "/trunk_control/connect")) == 2
+    assert ("byte", "/trunk_control/motor_mode") in [item[:2] for item in streamer.other]
+
+
+def test_main_set_mode_does_not_move_anything_when_the_current_angle_is_unreadable(stream_module):
+    """读不到当前角度 → **一个值都不发**（退出码 3）。`--set` 这条路同样要守住它。
+
+    这条在 `--set` 下比 `--values` 下更要紧：`--set` 的目标是"当前角度 + 覆写"，
+    读不到当前值就连目标都构造不出来，那时候最坏的做法是拿 0 当基准往下发。
+    """
+    streamer = _HeadStreamRecorder(current=None)
+    code = stream_module.main(
+        ["trunk", "--set", "6=-32", "--duration", "1", "--force"],
+        streamer_factory=lambda: streamer)
+    assert code == stream_module.EXIT_NO_DATA
+    assert streamer.trunk_targets == [], "读不到当前角度时必须一个值都不发"
+
+
+def test_main_rejects_values_and_set_together(stream_module, capsys):
+    """`--values` 与 `--set` **二选一**：同时给要报错，不能猜用户想要哪个。"""
+    streamer = _HeadStreamRecorder()
+    code = stream_module.main(
+        ["trunk", "--values", "0,0,0,0,0,0", "--set", "6=-32", "--force"],
+        streamer_factory=lambda: streamer)
+    assert code == stream_module.EXIT_USAGE
+    assert streamer.trunk_targets == []
+    assert "只能给一个" in capsys.readouterr().out
+
+
 # ---------- ros_command_bridge.py（常驻命令通道）----------
 @pytest.fixture
 def bridge_module(monkeypatch):

@@ -37,7 +37,12 @@ TEXT_CLASSES = {"QLabel", "QMessageBox", "QInputDialog", "append", "show_error",
 #: （是个 f-string，星号不在里面），所以 `_report("运动方式：**非实时模式**…")` 从缝里
 #: 漏了过去，现场在日志里看到一对星号。落点名单必须覆盖"最后一跳"。
 #: `_note` = `MotionRunner` 的口子（它把每个判据拼成人话传给 `progress`）。
-TEXT_SINKS = {"_report", "_note"}
+#: **v6.5.3 补 `append`**：日志区那条路的最后一跳就是 `self.append(...)`，而
+#: `_is_text_call` 对属性调用的判定是"`func.attr` 在清单里" —— `append` 原先不在，
+#: 于是 `self.append("…**未确认**…")` **整类躲过了扫描**。
+#: 实测漏掉的后果：`_on_head_minus32_done` 与 `launch.py` 的清理风险提示都带着一对
+#: 星号显示给现场（日志区是 `QTextEdit`，不渲染 markdown，只显示字面的 `**`）。
+TEXT_SINKS = {"_report", "_note", "append"}
 
 
 def _literal_parts(node) -> str:

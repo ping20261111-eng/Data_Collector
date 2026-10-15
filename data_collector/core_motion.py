@@ -144,6 +144,23 @@ TRUNK_STREAM_SEC = 2.5
 ARM_STREAM_SEC = 1.6
 #: 躯干到位后按目标保持多久（秒）：p2-p3.py 是 3s，这里取"够控制器收敛"即可
 TRUNK_HOLD_SEC = 0.8
+
+# ============ 【采数专用】头部走到 -32°（现场 2026-10-15 要求） ============
+#: 要动的轴：**H6（颈 · 抬头）**，0 基下标 5。
+#: 与 `TRUNK_AXES` 的顺序一致（脚踝 / 膝 / 大腿 / 腰 / 颈转 / 颈抬）。
+HEAD_DATA_AXIS_INDEX = 5
+#: 目标角度（度）。**超出 SDK 文档写的 H6 量程下限 -30°** —— 这是现场采数要的位姿，
+#: 现场脚本（`to-32.py`，用户提供）里就是 `target_position = [..., -32.0]` 并已实测在用，
+#: 所以这个任务的 job 带 `force=True` 跳过量程检查。
+#: ⚠️ 只有**这一个动作**允许越界；通用下发路径（轴表 / 预设 / 手动输入）仍是文档量程，
+#: 「越界只拦下、不静默钳位」那条纪律不变。
+HEAD_DATA_TARGET_DEG = -32.0
+#: 运动时长 / 频率 / 到位后保持（秒，Hz，秒）—— 三个数逐字取自现场脚本
+#: （`duration = 5.0` / `control_rate = 100` / `hold_time = 3.0`）。
+#: 时长给到 5s（而不是躯干预设用的 2.5s）：这是采数前的定位动作，稳比快重要。
+HEAD_DATA_DURATION_SEC = 5.0
+HEAD_DATA_RATE = 100
+HEAD_DATA_HOLD_SEC = 3.0
 #: 等一条实时流结束的上限（秒）：时长 + 保持 + 脚本启动与 DDS 发现的开销
 STREAM_TIMEOUT_PAD = 25.0
 #: 手臂实时流（follow_position）话题：`_set` 是 Bool 开关，`_update` 是 7 弧度的
@@ -310,20 +327,44 @@ def stream_job_topic_values(job: dict) -> List[float]:
     实时流脚本**不做任何单位换算**（它只管把 `--values` 原样发到话题字段上）——
     "度 → 弧度"这件事只在 `core_motion` 这一层发生一次（模块 docstring 第 1 条）。
     """
+    if job.get("set_axes"):
+        # 只改指定轴的任务（`--set`）：目标由**脚本自己读到的当前角度**构造，
+        # 上位机这一侧根本没有完整的那 6/7 个值可给。返回空表而不是抛异常，
+        # 同时 `stream_job_args` 在这种任务上也不会走"拼 --values"那条分支。
+        return []
     if job["kind"] == "trunk":
         return list(job["values"])              # 躯干话题就是"度"
     return deg_to_radians(job["values"])        # 手臂 follow_position 是"弧度"
 
 
 def stream_job_args(job: dict) -> List[str]:
-    """拼成 `motion_stream.py` 的位置参数（不含脚本路径本身）。"""
-    args = [job["kind"], "--values",
-            ",".join(fmt_number(v) for v in stream_job_topic_values(job)),
-            "--duration", fmt_number(job["duration"]), "--rate", str(int(job["rate"]))]
+    """拼成 `motion_stream.py` 的位置参数（不含脚本路径本身）。
+
+    两种给目标的方式（**二选一**，解析在 `motion_stream.parse_set_axes`）：
+
+    * `values`：完整目标（躯干 6 个度 / 手臂 7 个弧度）—— 既有用法，行为不变；
+    * `set_axes`：``{轴下标: 值}``，**其余轴保持脚本自己读到的那一帧当前角度**。
+      用于"只想动一个轴"（如头部到 -32°）—— 调用方不必先读一遍角度再拼 6 个值，
+      否则两次读数之间的差异会变成其余轴的一次无谓运动。
+
+    ``force=True`` 会带上 `--force` 跳过脚本的量程检查：**只有明确要越界时才给**
+    （当前只有"头部至 -32°"一处，见 `HEAD_DATA_TARGET_DEG`）。默认不带。
+    """
+    args = [job["kind"], "--duration", fmt_number(job["duration"]),
+            "--rate", str(int(job["rate"]))]
+    overrides = job.get("set_axes")
+    if overrides:
+        for index, value in sorted(overrides.items()):
+            args += ["--set", f"{int(index) + 1}={fmt_number(value)}"]
+    else:
+        args += ["--values",
+                 ",".join(fmt_number(item) for item in stream_job_topic_values(job))]
     if job["kind"] == "arm":
         args += ["--side", job["side"]]
     else:
         args += ["--hold", fmt_number(job["hold"]), "--prepare"]
+    if job.get("force"):
+        args.append("--force")
     return args
 
 

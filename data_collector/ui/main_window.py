@@ -125,6 +125,9 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         # 语义是「下发过什么」，不是「现在是不是自锁」：ROS 侧没有自锁状态话题。
         self.trunk_lock_sent = None
         self._trunk_lock_thread = None               # 自锁下发的后台线程（见 status.py）
+        # 头部至 -32°（采数）的后台线程，与自锁同一条理由：引用自己留着，
+        # `LocalTaskThread` 刻意不接收 parent（见 status.py / threads.py 的说明）。
+        self._head_stream_thread = None
 
         # 连接信号
         self.progress_signal.connect(self.update_progress_label)
