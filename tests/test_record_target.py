@@ -23,6 +23,7 @@
 import os
 import sys
 from pathlib import Path
+from typing import List
 
 import pytest
 
@@ -49,19 +50,54 @@ def qapp():
     yield QApplication.instance() or QApplication([])
 
 
+def _fake_volume(path, **overrides) -> de.MountedVolume:
+    """把一个目录伪装成"枚举到的外接盘"。"""
+    fields = dict(path=Path(path), label=Path(path).name, fs="ext4",
+                  total_bytes=512 * 1024 ** 3, free_bytes=500 * 1024 ** 3)
+    fields.update(overrides)
+    return de.MountedVolume(**fields)
+
+
+#: 本次用例里"插着"的盘。`_usb()` 建目录时登记、`mounted_disk` 夹具桩枚举时读取。
+#: 用清单而不是参数传递，是为了**不改动 17 个用例的签名** —— 它们本来就只写
+#: `_usb(tmp_path)` 就期待"这块盘插着"，把"插盘"这件事变成必须显式表达的参数
+#: 只会让每条用例多一行与被测行为无关的样板。
+PLUGGED: List[Path] = []
+
+
 @pytest.fixture
 def mounted_disk(monkeypatch):
-    """把 `is_mounted` 放行 —— 沙箱里造不出真挂载点。
+    """把 `_usb()` 建出来的目录当成"插着的移动硬盘"（沙箱里造不出真挂载点）。
 
-    `has_volume_marker()` 不打桩（它是普通的"文件在不在"），这样"插了但不是数据盘"
-    这条分支仍然走真实实现。
+    ## v6.5.1 为什么桩的是 `list_removable_mounts` 而不是 `is_mounted`
+
+    候选落点改成从**枚举结果**里挑盘之后，`DiskExportTarget.is_mounted` 那一层
+    压根不会被问到 —— 只桩它的话"插着盘"这个前提根本不成立，一大批用例会一起红，
+    而且红得看不出真实原因。桩枚举入口之后：
+    ① "插盘 / 拔盘"能被精确控制；
+    ② 不再依赖**跑测试的那台机器碰巧插没插盘**（这条很重要：不桩枚举的话，
+       开发机上插着移动硬盘会让"没插盘"的用例反向失效）。
+
+    `is_mounted` 那一层仍然要桩：导出侧的 `check_volume` 查的是 `DiskExportTarget`
+    （不查枚举），沙箱里造不出真挂载点。
     """
+    PLUGGED.clear()
     monkeypatch.setattr(de.DiskExportTarget, "is_mounted", lambda self: True)
+    monkeypatch.setattr(de, "list_removable_mounts",
+                        lambda configured="": [_fake_volume(p) for p in PLUGGED])
+    yield
+    PLUGGED.clear()
 
 
 @pytest.fixture
 def unmounted_disk(monkeypatch):
+    """枚举得到盘，但 `is_mounted` 判假 —— 目录在、盘没挂（路径撞名的陷阱）。"""
+    PLUGGED.clear()
     monkeypatch.setattr(de.DiskExportTarget, "is_mounted", lambda self: False)
+    monkeypatch.setattr(de, "list_removable_mounts",
+                        lambda configured="": [_fake_volume(p) for p in PLUGGED])
+    yield
+    PLUGGED.clear()
 
 
 def _mgr(tmp_path, mount=None, marker=MARKER, require_marker=True,
@@ -79,10 +115,13 @@ def _mgr(tmp_path, mount=None, marker=MARKER, require_marker=True,
 
 
 def _usb(tmp_path, with_marker=True):
+    """造一个"插着的移动硬盘"目录（并登记到 `PLUGGED`，供枚举桩读取）。"""
     usb = tmp_path / "usb"
     usb.mkdir(exist_ok=True)
     if with_marker:
         (usb / MARKER).write_text("ok", encoding="utf-8")
+    if usb not in PLUGGED:
+        PLUGGED.append(usb)
     return usb
 
 
@@ -99,54 +138,81 @@ def test_disk_target_points_into_the_disk_with_serial_and_date(tmp_path, mounted
     assert span[1] == de.capture_date(None), "日期应当是今天（本次采集还没发生）"
 
 
-def test_missing_mount_point_is_reported_verbatim(tmp_path):
-    """没配挂载点 → 说明指向配置项本身，不是含糊的"不可用"。"""
-    target = de.disk_record_target(_mgr(tmp_path, mount=None))
-    assert not target.available
-    assert "disk_export.mount_point" in target.reason
+def test_missing_mount_point_is_reported_verbatim(tmp_path, mounted_disk):
+    """没配挂载点、也没插盘 → 说清"插上即自动识别"，**不再要求人去填路径**。
+
+    v6.5.1 起「没配 `mount_point`」是**正常配置**（推荐做法），所以这条断言的方向
+    变了：旧文案是"请在 app_config.yaml 的 mount_point 填入实际挂载点"—— 那等于
+    把问题绕回原点（挂载点由系统按卷标生成，换盘就变，抄不准是必然的）。
+    """
+    # 用 `disk_record_targets`（列全部）而不是 `disk_record_target`（只给"第一个可用"）：
+    # 后者没有可用盘时返回 None，**拿不到那句"没插盘"的话术**，而话术才是这条要验的。
+    targets = de.disk_record_targets(_mgr(tmp_path, mount=None))
+    assert len(targets) == 1
+    assert not targets[0].available
+    assert "未检测到移动硬盘" in targets[0].reason
+    assert "自动识别" in targets[0].reason
 
 
-def test_absent_disk_reports_not_detected(tmp_path):
-    """挂载点目录不存在（没插盘）→ 说"未检测到"，而不是"路径错误"。"""
-    target = de.disk_record_target(_mgr(tmp_path, mount=tmp_path / "nope"))
-    assert not target.available
-    assert "未检测到移动硬盘" in target.reason
+def test_absent_disk_reports_not_detected(tmp_path, mounted_disk):
+    """配置里那块盘现在没插着（枚举不到）→ 说"未检测到"，而不是"路径错误"。
+
+    **注意前提**：v6.5.1 之后判定看的是**枚举结果**，不是"配置里那个目录在不在"。
+    所以"配置写着某路径"不再意味着"这块盘会被用上" —— 枚举不到就是没插盘。
+    """
+    targets = de.disk_record_targets(_mgr(tmp_path, mount=tmp_path / "nope"))
+    assert len(targets) == 1 and not targets[0].available
+    assert "未检测到移动硬盘" in targets[0].reason
 
 
 def test_plain_directory_is_not_treated_as_a_disk(tmp_path, unmounted_disk):
-    """路径存在但不是挂载点 → 必须拦住。
+    """枚举得到它（目录在），但 `is_mounted` 判假 → 仍然必须拦住。
 
-    这是最容易骗过人的一种：目录在、能写，但盘根本没挂载，数据会落在本机磁盘上。
+    这是最容易骗过人的一种：目录在、能写、能通过枚举，但盘根本没挂载 ——
+    数据会落在本机磁盘上，而界面显示"移动硬盘"。
     """
     plain = tmp_path / "plain"
     plain.mkdir()
     (plain / MARKER).write_text("ok", encoding="utf-8")
-    target = de.disk_record_target(_mgr(tmp_path, mount=plain))
-    assert not target.available
-    assert "不是已挂载的设备目录" in target.reason
+    PLUGGED.append(plain)
+    # 枚举已经放行了；拦住它的是"必须是真挂载点"这一层。
+    # 断言"无可用盘"而不是去匹配具体措辞：措辞会随文案调整变，但"必须拦住"不会。
+    assert de.disk_record_target(_mgr(tmp_path, mount=plain)) is None, (
+        "目录在但盘没挂载时绝不能当成可用移动硬盘（数据会落在本机盘上）")
+    targets = de.disk_record_targets(_mgr(tmp_path, mount=plain))
+    assert len(targets) == 1 and not targets[0].available
 
 
 def test_wrong_disk_is_rejected_by_the_marker(tmp_path, mounted_disk):
     """插了但不是数据盘（缺标识）→ 拦住并点出标识文件 —— 与导出同一条规则。"""
     usb = _usb(tmp_path, with_marker=False)
-    target = de.disk_record_target(_mgr(tmp_path, mount=usb))
-    assert not target.available
-    assert "不是数据盘" in target.reason and MARKER in target.reason
+    assert de.disk_record_target(_mgr(tmp_path, mount=usb)) is None, (
+        "缺标识文件的盘不该被当成可用数据盘")
+    targets = de.disk_record_targets(_mgr(tmp_path, mount=usb))
+    assert len(targets) == 1 and not targets[0].available
+    assert "不是数据盘" in targets[0].reason and MARKER in targets[0].reason
 
 
 @pytest.mark.parametrize("case", ["ok", "no_mount", "no_disk", "no_marker"])
-def test_default_is_the_disk_only_when_it_is_really_usable(tmp_path, monkeypatch, case):
-    """默认值：**插了可用数据盘就用它，否则本机** —— 四种情形一次钉住。"""
-    monkeypatch.setattr(de.DiskExportTarget, "is_mounted", lambda self: True)
+def test_default_is_the_disk_only_when_it_is_really_usable(tmp_path, mounted_disk, case):
+    """默认值：**插了可用数据盘就用它，否则本机** —— 四种情形一次钉住。
+
+    键在 v6.5.1 变成 `disk:<挂载点>`（要区分多块盘），所以"期望值"要跟着算出来，
+    不能硬写 `de.DISK_TARGET` —— 那样写会把"键格式变了"这件事藏起来。
+    """
     if case == "ok":
-        mgr = _mgr(tmp_path, mount=_usb(tmp_path))
+        usb = _usb(tmp_path)
+        mgr = _mgr(tmp_path, mount=usb)
+        expect = de.disk_target_key(usb)
     elif case == "no_mount":
         mgr = _mgr(tmp_path, mount=None)
+        expect = de.LOCAL_TARGET
     elif case == "no_disk":
         mgr = _mgr(tmp_path, mount=tmp_path / "nope")
+        expect = de.LOCAL_TARGET
     else:
         mgr = _mgr(tmp_path, mount=_usb(tmp_path, with_marker=False))
-    expect = de.DISK_TARGET if case == "ok" else de.LOCAL_TARGET
+        expect = de.LOCAL_TARGET
     assert de.default_record_target_key(mgr) == expect
 
 
@@ -161,11 +227,12 @@ def test_choosing_the_disk_moves_bag_dir_and_the_script_env(tmp_path, mounted_di
     usb = _usb(tmp_path)
     mgr = _mgr(tmp_path, mount=usb)
     target = de.disk_record_target(mgr)
-    mgr.set_record_target(de.DISK_TARGET, target.path)
+    mgr.set_record_target(target.key, target.path)
 
     assert mgr.get_bag_dir() == target.path
     assert mgr.get_script_env()["BAG_DIR"] == str(target.path)
-    assert mgr.record_target_key() == de.DISK_TARGET
+    assert mgr.record_target_key() == target.key
+    assert target.key.startswith(f"{de.DISK_TARGET}:"), "外接盘键必须带挂载点（多盘时要能区分）"
 
 
 def test_choosing_local_again_does_not_stick_to_the_disk(tmp_path, mounted_disk):
@@ -176,7 +243,8 @@ def test_choosing_local_again_does_not_stick_to_the_disk(tmp_path, mounted_disk)
     """
     usb = _usb(tmp_path)
     mgr = _mgr(tmp_path, mount=usb, bag_dir=str(tmp_path / "localbags"))
-    mgr.set_record_target(de.DISK_TARGET, de.disk_record_target(mgr).path)
+    disk_target = de.disk_record_target(mgr)
+    mgr.set_record_target(disk_target.key, disk_target.path)
     assert mgr.get_bag_dir() != mgr.get_configured_bag_dir()
 
     mgr.set_record_target(de.LOCAL_TARGET)
@@ -225,7 +293,8 @@ def test_dialog_lists_both_targets_and_defaults_to_the_disk(tmp_path, mounted_di
     assert len(texts) == 2, texts
     assert all(enabled for _, enabled in _items(dialog)), "盘可用时两项都该能选"
     settings = dialog.get_settings()
-    assert settings["record_target"] == de.DISK_TARGET
+    assert settings["record_target"] == de.disk_target_key(usb), \
+        "界面交出去的键必须带挂载点（多盘时才能区分选的是哪一块）"
     assert Path(settings["record_dir"]).is_relative_to(usb)
     assert "本次将写入" in dialog.target_hint.text()
 
@@ -266,16 +335,21 @@ def test_target_options_stay_short_so_the_dialog_width_is_stable(tmp_path, mount
 
 
 def test_dialog_falls_back_when_the_remembered_disk_gone(tmp_path, monkeypatch,
-                                                        dialog_factory):
+                                                        mounted_disk, dialog_factory):
     """上次选了硬盘、这次盘拔了 → **回落到本机**，不能把不可用的项留在选中态。
 
     留在选中态的后果是：填完名字点「开始录制」才发现写不进去。
     """
-    monkeypatch.setattr(de.DiskExportTarget, "is_mounted", lambda self: True)
+    # ① 先在"盘插着"的时候选一次（正常流程）。枚举由 `mounted_disk` 夹具提供。
     usb = _usb(tmp_path)
     mgr = _mgr(tmp_path, mount=usb)
-    mgr.set_record_target(de.DISK_TARGET, de.disk_record_target(mgr).path)
-    (usb / MARKER).unlink()                      # 盘拔了
+    disk_target = de.disk_record_target(mgr)
+    assert disk_target is not None, "前提：盘插着时应当有一个可用候选"
+    mgr.set_record_target(disk_target.key, disk_target.path)
+
+    # ② 再拔盘：枚举不到 = 枚举层认为没有外接盘（这才是"拔了"的准确表达，
+    #    目录还在那儿但盘没了，只删标识文件那是不完整的情形）
+    monkeypatch.setattr(de, "list_removable_mounts", lambda configured="": [])
 
     dialog = dialog_factory(mgr)
     assert dialog.get_settings()["record_target"] == de.LOCAL_TARGET
@@ -304,10 +378,14 @@ def test_dialog_is_wide_enough_for_the_landing_hint(tmp_path, mounted_disk, dial
         f"最小宽度只有 {dialog.minimumWidth()}px：落点提示会被裁掉并压到下一行")
 
 
-def test_dialog_without_config_still_opens(tmp_path, dialog_factory):
-    """`config=None`（旧用法/替身）也要能开 —— 不能因为多了这一栏就崩。"""
+def test_dialog_without_config_still_opens(tmp_path, mounted_disk, dialog_factory):
+    """`config=None`（旧用法/替身）也要能开 —— 不能因为多了这一栏就崩。
+
+    枚举层返回空（夹具默认）→ 外接盘那一条不可用并写着原因；**不允许整条消失**：
+    消失了操作员分不清是"没插盘"还是"没认出来"。
+    """
     dialog = dialog_factory(None)
-    assert dialog.target_combo.count() == 2
+    assert dialog.target_combo.count() == 2, "本机项 + 外接盘项（不可用也在）"
     assert dialog.get_settings()["record_target"] == de.LOCAL_TARGET
 
 
@@ -345,7 +423,7 @@ def test_starting_on_the_disk_applies_it_and_creates_the_folder(tmp_path, mounte
     usb = _usb(tmp_path)
     mgr = _mgr(tmp_path, mount=usb)
     target = de.disk_record_target(mgr)
-    ok, dummy = _apply(mgr, {"record_target": de.DISK_TARGET, "record_dir": target.path})
+    ok, dummy = _apply(mgr, {"record_target": target.key, "record_dir": target.path})
 
     assert ok, dummy.errors
     assert target.path.is_dir(), "起录前必须把落点目录建出来"
@@ -361,7 +439,7 @@ def test_starting_on_an_unavailable_disk_is_refused(tmp_path, mounted_disk):
     """
     usb = _usb(tmp_path, with_marker=False)
     mgr = _mgr(tmp_path, mount=usb)
-    ok, dummy = _apply(mgr, {"record_target": de.DISK_TARGET,
+    ok, dummy = _apply(mgr, {"record_target": de.disk_target_key(usb),
                              "record_dir": usb / "whatever"})
     assert not ok
     title, message = dummy.errors[-1]

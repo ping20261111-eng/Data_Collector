@@ -13,6 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Tuple, Any, Dict
 
+from . import convert_tool
+
 # ============ 项目路径约定 ============
 # 项目根目录（data_collector 包的上一级）：configs/、scripts/、logs/ 等统一相对它定位。
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -1996,6 +1998,13 @@ class ConfigManager:
         add("远端 SFTP 凭据", bool(password),
             "未配置密码，数据回传会失败",
             level="warn")
+
+        # 数据转换工具（nerv_lerobot，独立仓、不随交付包走）。标 warn 而不是 fail：
+        # 它只影响"录完之后转成训练格式"这一步，缺了完全不影响采集与回传 ——
+        # 写成 fail 会让没装它的机器在启动时弹一个"环境自检未通过"的红框。
+        target = convert_tool.probe_convert_tool(convert_tool.convert_tool_repo(self))
+        add("数据转换工具", target.available,
+            target.reason or str(target.repo), level="warn")
 
         return results
 

@@ -17,6 +17,7 @@ import traceback
 import shutil
 import zipfile
 from datetime import datetime
+from typing import Optional
 from html import escape as html_escape
 from pathlib import Path
 from .. import theme
@@ -211,6 +212,182 @@ class CalibrationDialog(QDialog):
         return self.combo.currentText().strip()
 
 
+class BagPickerDialog(QDialog):
+    """选一份采集数据去做统计（v6.5.1 取代系统目录选择框）。
+
+    ## 为什么不用 `QFileDialog.getExistingDirectory`
+
+    那个框只有目录名，而现场攒的是几十上百个 `名字_时间戳`：
+    - 分不清哪个是 bag、哪个只是普通目录（bag 里有 `metadata.yaml` / `*.mcap`）；
+    - 没法定时定点判断要统计哪一次；
+    - 选到非 bag 目录**不会当场拦**，要等统计脚本跑起来才报错。
+
+    这里改成：按录制时间倒序列出全部 bag，每行给 时间 / 体积 / 话题文件数 / 类型，
+    默认选中"今天最新那个"；**非 bag 目录根本不列**。
+
+    「浏览其它位置…」刻意保留：数据可能不在这台机器上（别的机器录的、
+    从盘上拷来的），一刀切只列本机目录会把这条路堵死。走"浏览"选到的目录
+    仍然要过 `looks_like_bag` 这一关，选到非 bag 就当场说清。
+
+    刻意**不做多选批量统计**：`bag_rate_stat.py` 按单个 bag 跑完整话题分析
+    （脚本只收一个路径），批量要改脚本签名与输出组织，那是另一个量级的改动。
+    """
+
+    #: 列表里每项的角色：存 `BagCandidate` 本体。
+    CANDIDATE_ROLE = Qt.UserRole + 1
+
+    MIN_WIDTH = 720
+
+    def __init__(self, parent=None, uploader=None, root=None):
+        super().__init__(parent)
+        self.setWindowTitle("选择要统计的采集数据")
+        self.setModal(True)
+        self.uploader = uploader
+        self.root = Path(root) if root is not None else None
+        self.setMinimumWidth(self.MIN_WIDTH)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(SP["sp4"], SP["sp4"], SP["sp4"], SP["sp4"])
+        layout.setSpacing(SP["sp3"])
+
+        header = QHBoxLayout()
+        title = QLabel("选择要统计的采集数据")
+        title.setObjectName("PanelTitle")
+        header.addWidget(title)
+        header.addStretch()
+        self.count_label = QLabel("")
+        self.count_label.setObjectName("Hint")
+        header.addWidget(self.count_label)
+        self.btn_refresh = QPushButton("刷新")
+        self.btn_refresh.setProperty("variant", "ghost")
+        self.btn_refresh.setToolTip("重新扫描采集数据目录（录完新的数据后点它）")
+        self.btn_refresh.clicked.connect(self.reload)
+        header.addWidget(self.btn_refresh)
+        layout.addLayout(header)
+
+        self.lst = QListWidget()
+        self.lst.setFont(theme.mono_font(theme.TYPE_SCALE["fs_sm"]))
+        self.lst.setAlternatingRowColors(True)
+        # 有数据时给足高度（一次能看七八条，不用滚动）；空列表时压到最小 ——
+        # 否则空态下会出现一大块白板，比"没有数据"这句话本身还显眼。
+        self.lst.setMinimumHeight(260)
+        self.lst.itemSelectionChanged.connect(self._sync_detail)
+        # 双击 = 直接开始统计（列表里最常见的意图，省一次点「开始统计」）
+        self.lst.itemDoubleClicked.connect(lambda _item: self.accept())
+        layout.addWidget(self.lst)
+
+        self.empty_note = QLabel("")
+        self.empty_note.setObjectName("Hint")
+        self.empty_note.setWordWrap(True)
+        self.empty_note.setVisible(False)
+        layout.addWidget(self.empty_note)
+
+        self.detail = QLabel("")
+        self.detail.setObjectName("Hint")
+        self.detail.setWordWrap(True)
+        layout.addWidget(self.detail)
+
+        hbox = QHBoxLayout()
+        hbox.addStretch()
+        self.btn_browse = QPushButton("浏览其它位置…")
+        self.btn_browse.setProperty("variant", "ghost")
+        self.btn_browse.setToolTip("到别的目录里选（例如移动硬盘上的、或别的机器录的数据）")
+        self.btn_browse.clicked.connect(self.browse_other)
+        cancel = QPushButton("取消")
+        cancel.setProperty("variant", "ghost")
+        cancel.clicked.connect(self.reject)
+        self.btn_ok = QPushButton("开始统计")
+        self.btn_ok.setProperty("variant", "primary")
+        self.btn_ok.setDefault(True)
+        self.btn_ok.clicked.connect(self.accept)
+        hbox.addWidget(self.btn_browse)
+        hbox.addWidget(cancel)
+        hbox.addWidget(self.btn_ok)
+        layout.addLayout(hbox)
+
+        self.reload()
+
+    def reload(self) -> None:
+        """重新扫描候选（幂等）。默认选中今天最新的那一条。"""
+        self.lst.clear()
+        candidates = []
+        if self.uploader is not None:
+            try:
+                candidates = self.uploader.scan_bag_candidates(self.root)
+            except Exception as exc:                    # noqa: BLE001 —— 列表开不出来要说清，不能崩
+                logger.warning(f"扫描采集数据失败：{exc}")
+        # 空列表时把那行说明显出来；有数据时列表本身就是答案，藏起来。
+        self.lst.setMinimumHeight(0 if candidates else 90)
+        self.empty_note.setVisible(not candidates)
+        if not candidates:
+            self.empty_note.setText(
+                f"{self.root or self._default_root()} 下没有可统计的采集数据"
+                f"（bag 目录里应有 metadata.yaml 或 .mcap 文件）。\n"
+                f"若数据在移动硬盘上、或是从别的机器拷来的，用「浏览其它位置…」选。")
+        for cand in candidates:
+            item = QListWidgetItem(
+                f"{cand.name or cand.path.name:<28s} {cand.time_text():>10s} "
+                f"{cand.size_text():>9s}  数据文件 {cand.topic_files:<3d} "
+                f"{cand.kind_text()}")
+            item.setData(self.CANDIDATE_ROLE, cand)
+            self.lst.addItem(item)
+        self.count_label.setText(
+            f"共 {len(candidates)} 项 · 已按录制时间倒序" if candidates else "")
+        if candidates:
+            self.lst.setCurrentRow(0)          # 倒序第一位 = 今天最新
+        self._sync_detail()
+
+    def _default_root(self) -> Path:
+        return Path(getattr(self.uploader, "bag_dir", "/var/nerv/bag"))
+
+    def browse_other(self) -> None:
+        """到别的目录里选一个 bag；选到非 bag 当场说清，不放行。"""
+        start = str(self.root or self._default_root())
+        folder = QFileDialog.getExistingDirectory(
+            self, "选择要统计的采集数据（bag 文件夹）", start,
+            QFileDialog.ShowDirsOnly)
+        if not folder:
+            return
+        path = Path(folder)
+        if self.uploader is not None and not self.uploader.looks_like_bag(path):
+            QMessageBox.warning(
+                self, "不是采集数据目录",
+                f"{path}\n\n"
+                f"这个目录里没有 rosbag 的采集数据（应有 metadata.yaml 或 .mcap 文件）。\n"
+                f"请选到具体那一次采集的目录 —— 也就是包含 .mcap 文件的那一层。")
+            return
+        from ..core_data import describe_bag
+        self.lst.clear()
+        self.empty_note.setVisible(False)      # 手动选到了，列表不再是空的
+        item = QListWidgetItem(
+            f"{path.name:<32s} {'本次选择':>10s} "
+            f"{describe_bag(path).size_text():>9s}")
+        item.setData(self.CANDIDATE_ROLE, describe_bag(path))
+        self.lst.addItem(item)
+        self.lst.setCurrentRow(0)
+        self.count_label.setText("共 1 项（来自手动选择）")
+        self._sync_detail()
+
+    def current_candidate(self):
+        item = self.lst.currentItem()
+        return item.data(self.CANDIDATE_ROLE) if item is not None else None
+
+    def _sync_detail(self) -> None:
+        cand = self.current_candidate()
+        self.btn_ok.setEnabled(cand is not None)
+        if cand is None:
+            self.detail.setText("")
+            return
+        self.detail.setText(
+            f"{cand.path} · {cand.size_text()} · "
+            f"{cand.topic_files} 个数据文件 · {cand.time_text()}录制")
+
+    def selected_path(self) -> Optional[Path]:
+        """选中那一次的目录；没选返回 None（调用方据此不要起脚本）。"""
+        cand = self.current_candidate()
+        return cand.path if cand is not None else None
+
+
 class RecordDialog(QDialog):
     """录制设置。采集任务可下拉选，也可以点「管理任务」增删自己的任务。
 
@@ -331,14 +508,7 @@ class RecordDialog(QDialog):
         self.target_combo.blockSignals(True)
         self.target_combo.clear()
         for target in self._targets:
-            # 下拉里只放**短标签**：路径与不可用原因都放下面那行提示。
-            # （实测：把路径拼进选项文字时，QComboBox 会按最长项撑开 ——
-            #   本对话框在"插盘/拔盘"两态之间宽度从 560 跳到 816，很难看。
-            #   而且两块盘路径长短不同时，同一个界面宽度还会再变。）
-            suffix = "（已插入）" if (target.key == "disk" and target.available) else ""
-            if target.key == "disk" and not target.available:
-                suffix = "（不可用）"
-            self.target_combo.addItem(f"{target.label}{suffix}", target.key)
+            self.target_combo.addItem(self._target_item_text(target), target.key)
             item = self.target_combo.model().item(self.target_combo.count() - 1)
             if item is not None:
                 # 不可用项**列出来但不可选**：原因写在下面那行提示里，不必去猜
@@ -347,6 +517,24 @@ class RecordDialog(QDialog):
         self.target_combo.setCurrentIndex(index if index >= 0 else 0)
         self.target_combo.blockSignals(False)
         self._sync_target_hint()
+
+    @staticmethod
+    def _target_item_text(target) -> str:
+        """下拉里那一项的文字（**必须短**）。
+
+        不放挂载路径与不可用原因：实测把路径拼进选项文字时，`QComboBox` 会按最长项
+        撑开，本对话框在"插盘/拔盘"两态之间宽度从 560 跳到 816；v6.5.1 之后可能
+        同时列好几块盘、路径长短不一，同一个界面的宽度还会再变。
+        那些信息都在下面那行提示里。
+
+        盘名（`Seagate`）保留在标签里：插两块盘时只写"移动硬盘"两行分不清。
+        """
+        if target.mount is None:
+            return target.label
+        suffix = "" if target.available else "（不可用）"
+        if target.mount.configured:
+            suffix += " · 配置指定"
+        return f"{target.label}{suffix}"
 
     def current_target(self):
         """当前选中的落盘目标（`disk_export.RecordTarget`）；没有候选时返回 None。"""
@@ -367,12 +555,18 @@ class RecordDialog(QDialog):
         if target is None:
             self.target_hint.setText("")
             return
+        on_disk = target.mount is not None
         lines = [f"本次将写入：{target.path}/ —— "
-                 + ("直接写在移动硬盘上，录完可直接拔盘交付" if target.key == "disk"
-                    else "本机数据盘")]
-        blocked = [t for t in getattr(self, "_targets", [])
-                   if t.key != target.key and not t.available]
-        for other in blocked:
+                 + ("直接写在移动硬盘上，录完可直接拔盘交付" if on_disk else "本机数据盘")]
+        if on_disk:
+            # 说清"这是哪块盘、什么格式、还剩多少"：自动识别之后下拉里可能同时有
+            # 好几块，操作员必须能从提示确认选中的确实是手边这块。
+            lines.append(target.mount.summary())
+            if target.mount.configured:
+                lines.append("该挂载点来自 app_config.yaml 的 disk_export.mount_point")
+        for other in getattr(self, "_targets", []):
+            if other.key == target.key or other.available:
+                continue
             lines.append(f"{other.label}不可用：{other.reason}")
         self.target_hint.setText("\n".join(lines))
         self._fit_target_hint()
@@ -426,9 +620,14 @@ class RecordDialog(QDialog):
     def get_settings(self):
         """返回录制参数。label 是纯任务名，action_id 是可选的编号（一般为 None）。
 
-        额外带出「保存位置」：`record_target` 是键（`local` / `disk`），
+        额外带出「保存位置」：`record_target` 是键（`local` / `disk:<挂载点>`），
         `record_dir` 是**要落到的目录**（`local` 时为 None —— 表示用配置里的
         `bag_dir`，而不是"某个具体路径"，这样"选本机"不会被上一次的选择黏住）。
+
+        判"是不是外接盘"用 `target.mount is not None`，**不要比键的字面值**：
+        v6.5.1 起外接盘键带挂载点（`disk:/media/…`），写成 `key == "disk"` 会
+        永远为假 → `record_dir` 变 None → 起录时落盘目录悄悄退回配置里的
+        `bag_dir`，而界面显示的是移动硬盘。这是**静默写错位置**，所以必须钉住。
         """
         text = self.label_combo.currentText().strip()
         index = self.label_combo.currentIndex()
@@ -439,6 +638,7 @@ class RecordDialog(QDialog):
             name = text          # 用户手输的自由文本，没有对应编号
             action_id = None
         target = self.current_target()
+        on_disk = target is not None and target.mount is not None
         return {
             "type": self.type_combo.currentText(),
             "name": self.name_edit.text().strip(),
@@ -446,8 +646,7 @@ class RecordDialog(QDialog):
             "label": name,
             "action_id": action_id,
             "record_target": target.key if target is not None else "local",
-            "record_dir": (target.path if target is not None and target.key == "disk"
-                           else None),
+            "record_dir": target.path if on_disk else None,
         }
 
 

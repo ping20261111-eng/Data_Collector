@@ -392,9 +392,23 @@ class ExportTargetMixin(RemoteCredentialMixin):
         self.lb_disk_mount = QLabel("")
         self.lb_disk_mount.setVisible(False)
 
+        # ---- 自动检测出来的盘（v6.5.1）：消除"手抄挂载点" ----
+        # 挂载点是系统按卷标自动生成的（/media/<用户>/<卷标>），换盘、换用户名、
+        # 换插口都会变。要人把系统生成的路径抄进配置里，本身就是让现场做一件
+        # 机器已经知道答案的事 —— 实测就是这么漏的：配置写着 /media/nerv/DE8A-9634，
+        # 实际盘挂在 /media/nerv/Seagate，程序报"未检测到移动硬盘"，而盘就在眼前。
+        self.cb_disk_found = QComboBox()
+        self.cb_disk_found.setObjectName("DiskFound")
+        self.cb_disk_found.setToolTip(
+            "自动检测到的外接存储设备；选中即填入下方挂载点，无需手工抄路径")
+        self.cb_disk_found.setMinimumWidth(260)
+        self.cb_disk_found.currentIndexChanged.connect(self.on_disk_found_picked)
+        row.addWidget(self.cb_disk_found)
+        row.addWidget(QLabel("检测到"))
+
         self.ed_disk_mount = QLineEdit()
         self.ed_disk_mount.setObjectName("DiskMount")
-        self.ed_disk_mount.setPlaceholderText("/media/robot/NERV")
+        self.ed_disk_mount.setPlaceholderText("留空即可自动识别；也可在此手动填写挂载点")
         # 面板宽度固定（设计稿400px），所以让输入框吃掉整行富余即可 ——
         # 主卡片里那个「固定 300px」的教训是"别让 Expanding 抢走状态文案的
         # 位置"，而这里状态文案已经换到下一行，不存在那个问题。
@@ -429,7 +443,8 @@ class ExportTargetMixin(RemoteCredentialMixin):
         self.btn_disk_recheck = QPushButton("重新检测")
         self.btn_disk_recheck.setProperty("variant", "ghost-compact")
         self.btn_disk_recheck.setToolTip("盘是后来才插上的时候点它")
-        self.btn_disk_recheck.clicked.connect(lambda: self._probe_disk_mount())
+        # 先刷「检测到」列表再探：盘是后来才插上的，不刷的话下拉里还是"未检测到"
+        self.btn_disk_recheck.clicked.connect(self._recheck_disk)
         state_row.addWidget(self.btn_disk_recheck, 0)
 
         outer.addLayout(state_row)
@@ -476,6 +491,9 @@ class ExportTargetMixin(RemoteCredentialMixin):
 
         self.ed_disk_mount.setText(settings.get("mount_point", "") or "")
         self._set_disk_row_visible(target in ("disk", "both"))
+        # 枚举要先跑：面板打开的那一刻盘可能刚插上，而 `mount_point` 里那串是
+        # 上一版配置留下的、指向别的盘的路径 —— 不先刷就会一直显示"路径不存在"。
+        self.refresh_found_disks()
         if probe and target in ("disk", "both"):
             self._probe_disk_mount()
 
@@ -617,6 +635,60 @@ class ExportTargetMixin(RemoteCredentialMixin):
         mount = self.ed_disk_mount.text().strip() if uses_disk else None
         self._save_export_settings(target, mount,
                                    label=self.cb_export_target.currentText())
+
+    def refresh_found_disks(self) -> None:
+        """重新枚举当前插着的外接设备，填进「检测到」那个下拉。
+
+        幂等（重复调用不会多出条目）。选中项**尽量保持不变** —— 定时探测也会调它，
+        而定时器不该把用户已经选好的那一项换掉。
+
+        没插盘时那一项仍然列出来但**不可选**（整项消失的话，操作员分不清是
+        "没插"还是"插了但没认出来"）。
+
+        选项文字与"无盘提示"都在 `disk_export.found_disk_choices` 里（口径一处），
+        这里只做接线 —— 枚举与显示策略分开，守卫才抓得到显示侧的改动。
+        """
+        from ...disk_export import found_disk_choices
+
+        previous = self.cb_disk_found.currentData()
+        self.cb_disk_found.blockSignals(True)
+        self.cb_disk_found.clear()
+        for text, path in found_disk_choices(self.config):
+            self.cb_disk_found.addItem(text, path)
+            item = self.cb_disk_found.model().item(self.cb_disk_found.count() - 1)
+            if item is not None and not path:
+                item.setEnabled(False)
+        index = self.cb_disk_found.findData(previous)
+        if index >= 0:
+            self.cb_disk_found.setCurrentIndex(index)
+        elif self.cb_disk_found.itemData(0):
+            # 新插上来的盘：自动填进输入框（**这是"自动识别"真正替掉手抄的地方**）
+            self.on_disk_found_picked()
+        self.cb_disk_found.blockSignals(False)
+
+    def _recheck_disk(self) -> None:
+        """「重新检测」按钮：重刷枚举 → 重探当前挂载点。
+
+        两步的顺序不能反：枚举会把新插上的盘自动填进输入框，而探测要看输入框里的
+        内容 —— 只探测不刷的话，"盘刚插上"这个场景下探的还是旧路径。
+        """
+        self.refresh_found_disks()
+        self._probe_disk_mount()
+
+    def on_disk_found_picked(self, *_args) -> None:
+        """从「检测到」下拉里选了一块盘 → 填进挂载点输入框并立刻探测。
+
+        填进去之后**走同一条探测路径**（`_probe_disk_mount`），不另开一套判断：
+        否则"下拉说就绪、面板说不可用"这种界面自相矛盾会立刻出现。
+        """
+        mount = str(self.cb_disk_found.currentData() or "").strip()
+        if not mount:
+            return
+        self.ed_disk_mount.setText(mount)
+        target = self.cb_export_target.currentData()
+        self._probe_disk_mount()
+        if target in ("disk", "both"):
+            self._save_export_settings(target, mount, label="挂载点")
 
     def on_disk_mount_edited(self) -> None:
         """挂载点改完（失焦）才存 —— 边打边存会写入打到一半的路径。"""
@@ -823,15 +895,19 @@ class ExportTargetMixin(RemoteCredentialMixin):
         self._disk_timer = timer
 
     def _tick_disk_probe(self) -> None:
-        """定时探一次，只在状态真的变了才说话。"""
+        """定时探一次，只在状态真的变了才说话。
+
+        **先刷枚举再探测**，顺序不能反：自动识别之后"挂载点输入框为空"是**正常
+        状态**（表示"全靠自动识别"），而旧实现在这里遇到空值就直接 return ——
+        那样只要没手工填过路径，定时探测就永远不跑，"插上盘也没人知道"。
+        """
         if self.cb_export_target.currentData() not in ("disk", "both"):
-            return
-        if not self.ed_disk_mount.text().strip():
             return
         # 探测本身会把面板里的状态文案与按钮刷好（它就是那一处的真相来源），
         # 但探测期间**不该弹窗** —— 用户没点任何东西。
         before = (getattr(self, "_disk_ok", None), getattr(self, "_disk_caption", None))
         try:
+            self.refresh_found_disks()
             self._probe_disk_mount(quiet=True)
         except Exception as exc:
             logger.debug(f"定时探测挂载点失败：{exc}")

@@ -26,7 +26,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 from .core import logger
 from .errors import AppError, ErrorCode
@@ -81,6 +81,10 @@ class DiskExportTarget:
         self.require_volume_id = require_volume_id
         self.min_free_margin = min_free_margin_mb * 1024 * 1024
         self.warn_file_bytes = warn_file_bytes
+        #: 这个挂载点是**自动枚举**得来的（不是配置里手写的）。只影响报错措辞：
+        #: 枚举来的路径"不存在"意思是"盘没插"，说成"路径写错、请改配置"会让人去改
+        #: 一个他根本没填过、也填不该填的字段。
+        self.enumerated_mount = False
 
     # ---------- 挂载点与盘标识 ----------
 
@@ -107,6 +111,13 @@ class DiskExportTarget:
     def check_volume(self) -> None:
         """校验挂载点可用。失败时抛带码异常，让界面说清"该做什么"。"""
         if not self.mount_point.exists():
+            if self.enumerated_mount:
+                raise AppError(
+                    ErrorCode.NOT_FOUND,
+                    "未检测到移动硬盘（已启用自动识别，无需配置挂载点）。\n"
+                    "请插上移动硬盘后重试；若它已经插着，可在「导出目标」面板里"
+                    "点「重新检测」看识别结果。",
+                )
             raise AppError(
                 ErrorCode.NOT_FOUND,
                 f"导出路径不存在：{self.mount_point}\n"
@@ -292,6 +303,191 @@ def _mb(value: float) -> str:
     return f"{value / 1024 / 1024:.0f}MB"
 
 
+#: 不是真实文件系统的挂载类型，一律不算"盘"。
+#: 实测踩过的坑：本机 `/proc/mounts` 有 30 多条，其中 SNAP 那些全是 squashfs + loop
+#: 设备 —— 不排除的话，枚举结果会被一堆 `/snap/core22/2437` 之类的只读系统镜像占满，
+#: 界面下拉里全是"移动硬盘"。
+PSEUDO_FS_TYPES = frozenset({
+    "autofs", "binfmt_misc", "bpf", "cgroup", "cgroup2", "configfs", "debugfs",
+    "devpts", "efivarfs", "fuse", "fusectl", "hugetlbfs", "mqueue", "nsfs",
+    "overlay", "proc", "pstore", "ramfs", "securityfs", "squashfs", "sunrpc",
+    "sysfs", "tmpfs", "tracefs",
+})
+
+#: 本机系统挂载点：即使与 `/` 不是同一设备（独立分区）也不该当成外接盘。
+#: `/boot/efi` 就是这种情况 —— 它是 `/dev/nvme0n1p1`，独立分区，但仍在本机盘上。
+SYSTEM_MOUNTS = frozenset({
+    "/", "/boot", "/boot/efi", "/home", "/opt", "/root", "/run", "/srv", "/var",
+})
+
+#: 小于这个容量的外接盘不列为数据盘候选：一次常规采集几 GB 到几十 GB，
+#: U 盘虽然容量够但现场极少拿它装采集数据，而误选的代价（抱着 U 盘等交付）
+#: 比少列一个候选大。只提示不拦截。
+MIN_DISK_BYTES = 8 * 1024 ** 3
+
+
+@dataclass(frozen=True)
+class MountedVolume:
+    """一个枚举到的外接设备挂载点（移动硬盘 / U 盘 / 读卡器…）。
+
+    字段只留判定与界面真正用得到的：`path` 决定落点，
+    `label` / `fs` / `total_bytes` / `free_bytes` 用来在界面上说清"这是哪块盘"。
+    """
+
+    path: Path
+    label: str
+    fs: str
+    total_bytes: int = 0
+    free_bytes: int = 0
+    #: 是不是配置里 `disk_export.mount_point` 指定的那一块（界面标"配置指定"）
+    configured: bool = False
+
+    @property
+    def capacity_ok(self) -> bool:
+        """容量够不够装一次采集。"""
+        return self.total_bytes <= 0 or self.total_bytes >= MIN_DISK_BYTES
+
+    def summary(self) -> str:
+        """给界面下拉用的一行摘要（不含路径 —— 路径太长会把控件撑开）。"""
+        bits = [self.label]
+        if self.fs:
+            bits.append(self.fs)
+        if self.total_bytes:
+            bits.append(f"可用 {_size(self.free_bytes)}")
+        return " · ".join(bits)
+
+
+def _size(value: float) -> str:
+    """字节数转成人看得懂的容量（如 `1.1TB`）。"""
+    number = float(value)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if number < 1024 or unit == "TB":
+            return f"{number:.0f}B" if unit == "B" else f"{number:.1f}{unit}"
+        number /= 1024.0
+    return f"{number:.1f}TB"
+
+
+def _parent_block_device(source: str) -> str:
+    """`/dev/sda1` → `sda`；`/dev/mmcblk0p1` → `mmcblk0`（只削末尾分区号）。"""
+    name = os.path.basename(source)
+    return name.rstrip("0123456789") or name
+
+
+def _usb_sysfs_path(block: str) -> str:
+    """块设备在 sysfs 里的真实路径（USB 设备的路径里含 `/usb`）。
+
+    单独抽出来是为了**可被测试替换**：判据本身（"`/usb` in 路径"）是纯逻辑，
+    而"怎么拿到 sysfs 路径"要碰文件系统。测试替换前者、验后者，
+    才不会变成"把判据整个打桩 → 改生产代码也抓不到"。
+    """
+    return os.path.realpath(f"/sys/block/{block}/device")
+
+
+def _is_usb_block(block: str) -> bool:
+    """块设备是否挂在 USB 总线上（读 sysfs 真实路径，不起子进程）。
+
+    为什么不用 `lsblk TRAN`：要 subprocess（每秒轮询一次代价不合适），而且
+    **USB 盘经 SCSI 层时 TRAN 给的是 `scsi`**，反而判错。
+    为什么不用 `/sys/block/*/removable`：实测移动硬盘盒普遍报 `0`
+    （本机 `/dev/sda1` 就是），与内置 NVMe 完全一样，分不出来。
+    sysfs 里 USB 设备的真实路径含 `/usb`（如
+    `/sys/devices/pci.../0000:00:14.0/usb2/2-3/2-3:1.0/host0/...`）—— 这条是准的。
+    """
+    try:
+        return "/usb" in _usb_sysfs_path(block)
+    except OSError:
+        return False
+
+
+def list_removable_mounts(configured: str = "") -> List[MountedVolume]:
+    """枚举当前插着的所有外接存储设备。
+
+    ## 为什么不再只认配置里那一条 `mount_point`
+
+    挂载点是**系统按卷标自动生成**的：换一块盘、换一个用户名、换一个插口，路径
+    就变（`/media/nerv/Seagate` ↔ `/media/robot/DE8A-9634` ↔
+    `/run/media/robot/NERV` ↔ `/mnt/nerv_data`）。要人把系统生成的路径手工抄进
+    `app_config.yaml`，等于让现场做一件机器本来就知道答案的事 —— 实测就是这么漏的：
+    配置写着 `/media/nerv/DE8A-9634`，实际盘挂在 `/media/nerv/Seagate`，
+    程序报"未检测到移动硬盘"，而盘就在眼前。
+
+    所以改成**枚举为主、配置为辅**：`configured` 非空且当前确实挂着时，那一块会被
+    标 `configured=True`（界面显示"配置指定"）并排到最前；它挂不上时也只是少一个
+    优先项，**不影响其它盘被枚举出来**。
+
+    ## 判定为什么是"两条同时成立"
+
+    1. `st_dev` 与 `/` 不同 —— 是独立块设备，不是本机盘里的一个普通目录
+       （后者是"路径撞名"的经典陷阱：机器侧有人把挂载点配成 `/home/nerv/data`，
+       于是数据其实写进了本机盘，而界面以为上了移动硬盘）。
+    2. sysfs 设备路径含 `/usb` —— 是 USB 设备，不是 NVMe / SATA 内置盘。
+
+    再排除两类：`/proc/mounts` 里的**伪文件系统**（SNAP、fuse、tmpfs…），
+    以及 `/`、`/boot/efi` 这类**本机系统挂载点**（独立分区但仍在本机盘上）。
+
+    顺序稳定：配置指定的那块排最前，其余按「容量大的在前、挂载点名字次之」——
+    不按挂载顺序排，否则每插拔一次下拉里各项的位置就会跳。
+    """
+    try:
+        root_dev = os.stat("/").st_dev
+    except OSError as exc:
+        logger.warning(f"读取根目录设备号失败，无法枚举外接盘：{exc}")
+        return []
+
+    configured_real = ""
+    if configured:
+        try:
+            configured_real = os.path.realpath(os.path.expanduser(str(configured)))
+        except OSError:
+            configured_real = str(configured)
+
+    try:
+        with open("/proc/mounts", encoding="utf-8") as handle:
+            mount_lines = handle.readlines()
+    except OSError as exc:
+        logger.warning(f"读取 /proc/mounts 失败，无法枚举外接盘：{exc}")
+        return []
+
+    found: dict = {}
+    for line in mount_lines:
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        source, mount, fs = parts[0], parts[1], parts[2]
+        if fs in PSEUDO_FS_TYPES or not source.startswith("/dev/"):
+            continue                       # 伪文件系统 / 非块设备来源
+        if mount in SYSTEM_MOUNTS:
+            continue                       # 本机系统挂载点（/boot/efi 等）
+        try:
+            stat_result = os.stat(mount)
+        except OSError:
+            continue                       # 拔掉了 / 没权限
+        if stat_result.st_dev == root_dev:
+            continue                       # 与 / 同设备 → 本机盘上的目录
+        if not _is_usb_block(_parent_block_device(source)):
+            continue
+
+        real = os.path.realpath(mount)
+        if real in found:
+            continue                       # 同一块盘被挂到多处，只留第一个
+        try:
+            usage = shutil.disk_usage(mount)
+            total, free = usage.total, usage.free
+        except OSError:
+            total, free = 0, 0
+        found[real] = MountedVolume(
+            path=Path(mount),
+            label=Path(mount).name or str(mount),
+            fs=fs,
+            total_bytes=total,
+            free_bytes=free,
+            configured=(real == configured_real),
+        )
+
+    return sorted(found.values(),
+                  key=lambda vol: (not vol.configured, -vol.total_bytes, str(vol.path)))
+
+
 # ---------- 录制落盘目标（本机数据盘 / 移动硬盘） ----------
 #
 # 「这一次录到哪里」是**一次会话的决定**，不是机器配置 —— 所以这里只负责把两种落点
@@ -303,8 +499,26 @@ def _mb(value: float) -> str:
 # 否则会出现"能导出却录不进去"这种自相矛盾。
 
 #: 两个候选落点的键。界面、`ConfigManager` 与录制脚本的 `BAG_DIR` 都按它分派。
+#: 本机项就是 `local`；外接盘项是 **`disk:<挂载点绝对路径>`**（见 `disk_target_key`）。
 LOCAL_TARGET = "local"
+
+#: 外接盘候选的键前缀。**不带挂载点的一段（光 `"disk"`）在 v6.5.1 起不再由界面产生** ——
+#: 插两块盘时两个候选的键必须不同，界面才能知道"用户选的是哪一块"。
 DISK_TARGET = "disk"
+
+
+def disk_target_key(mount_point) -> str:
+    """外接盘候选的键：`disk:<挂载点绝对路径>`。
+
+    为什么键里要带挂载点：v6.5.1 之前只有一个候选（配置写死那一块），键是 `"disk"`。
+    改成自动枚举后可能同时列出好几块，键相同的话 `QComboBox.findData` 永远命中第一个，
+    "选了第二块却写到第一块"就成了静默写错位置 —— 这类错现场根本发现不了。
+    """
+    try:
+        real = os.path.realpath(str(mount_point))
+    except (OSError, ValueError):
+        real = str(mount_point)
+    return f"{DISK_TARGET}:{real}"
 
 #: 读不到序列号时的占位目录名。**刻意不静默扁平**：扁平（直接写挂载点根）会让
 #: "两台机器的数据混在一根目录"这件事在盘上完全看不出来 —— 而这个盘本来就是
@@ -379,6 +593,9 @@ class RecordTarget:
 
     `path` 就是**选它时会被当成 `BAG_DIR` 传给录制脚本的那个目录**；
     `available=False` 时 `reason` 说明为什么不能用（界面据此置灰并给出原因）。
+
+    `mount` 指向枚举到的那个外接盘（可能是 `None`，本机候选就是）。
+    界面上"这块盘是哪块、什么格式、还剩多少空间"全部从这里取，不要再去查盘。
     """
 
     key: str
@@ -386,6 +603,7 @@ class RecordTarget:
     path: Path
     available: bool
     reason: str = ""
+    mount: Optional[MountedVolume] = None
 
     def describe(self) -> str:
         if self.available:
@@ -393,16 +611,100 @@ class RecordTarget:
         return f"{self.label}（不可用：{self.reason}）"
 
 
-def _disk_target_object(config) -> DiskExportTarget:
-    """按配置造一个 `DiskExportTarget`（与 `DataUploader._disk_export_target` 同源）。"""
+def disk_settings(config) -> dict:
+    """`app_config.yaml` 的 `disk_export` 段（配置缺失时给一份保守默认）。"""
     settings = config.get_export_settings() if config is not None else {}
+    return settings or {}
+
+
+def _disk_target_object(config, mount_point: str = "") -> DiskExportTarget:
+    """按配置造一个 `DiskExportTarget`（与 `DataUploader._disk_export_target` 同源）。
+
+    `mount_point` 非空时用它，而不是配置里那条 —— 这是 v6.5.1 的关键改动：
+    判定口径（标识文件、空间余量、体积预判）与导出侧**逐字共用同一个类**，
+    所以"能导出却录不进去"这种自相矛盾不会因为多块盘而重新出现。
+    """
+    settings = disk_settings(config)
     return DiskExportTarget(
-        mount_point=settings.get("mount_point", ""),
+        mount_point=mount_point or settings.get("mount_point", ""),
         volume_id_file=settings.get("volume_id_file", ".nerv_volume"),
         require_volume_id=bool(settings.get("require_volume_id")),
         min_free_margin_mb=int(settings.get("min_free_margin_mb", 2048)),
         warn_file_bytes=int(settings.get("warn_file_bytes", 3_800_000_000)),
     )
+
+def _disk_target_for_mount(config, mount: MountedVolume,
+                          folder: Optional[Path] = None) -> RecordTarget:
+    """把一块枚举到的外接盘变成一个候选落点，逐级给出**可照做**的原因。
+
+    判定顺序刻意是「先说最可能的原因」：容量太小 → 缺标识文件 → 空间余量不足。
+    现场看到的是"为什么不能选"以及"下一步做什么"，而不是一句 `not available`。
+    """
+    disk = _disk_target_object(config, str(mount.path))
+    path = Path(mount.path) / disk_subpath(read_serial(config), folder)
+    key = disk_target_key(mount.path)
+    label = f"移动硬盘（{mount.label}）"
+
+    if not mount.capacity_ok:
+        return RecordTarget(
+            key, label, path, False,
+            f"容量不足（{_size(mount.total_bytes)}，数据盘至少要 {_size(MIN_DISK_BYTES)}）",
+            mount)
+    # 枚举认得出它是外接设备，但**它现在是不是还挂着**是另一件事：
+    # 目录留在那儿而盘已经拔了 / 卸载了，照样能写进去 —— 写进去的是本机磁盘上的
+    # 一个普通目录，而界面显示"移动硬盘"。所以这一层不能省。
+    if not disk.is_mounted():
+        return RecordTarget(key, label, path, False,
+                            f"未检测到移动硬盘（{mount.path} 不再是已挂载的设备目录，"
+                            f"盘可能已拔出）", mount)
+    if disk.require_volume_id and not disk.has_volume_marker():
+        # 原因里**不带完整路径**：这一句要放进「录制设置」的提示行，太长会多占一行
+        # （实测第 3 行会被下一行的标签压住）。挂载点本身在导出面板里看得见；
+        # 需要完整路径的场合是起录失败的那个错误框，那里再补。
+        marker = Path(disk.volume_id_file).name if disk.volume_id_file else ""
+        return RecordTarget(key, label, path, False,
+                            f"该盘不是数据盘（缺标识文件 {marker}；挂载点 {mount.path}）",
+                            mount)
+    # 空间余量：与导出侧 `check_free_space` 同一口径（同一个类的同一个余量），
+    # 免得"导出说够、录制说不够"。
+    if mount.free_bytes and mount.free_bytes < disk.min_free_margin:
+        return RecordTarget(
+            key, label, path, False,
+            f"可用空间不足（剩 {_size(mount.free_bytes)}，需要至少 "
+            f"{_size(disk.min_free_margin)} 余量）", mount)
+    return RecordTarget(key, label, path, True, "", mount)
+
+
+def disk_record_targets(config, folder: Optional[Path] = None) -> List[RecordTarget]:
+    """当前插着的**每一块**外接盘各给一个候选（顺序见 `list_removable_mounts`）。
+
+    没插盘时返回一个"占位候选"，`available=False` 且原因写明"未检测到移动硬盘
+    （插上即自动识别）"。**刻意保留这个占位项而不是返回空列表**：界面上
+    "移动硬盘"这一项一直在、只是置灰并写着原因，操作员一眼知道有这回事；
+    如果整项消失，就得先猜"是不是插了但没认出来"。
+    """
+    settings = disk_settings(config)
+    configured = str(settings.get("mount_point", "") or "")
+    volumes = list_removable_mounts(configured)
+    if not volumes:
+        reason = ("未检测到移动硬盘（插上即自动识别）" if configured
+                  else "未检测到移动硬盘（已启用自动识别，无需配置挂载点）")
+        return [RecordTarget(DISK_TARGET, "移动硬盘", Path(configured or ""),
+                             False, reason)]
+    return [_disk_target_for_mount(config, vol, folder) for vol in volumes]
+
+
+def disk_record_target(config, folder: Optional[Path] = None) -> Optional[RecordTarget]:
+    """**可用的**外接盘候选里取第一个（没有则 None）。
+
+    只保留这个"取第一个"的入口，是因为有些地方只需要一个"有没有可用盘"的答案
+    （默认选中、顶栏的状态提示），不需要知道有几块。界面要列出全部时用
+    `disk_record_targets`。
+    """
+    for target in disk_record_targets(config, folder):
+        if target.available:
+            return target
+    return None
 
 
 def local_record_target(config) -> RecordTarget:
@@ -414,46 +716,46 @@ def local_record_target(config) -> RecordTarget:
     return RecordTarget(LOCAL_TARGET, "本机数据盘", path, True, "")
 
 
-def disk_record_target(config, folder: Optional[Path] = None) -> RecordTarget:
-    """移动硬盘：`<挂载点>/<序列号>/<采集日期>`。
+def found_disk_choices(config) -> List[Tuple[str, str]]:
+    """给「检测到的移动硬盘」那个下拉用的选项：`[(显示文字, 挂载点路径)]`。
 
-    三级判定，逐级给出**可照做**的原因：挂载点没配 / 没插（不存在或不是挂载点）/
-    插了但不是数据盘（缺标识文件）。
+    为什么放在逻辑层而不是界面里：**"下拉里显示什么"和"怎么枚举"是同一件事的两半**。
+    放在界面里就会出现两份口径 —— 而界面那半一旦改文案，逻辑那半的守卫就抓不到。
+    选项**刻意不含完整路径**（路径可能很长，会把那一行撑得很宽，面板宽度是固定的）。
+
+    没插盘时给一项 `("未检测到移动硬盘（插上即自动识别）", "")`：整项消失的话，
+    操作员分不清是"没插盘"还是"没认出来"。返回空路径表示"这一项不可选"。
     """
-    disk = _disk_target_object(config)
-    mount = disk.mount_point
-    if not mount or str(mount) in ("", "."):
-        return RecordTarget(
-            DISK_TARGET, "移动硬盘", mount, False,
-            "未配置移动硬盘挂载点（app_config.yaml 的 disk_export.mount_point）")
-    path = Path(mount) / disk_subpath(read_serial(config), folder)
-    if not Path(mount).exists():
-        return RecordTarget(DISK_TARGET, "移动硬盘", path, False,
-                            f"未检测到移动硬盘（{mount} 不存在）")
-    if not disk.is_mounted():
-        return RecordTarget(DISK_TARGET, "移动硬盘", path, False,
-                            f"未检测到移动硬盘（{mount} 不是已挂载的设备目录）")
-    if disk.require_volume_id and not disk.has_volume_marker():
-        # 原因里**不带完整路径**：这一句要放进「录制设置」的提示行，太长会多占一行
-        # （实测第 3 行会被下一行的标签压住）。挂载点本身在导出面板里看得见；
-        # 需要完整路径的场合是起录失败的那个错误框，那里再补。
-        marker = Path(disk.volume_id_file).name if disk.volume_id_file else ""
-        return RecordTarget(
-            DISK_TARGET, "移动硬盘", path, False,
-            f"该盘不是数据盘（缺标识文件 {marker}；挂载点 {mount}）")
-    return RecordTarget(DISK_TARGET, "移动硬盘", path, True, "")
+    configured = str(disk_settings(config).get("mount_point", "") or "")
+    try:
+        volumes = list_removable_mounts(configured)
+    except Exception as exc:                      # noqa: BLE001 —— 枚举失败不该弄坏面板
+        logger.warning(f"枚举移动硬盘失败：{exc}")
+        volumes = []
+    if not volumes:
+        return [("未检测到移动硬盘（插上即自动识别）", "")]
+    return [(vol.summary(), str(vol.path)) for vol in volumes]
 
 
 def record_targets(config, folder: Optional[Path] = None) -> List[RecordTarget]:
-    """两个候选落点，顺序固定：**本机在前、硬盘在后**（界面按此顺序列出）。"""
-    return [local_record_target(config), disk_record_target(config, folder)]
+    """候选落点列表，顺序固定：**本机在前、所有外接盘在后**（界面按此顺序列出）。"""
+    return [local_record_target(config)] + disk_record_targets(config, folder)
 
 
 def target_by_key(config, key: str, folder: Optional[Path] = None) -> Optional[RecordTarget]:
-    """按键取候选；键不认识返回 None（界面据此回退到默认）。"""
+    """按键取候选；键不认识返回 None（界面据此回退到默认）。
+
+    **兼容裸 `"disk"`**：v6.5.1 之前界面产生的键就是 `"disk"`（只有一个候选）。会话
+    里若还留着这样的旧键（用户先在旧界面选过、再换包），按"第一个外接盘候选"处理，
+    而不是让界面回落到本机 —— 那会让用户看到"我明明选了移动硬盘，怎么变本机了"。
+    """
     for target in record_targets(config, folder):
         if target.key == key:
             return target
+    if str(key) == DISK_TARGET:
+        for target in record_targets(config, folder):
+            if target.mount is not None:
+                return target
     return None
 
 
@@ -463,5 +765,8 @@ def default_record_target_key(config, folder: Optional[Path] = None) -> str:
     这是"后续采集可能直接存到移动硬盘"这条需求的自动半边 —— 现场把盘插上就不用
     再点一下；拔了也自动回到本机（**不会因为配置指着盘而起录失败**，因为选择根本
     不写回配置）。
+
+    返回的是 `RecordTarget.key`（外接盘项是 `disk:<挂载点>`，界面用它精确回选）。
     """
-    return DISK_TARGET if disk_record_target(config, folder).available else LOCAL_TARGET
+    disk = disk_record_target(config, folder)
+    return disk.key if disk is not None else LOCAL_TARGET

@@ -7,7 +7,8 @@ import tempfile
 import time
 import zipfile
 import hashlib
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Callable, Tuple
 
@@ -539,6 +540,84 @@ class RecorderManager:
         return {"alive": True, "producing": True, "message": ""}
 
 
+@dataclass(frozen=True)
+class BagCandidate:
+    """一个可统计的采集数据（rosbag 目录）。
+
+    字段刻意只留"选它需要知道的"：路径、录制时间、体积、话题文件数、采集类型。
+    界面上列表里那一行就是这些字段 —— 操作员靠**时间与大小**判断该统计哪一次，
+    靠**类型**知道这次是 vla / bag / cmd 哪种录制。
+    """
+
+    path: Path
+    captured_at: datetime
+    size_bytes: int = 0
+    topic_files: int = 0
+    kind: str = ""
+
+    #: 目录名里 `_时间戳` 之前的部分就是"这次采集叫什么"。取不到就用目录名。
+    name: str = ""
+
+    def size_text(self) -> str:
+        # 用局部变量逐级折算，**不要就地改 self.size_bytes** —— 这个类是
+        # frozen dataclass，改字段会抛 FrozenInstanceError，而且即使不 frozen
+        # 也会让"读一次列表、体积就变一次"这种诡异行为发生。
+        if self.size_bytes <= 0:
+            return "—"
+        number = float(self.size_bytes)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if number < 1024 or unit == "TB":
+                return f"{number:.0f}B" if unit == "B" else f"{number:.1f}{unit}"
+            number /= 1024.0
+        return f"{number:.1f}TB"
+
+    def time_text(self) -> str:
+        """录制时间：今天的只写时分（列表窄，全写日期会挤掉体积那列）。"""
+        today = datetime.now().date()
+        if self.captured_at.date() == today:
+            return self.captured_at.strftime("今天 %H:%M")
+        if self.captured_at.date() == today - timedelta(days=1):
+            return self.captured_at.strftime("昨天 %H:%M")
+        return self.captured_at.strftime("%m-%d %H:%M")
+
+    def kind_text(self) -> str:
+        return self.kind or "bag"
+
+
+def describe_bag(folder: Path) -> BagCandidate:
+    """把一个 bag 目录读成一条候选信息（时间 / 体积 / 话题文件数 / 类型）。
+
+    **体积与文件数读不到就留 0**，不抛异常：这个函数是在"点开一个选择对话框"
+    这条交互路径上跑的，一个坏目录不该让整个列表打不开。列表里显示"—"即可。
+    """
+    path = Path(folder)
+    try:
+        captured = datetime.fromtimestamp(path.stat().st_mtime)
+    except OSError:
+        captured = datetime.now()
+    size, topic_files = 0, 0
+    try:
+        for entry in path.iterdir():
+            if entry.is_file():
+                try:
+                    size += entry.stat().st_size
+                except OSError:
+                    continue
+                if entry.suffix == ".mcap":
+                    topic_files += 1
+    except OSError:
+        pass
+    name, kind = path.name, ""
+    # 录制脚本把类型写在名字里（vla_2026…/ bag_…/ cmd_…），带上前缀才好认；
+    # 老目录（`labeltest_…`、`rosbag2_…`）认不出来就不写类型，不硬猜。
+    for candidate in ("vla", "bag", "cmd"):
+        if path.name.lower().startswith(candidate + "_"):
+            name, kind = path.name[len(candidate) + 1:], candidate
+            break
+    return BagCandidate(path=path, captured_at=captured, size_bytes=size,
+                        topic_files=topic_files, kind=kind, name=name)
+
+
 class DataUploader:
     def __init__(self, config=None):
         """config 为 ConfigManager 时从 app_config.yaml 读取远程主机/目录与密码；
@@ -636,6 +715,57 @@ class DataUploader:
         subdirs = [d for d in self.bag_dir.iterdir() if d.is_dir()]
         subdirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
         return subdirs
+
+    # ---------- 采集数据候选（给「采集统计」等"选一个 bag"用） ----------
+
+    def looks_like_bag(self, folder: Path) -> bool:
+        """这个目录是不是一个 rosbag 采集目录。
+
+        判据是**目录里有 bag 自己会写的文件**：`metadata.yaml`（rosbag2 的清单）
+        或 `*.mcap`（数据本体）。不按目录名判断 —— 名字是操作员随手写的
+        （`11111_2026…`、`labeltest3_…`、`rosbag2_…` 都有），按名字判会把一堆
+        乱七八糟的目录认成采集数据。
+        """
+        path = Path(folder)
+        try:
+            for entry in path.iterdir():
+                if entry.name == "metadata.yaml" or entry.suffix == ".mcap":
+                    return True
+        except OSError:
+            return False
+        return False
+
+    def scan_bag_candidates(self, root: Optional[Path] = None,
+                            limit: int = 200) -> List["BagCandidate"]:
+        """列出可统计的采集数据，按**录制时间倒序**（新的在最前）。
+
+        为什么要有这个而不是让操作员在系统文件框里一层层点：
+        - 系统框里只有目录名，分不清哪个是 bag、哪个是别的目录；
+        - 现场会攒几十上百个 `名字_时间戳`，没法按时间/大小判断要统计哪个；
+        - 选到非 bag 目录**当场就该拦**，而不是等脚本跑起来才报错。
+
+        只扫一层（`root` 的直接子目录）：bag 是平铺的，深层扫描在几百个目录的
+        机器上要几百毫秒到几秒，而这个对话框是每次点「采集统计」都开的。
+        扫不到就返回空列表并让界面说清"这个目录下没有可统计的采集数据"，
+        同时保留「浏览其它位置」给盘上的 / 别的机器来的数据。
+        """
+        base = Path(root) if root is not None else Path(self.bag_dir)
+        if not base.is_dir():
+            return []
+        found = []
+        try:
+            children = sorted(base.iterdir(), key=lambda d: d.stat().st_mtime,
+                              reverse=True)
+        except OSError as exc:
+            logger.warning(f"扫描采集数据目录失败：{exc}")
+            return []
+        for child in children:
+            if len(found) >= limit:
+                break
+            if not child.is_dir() or not self.looks_like_bag(child):
+                continue
+            found.append(describe_bag(child))
+        return found
 
     def get_latest_bag_folder(self) -> Optional[Path]:
         folders = self.get_bag_folders()
@@ -1043,16 +1173,36 @@ class DataUploader:
             return "server"
 
     def _disk_export_target(self):
-        """按当前配置造一个 `DiskExportTarget`（延迟导入，见文件头的注释）。"""
-        from .disk_export import DiskExportTarget
+        """造一个 `DiskExportTarget`（延迟导入，见文件头的注释）。
+
+        挂载点取值顺序：**配置里写的那条 → 自动枚举的第一块盘**。
+
+        为什么要有第二步：挂载点是系统按卷标自动生成的（`/media/<用户>/<卷标>`），
+        换盘 / 换用户名 / 换插口都会变。要求人把系统生成的路径抄进配置里，
+        本身就是让现场做一件机器已经知道答案的事 —— 实测就是这么漏的：配置写着
+        `/media/nerv/DE8A-9634`，实际盘挂在 `/media/nerv/Seagate`，于是
+        "能识别到盘"却"导不出"或"识别不到盘"。留空 = 全靠自动识别。
+
+        取「第一块」而不是让用户选，是因为导出侧**没有选择界面**（只有录制侧有）。
+        多块盘同时插时，界面会提示插一块；这一处的兜底只为"没插盘"和"只插一块"
+        这两种现场实际会遇到的形态服务。
+        """
+        from .disk_export import DiskExportTarget, list_removable_mounts
         settings = self.config.get_export_settings() if self.config else {}
-        return DiskExportTarget(
-            mount_point=settings.get("mount_point", ""),
+        configured = str(settings.get("mount_point", "") or "").strip()
+        mount_point = configured
+        if not mount_point:
+            volumes = list_removable_mounts()
+            mount_point = str(volumes[0].path) if volumes else ""
+        target = DiskExportTarget(
+            mount_point=mount_point,
             volume_id_file=settings.get("volume_id_file", ".nerv_volume"),
             require_volume_id=bool(settings.get("require_volume_id")),
             min_free_margin_mb=int(settings.get("min_free_margin_mb", 2048)),
             warn_file_bytes=int(settings.get("warn_file_bytes", 3_800_000_000)),
         )
+        target.enumerated_mount = not configured
+        return target
 
     def _export_to_disk(self, folder_path: Path,
                         progress_cb=None, progress_percent=None) -> bool:
@@ -1094,11 +1244,15 @@ class DataUploader:
 
         disk = self._disk_export_target()
         if not disk.mount_point or str(disk.mount_point) == ".":
+            # 到这里只有一种成因：**自动枚举没找到任何外接盘**（配置那条也可能没填）。
+            # 所以不能说"未配置" —— v6.5.1 起挂载点本来就该留空、靠自动识别，
+            # 让现场去 app_config.yaml 填一个系统生成的路径是让问题绕回原点。
             return self._fail(
-                ErrorCode.CONFIG_MISSING,
-                "未配置移动硬盘导出路径。\n"
-                "请在 app_config.yaml 的 disk_export.mount_point 填入实际挂载点，"
-                "或把 export_target 改回 server。",
+                ErrorCode.NOT_FOUND,
+                "未检测到移动硬盘。\n"
+                "请插上移动硬盘后重试；若它已经插着，可在「导出目标」面板里"
+                "点「重新检测」看识别结果（挂载点无需手工填写）。\n"
+                "也可以把导出目标改回服务器。",
             )
 
         archive_name = self._archive_name(folder)

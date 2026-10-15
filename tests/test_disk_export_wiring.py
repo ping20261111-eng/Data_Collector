@@ -219,14 +219,25 @@ def test_disk_export_writes_an_archive(tmp_path, monkeypatch):
     assert not list(mount.rglob("*.partial"))
 
 
-def test_disk_export_rejects_when_not_configured(tmp_path):
-    """选了 disk 却没配挂载点 → 明确说清怎么改，而不是抛原始异常。"""
+def test_disk_export_rejects_when_not_configured(tmp_path, monkeypatch):
+    """选了 disk、没配挂载点、也枚举不到盘 → 明确说清"没插盘"，不是抛原始异常。
+
+    **必须把枚举桩成空**：v6.5.1 起挂载点为空会自动枚举，而**开发机/测试机上
+    可能真的插着移动硬盘** —— 不桩的话这条用例会因为"这台机器碰巧插了盘"而红，
+    变成一份"看跑它那台机器插没插盘"的守卫（换个环境就失效，而且失效方向相反：
+    插着盘时它不报错，验不到要验的东西）。
+    """
+    from data_collector import disk_export as de
+    monkeypatch.setattr(de, "list_removable_mounts", lambda *a, **k: [])
+    monkeypatch.setattr(de.DiskExportTarget, "is_mounted", lambda self: True)
+
     folder = _bag(tmp_path)
     up = _uploader(tmp_path, "export_target: disk\n")
 
     assert up.upload_bag_folder(folder) is False
-    assert up.last_code == ErrorCode.CONFIG_MISSING
-    assert "mount_point" in up.last_error
+    assert up.last_code == ErrorCode.NOT_FOUND
+    # 措辞要指向"插盘"而不是"改配置"：挂载点是自动枚举的，不是用户填的
+    assert "未检测到移动硬盘" in up.last_error
 
 
 def test_disk_export_keeps_the_error_code_of_a_failed_precheck(tmp_path, monkeypatch):

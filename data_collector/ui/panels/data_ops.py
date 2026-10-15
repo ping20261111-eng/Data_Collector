@@ -204,15 +204,26 @@ class DataOpsMixin:
         选择**只记在内存里**（`ConfigManager.set_record_target`）：盘拔了下次自动回到
         本机，不会出现"配置还指着那块盘、起录直接失败"。
         """
-        from ...disk_export import DISK_TARGET, disk_record_target
+        from ...disk_export import DISK_TARGET, target_by_key
 
-        if (settings.get("record_target") or "local") != DISK_TARGET:
+        key = str(settings.get("record_target") or "local")
+        if key == "local" or not key.startswith(f"{DISK_TARGET}:"):
             self.config.set_record_target("local")
             self.append(f"本次录制保存位置：{self.config.get_bag_dir()}（本机数据盘）")
             return True
 
-        # 重新解析一次而不是用对话框里那份快照：从打开对话框到现在，盘可能已经被拔了
-        target = disk_record_target(self.config)
+        # 重新解析一次、并且**按同一个键取**，而不是用对话框里那份快照：
+        # ① 从打开对话框到现在，盘可能已经被拔了；
+        # ② v6.5.1 之后可能同时列好几块盘，按键取才能确定"就是用户选的那一块"
+        #    —— 拿"第一个可用盘"的话，用户选了第二块却写到第一块，且界面看不出来。
+        target = target_by_key(self.config, key)
+        if target is None:
+            self.show_error(
+                "移动硬盘不可用",
+                f"没有找到这块盘（{key.split(':', 1)[-1]}）。\n"
+                f"它可能已经被拔出。\n\n"
+                f"可以改用「本机数据盘」录制，或插好硬盘后重新打开「录制设置」。")
+            return False
         if not target.available:
             self.show_error(
                 "移动硬盘不可用",
@@ -227,8 +238,13 @@ class DataOpsMixin:
                 f"无法在移动硬盘上创建目录：{target.path}\n{exc}\n\n"
                 f"请确认硬盘已插好、可写；必要时改用「本机数据盘」。")
             return False
-        self.config.set_record_target(DISK_TARGET, target.path)
-        self.append(f"本次录制保存位置：{target.path}（移动硬盘；录完可直接拔盘交付）")
+        self.config.set_record_target(target.key, target.path)
+        # 日志里同时给"盘名"和"移动硬盘"这个词：只看路径分不清是哪块盘，
+        # 只看盘名又不知道这次是写盘上。排障时两个都要。
+        self.append(f"本次录制保存位置：{target.path}"
+                    f"（移动硬盘 {target.mount.label}，"
+                    f"{target.mount.fs or '未知格式'}，"
+                    f"录完可直接拔盘交付）")
         return True
 
     @guard_slot
@@ -389,17 +405,21 @@ class DataOpsMixin:
 
     @guard_slot
     def on_bag_rate_stat(self):
-        """采集统计：对选中的 bag 做完整话题频率统计（bag_rate_stat.py）。"""
-        folder_path = QFileDialog.getExistingDirectory(
-            self,
-            "选择要统计的 bag 文件夹",
-            str(self.config.get_bag_dir()),
-            QFileDialog.ShowDirsOnly
-        )
-        if not folder_path:
+        """采集统计：选一份采集数据，跑完整话题频率统计（bag_rate_stat.py）。
+
+        v6.5.1 起用 `BagPickerDialog`（按时间倒序列出全部 bag、显示体积与话题文件数）
+        取代系统目录选择框 —— 后者只有目录名，分不清哪个是 bag、也没法定点判断
+        要统计哪一次，而且选到非 bag 目录不会当场拦。
+        """
+        from ..dialogs import BagPickerDialog
+        dlg = BagPickerDialog(self, uploader=self.uploader)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        folder_path = dlg.selected_path()
+        if folder_path is None:
             return
         try:
-            self.launcher.launch_bag_rate_stat(folder_path)
+            self.launcher.launch_bag_rate_stat(str(folder_path))
             self.append(f"已启动采集统计：{folder_path}")
         except Exception as e:
             self.show_error("启动失败", f"无法启动采集统计脚本：{e}")
