@@ -16,8 +16,13 @@ terminal_command: gnome-terminal
 # ---------- 版本下载（可选；version_repo_url 留空则该功能不启用） ----------
 # 远端只读文件服务器的**版本包目录**（nginx 目录列表）。上位机从它拉版本列表、
 # 下载 tar.bz2、解压成工作空间；解压完可直接切换 workspace_root。
-# 注意要指到具体产品目录，指到上层目录会解析不出包列表。
-version_repo_url: ""                     # 例如 http://172.16.10.2:9000/file/wheeled_robot/
+# ⚠️ 要指到**具体产品目录**（末尾带 /wheeled_robot/）。指到上层 `/file/` 也能连上
+#    （返回 200），但那里没有 tar.bz2，界面只会说"没解析到任何版本包"。
+#
+# **这里预填了内网默认地址**：它是团队共用的文件服务器，对所有机器都是同一个值，
+# 所以适合做默认值（"每台机器都不同"的东西才不该进交付包，比如密码 / 挂载点）。
+# 不接这台服务器的部署把它留空即可 —— 留空 = 该功能不启用，启动自检会标一条提醒。
+version_repo_url: http://172.16.10.2:9000/file/wheeled_robot/
 # 下载与解压的落点：归档下到这里，解压成 ${version_download_dir}/<包名>/<工作空间>。
 # 留空则取当前 workspace_root 的父目录。
 version_download_dir: ""

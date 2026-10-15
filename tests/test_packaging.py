@@ -145,3 +145,28 @@ def test_the_shipped_config_example_parses_into_numbers():
     assert disk.get("mount_point") == "", (
         "样例里 mount_point 应当留空（靠自动识别），写了具体路径等于把"
         "某一台机器的挂载点当成通用配置发出去")
+
+def test_the_shipped_config_example_points_at_the_version_repo():
+    """交付包里的**配置样例**必须预填版本仓库地址（v6.5.4）。
+
+    为什么值得钉一条：`app.py` 首启是 `shutil.copy(example, app_config.yaml)` ——
+    **样例里这一项是什么，新机器首启后就是什么**。实测（2026-10-15）：样例里原本是
+    空串，于是每台新机器首启后「版本下载」都是"未启用"，而当时的启动自检里又
+    没有这一项 → 现场报"看不到服务器上的版本"时，日志与界面都给不出线索。
+
+    这个地址是**团队共用的内网文件服务器**（对所有机器同一个值），所以适合做默认值；
+    不接它的部署把这一项清空即可（留空 = 功能不启用，自检会标一条提醒）。
+    """
+    import yaml
+
+    example = PROJECT_ROOT / "configs" / "app_config.example.yaml"
+    data = yaml.safe_load(example.read_text(encoding="utf-8"))
+    url = str(data.get("version_repo_url") or "").strip()
+
+    assert url, ("样例里 version_repo_url 不能留空 —— 首启是逐字复制这份样例，"
+                 "留空等于让每台新机器的版本下载都「未启用」")
+    assert url.startswith(("http://", "https://")), f"应当是个地址：{url}"
+    assert url.endswith("/"), f"目录地址末尾要有 /：{url}"
+    assert not url.rstrip("/").endswith("/file"), (
+        f"指向的是上层目录而不是包目录：{url} —— 实测这个地址也能连上（200），"
+        f"但那里没有 tar.bz2，界面只会说「没解析到任何版本包」")

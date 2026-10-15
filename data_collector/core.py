@@ -1998,6 +1998,20 @@ class ConfigManager:
             "未配置密码，数据回传会失败",
             level="warn")
 
+        # 版本仓库（「版本管理」里的版本下载）。标 warn：不接这台内网文件服务器的部署
+        # 是**合法状态**（`version_repo_url` 留空 = 功能不启用），所以不阻塞启动；
+        # 但"静默地不可用"比"明确地未配置"难查得多 —— 现场报"看不到服务器上的版本"
+        # 时，日志区里应当已经有一条能直接对上的话（2026-10-15 那次排查就卡在这里：
+        # 根因是这一项为空，而自检里没有它，界面上也只有一个空列表）。
+        repo_url = ""
+        try:
+            repo_url = str((self.get_version_repo() or {}).get("url") or "").strip()
+        except Exception:
+            pass
+        add("版本仓库", bool(repo_url),
+            repo_url or "未配置 version_repo_url，「版本管理」里的版本下载不可用",
+            level="warn")
+
         return results
 
 # ============ 进程管理器 ============

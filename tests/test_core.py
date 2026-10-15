@@ -1896,6 +1896,10 @@ def test_check_environment_all_ok_when_ready(tmp_path):
         "vision_calib_dir": str(calib),
         "product_file": str(tmp_path / "Product.json"),
         "remote_password": "test-secret",
+        # v6.5.4 起自检多了「版本仓库」一项（未配置 = warn）。本用例断言"齐备时无
+        # 未通过项"，所以夹具也得把它配上 —— 否则它会红，而红的理由与本用例要考的
+        # 东西无关（这正是"改自检要同步夹具"的那类连带）。
+        "version_repo_url": "http://172.16.10.2:9000/file/wheeled_robot/",
         **_DOCTOR_SCRIPTS,
     })
 
@@ -1949,6 +1953,44 @@ def test_check_environment_flags_missing_record_script(tmp_path):
 
     assert by_name["脚本 · 录制 bag"]["ok"] is False
     assert by_name["脚本 · 录制 bag"]["level"] == "fail"
+
+
+def test_check_environment_reports_the_version_repo_as_a_warning(tmp_path):
+    """「版本仓库」没配时，启动自检里必须有一条 warn（v6.5.4）。
+
+    对应一次真实现场排查（2026-10-15）：报"工具看不到服务器上的版本"，
+    根因是**那台机器的 `version_repo_url` 是空的** —— 而交付包刻意不含
+    `configs/app_config.yaml`，首启由 `app.py` 从样例**逐字复制**（`shutil.copy`），
+    样例里那一项原本是空串，于是**每台新机器首启后版本下载都是"未启用"**。
+
+    修之前自检里**根本没有这一项**，所以"静默不可用"在日志区一个字都不提，
+    只能进「版本管理」对话框看见那句话 —— 排查时无从下手。
+    """
+    _doctor_ready_workspace(tmp_path)
+    base = {
+        "workspace_root": str(tmp_path),
+        "teleop_config_path": "t.yaml",
+        "bag_dir": str(tmp_path / "bag"),
+        "run_nodes_script": "run_nodes.sh",
+        "record_bag_script": "record_bag.sh",
+        "record_vla_script": "record_vla.sh",
+        "record_cmd_script": "record_cmd.sh",
+    }
+    cfg_file = tmp_path / "app_config.yaml"
+    save_yaml(cfg_file, dict(base))                       # 故意不写 version_repo_url
+
+    by_name = {r["name"]: r for r in ConfigManager(cfg_file).check_environment()}
+
+    assert "版本仓库" in by_name, "自检里必须有这一项，否则「没配」这件事没人会知道"
+    assert by_name["版本仓库"]["ok"] is False
+    assert by_name["版本仓库"]["level"] == "warn", "没配版本仓库不该阻塞启动"
+    assert "version_repo_url" in by_name["版本仓库"]["detail"], "要指出改哪个键"
+
+    # 配上之后必须算通过（判据与 `get_version_repo` 同源，别再写一份）
+    save_yaml(cfg_file, dict(base, version_repo_url="http://172.16.10.2:9000/file/wheeled_robot/"))
+    by_name = {r["name"]: r for r in ConfigManager(cfg_file).check_environment()}
+    assert by_name["版本仓库"]["ok"] is True
+    assert by_name["版本仓库"]["detail"].startswith("http://")
 
 
 # ---------- 体积格式化与目录统计（界面共用） ----------
