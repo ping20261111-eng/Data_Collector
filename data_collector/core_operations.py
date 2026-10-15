@@ -20,6 +20,9 @@ from .core import (
 )
 # 姿势控制用到的常量与 payload 构造函数（话题名/消息类型/单位换算只有一处定义 —— 见 core_motion）
 from .core_motion import (BOOL_MSG, MOTION_STREAM_SCRIPT, STREAM_TIMEOUT_PAD,
+                          TRUNK_CONNECT_TOPIC, TRUNK_LOCK_AXES_TEXT,
+                          TRUNK_LOCK_INDEXES, TRUNK_LOCK_LAYOUT_OFFSET,
+                          TRUNK_LOCK_MSG, TRUNK_LOCK_SETTLE, TRUNK_LOCK_TOPIC,
                           stream_job_args, stream_job_key)
 # 常驻命令通道（v6.2.0）：姿态控制的下发走它，起不来就降级到一次性 CLI
 from .ros_bridge import RosBridge
@@ -1902,16 +1905,86 @@ class Launcher:
         （`getMotorBrakeState()` 只存在于 C++ SDK 接口里），所以这里只说
         "发出去了 / 没发出去"，**不说"现在是自锁状态"**。界面同理。
 
-        走**常驻通道**（与其它"一次性指令"同一条路），不新开机制。
+        走**常驻通道**（与其它"一次性指令"同一条路），不新开机制；
+        **通道起不来时降级到一次性 CLI**（`ros2 topic pub --once`），与
+        `publish_motion` 同一套范式 —— 这条降级是必需而不是可选的，原因见下面。
         """
         bridge = self.bridge(on_line=on_line)
-        if bridge is None:
-            return {"ok": None, "reason": self.bridge_note or "常驻通道不可用"}
-        # 解除是两步、每步都要等够（见通道里的 TRUNK_LOCK_SETTLE），
-        # 所以给它比默认 20s 更宽的窗口，别让"其实在做"被读成超时。
-        timeout = 20.0 if locked else 40.0
-        return bridge.ensure("trunk_lock" if locked else "trunk_unlock",
-                             timeout=timeout, on_line=on_line)
+        if bridge is not None:
+            # 解除是两步、每步都要等够（见 TRUNK_LOCK_SETTLE），
+            # 所以给它比默认 20s 更宽的窗口，别让"其实在做"被读成超时。
+            timeout = 20.0 if locked else 40.0
+            return bridge.ensure("trunk_lock" if locked else "trunk_unlock",
+                                 timeout=timeout, on_line=on_line)
+        # ⚠️ **这里原来直接返回"通道不可用"，等于这个功能没有**（现场 2026-10-15 报
+        # 「躯干自锁无法使用」）。自锁是**单条一次性指令** —— 现场给的就是一条
+        # `ros2 topic pub --once /trunk_control/switch_power_on ...`，它根本不依赖
+        # 常驻进程存活。通道起不来的那些原因（缺 rclpy / 启动期崩 / 工作空间路径不对）
+        # 与"能不能发这一条"无关，于是通道一挂自锁就彻底不可用；这也与本文件
+        # `publish_motion` / 急停 / 下电 / 夹爪的既有约定（**通道不是必须的**）不一致。
+        logger.warning(f"躯干自锁：常驻通道不可用，降级到一次性 CLI（{self.bridge_note}）")
+        return self._trunk_lock_via_cli(locked, on_line=on_line)
+
+    def _trunk_lock_via_cli(self, locked: bool, on_line=None) -> dict:
+        """躯干自锁 / 解除的**一次性 CLI** 路径（常驻通道不可用时的兜底）。
+
+        与 `publish_motion` 兜底到 `_publish_topics` 是同一套机制；区别只有一处：
+        解除那**两步必须依次发、每步之间等够**（现场确认单发一条 `connect true`
+        不生效），不能像 `publish_motion` 那样一条命令并发下去。
+
+        返回形状与通道那条**保持一致**（`{ok, steps, reason}`，每个 step 带
+        `name` / `sent` / `matched`），所以界面的汇报文案两边都能用。
+        """
+        if on_line:
+            on_line("躯干自锁：常驻通道不可用，改用一次性 CLI 下发")
+        steps = []
+        if locked:
+            # 照现场脚本 `swich_pown_on.sh` 那一段：`UInt8MultiArray`，
+            # `layout` 只有 `data_offset`（**0**，与躯干目标的 1 不同，别混），
+            # `data` 是电机索引 H1~H3 → 0x00/0x01/0x02。
+            payload = ("{layout: {dim: [], data_offset: "
+                       f"{TRUNK_LOCK_LAYOUT_OFFSET}}}, data: ["
+                       + ", ".join(f"0x{index:02x}" for index in TRUNK_LOCK_INDEXES)
+                       + "]}")
+            name = f"躯干自锁（{TRUNK_LOCK_AXES_TEXT} 转为仅上电）"
+            codes = self._publish_topics(
+                [(name, TRUNK_LOCK_TOPIC, TRUNK_LOCK_MSG, payload)],
+                timeout=10.0, label="躯干自锁", keep_alive=2.0)
+            steps.append(self._lock_step(name, codes.get(name)))
+        else:
+            for index, flag in enumerate((False, True), start=1):
+                name = ("躯干下使能（解除自锁 · 第 1 步）" if index == 1
+                        else "躯干重新使能（解除自锁 · 第 2 步）")
+                codes = self._publish_topics(
+                    [(name, TRUNK_CONNECT_TOPIC, BOOL_MSG,
+                      f"data: {'true' if flag else 'false'}")],
+                    timeout=10.0, label=name, keep_alive=TRUNK_LOCK_SETTLE)
+                step = self._lock_step(name, codes.get(name))
+                steps.append(step)
+                if step["ok"] is not True:
+                    break                      # 第 1 步就没成，别再发第 2 步
+                if index == 1:
+                    time.sleep(TRUNK_LOCK_SETTLE)
+        failed = [s for s in steps if s["ok"] is not True]
+        if failed:
+            return {"ok": False, "steps": steps, "reason": failed[0]["reason"]}
+        return {"ok": True, "steps": steps, "reason": ""}
+
+    @staticmethod
+    def _lock_step(name: str, code) -> dict:
+        """把一次性 CLI 的退出码翻成通道那条一样的 step 形状（措辞也一致）。"""
+        if code is None:
+            return {"name": name, "ok": None, "sent": 0, "matched": -1,
+                    "reason": "没有回取到结果（下发进程没回话）", "channel": "一次性 CLI"}
+        if code == 0:
+            return {"name": name, "ok": True, "sent": 1, "matched": -1,
+                    "reason": "", "channel": "一次性 CLI"}
+        if code == 124:
+            return {"name": name, "ok": False, "sent": 0, "matched": 0,
+                    "reason": "等待超时：没等到订阅者（主程序没在跑？）",
+                    "channel": "一次性 CLI"}
+        return {"name": name, "ok": False, "sent": 0, "matched": -1,
+                "reason": f"退出码 {code}", "channel": "一次性 CLI"}
 
     def ensure_arm_point_mode(self, side: str, on_line=None) -> dict:
         """让某侧手臂退出 follow / servoj（`ArmMove` 的前置条件）。"""

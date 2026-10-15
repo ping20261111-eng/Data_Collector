@@ -3916,3 +3916,187 @@ def test_motion_stream_without_workspace_or_script_sends_nothing(launcher_env, m
     seen = []
     assert launcher.run_motion_streams([job], on_line=seen.append) == {"躯干实时流": False}
     assert any("找不到实时流脚本" in line for line in seen)
+
+
+# ==================== 躯干自锁：常驻通道不可用时必须还能下发 ====================
+# ⚠️ 这组用例是为了钉住一条**已经砸到现场的缺陷**：自锁是单条一次性指令
+# （现场给的就是 `ros2 topic pub --once /trunk_control/switch_power_on ...`），
+# 根本不依赖常驻进程存活；而 `set_trunk_locked` 当时在通道不可用时**直接返回
+# "通道不可用"**，于是通道一挂这个功能就彻底不可用（现场报「躯干自锁无法使用」）。
+# 而 `conftest._no_command_bridge` 那个 fixture **默认把通道禁掉**，
+# 既有守卫却全打在通道那条路上（`test_scripts.py::bridge_module`）+ 界面层，
+# **没有一条覆盖"通道不可用"** —— 所以整套测试全绿、功能却是坏的。
+#
+# 下面每条都显式声明自己走的是一次性 CLI 那条路，并断言**真正下发的那个命令串**，
+# 而不只是"调了某个方法"：断言必须打在 `_publish_topics` 的入参上，
+# 否则"通道被桩掉、实际什么也没发"也会照样绿。
+
+
+def _trunk_lock_launcher(tmp_path, monkeypatch, *, stub_publish=True):
+    """造一个**通道不可用**的 Launcher，并桩掉 `_publish_topics` 以捕获下发内容。"""
+    from data_collector import core_operations, core_motion
+    from data_collector.core import ConfigManager, save_yaml
+
+    workspace = tmp_path / "ws"
+    (workspace / "install").mkdir(parents=True)
+    (workspace / "install" / "setup.bash").write_text("", encoding="utf-8")
+    cfg_file = tmp_path / "app_config.yaml"
+    save_yaml(cfg_file, {
+        "workspace_root": str(workspace),
+        "teleop_config_path": "teleop.yaml",       # ConfigManager 无条件要读这个键
+        "bag_dir": str(tmp_path / "bag"),
+    })
+    save_yaml(workspace / "teleop.yaml",
+              {"teleop": {"calibration": "default"}, "calibrations": {}})
+
+    launcher = core_operations.Launcher(ConfigManager(cfg_file))
+    # 通道不可用（复现现场：rclpy 缺 / 启动期崩 / 工作空间路径不对）
+    monkeypatch.setattr(core_operations.Launcher, "bridge",
+                        lambda self, on_line=None: None, raising=True)
+    monkeypatch.setattr(core_operations.Launcher, "bridge_note",
+                        "测试：常驻通道不可用", raising=False)
+
+    sent = []
+
+    def fake_publish(_self, entries, timeout=6.0, label="", keep_alive=2.0):
+        sent.append({"entries": list(entries), "timeout": timeout,
+                     "label": label, "keep_alive": keep_alive})
+        return {name: 0 for name, *_rest in entries}          # 一律成功
+
+    if stub_publish:
+        monkeypatch.setattr(core_operations.Launcher, "_publish_topics",
+                            fake_publish, raising=True)
+    # 解除那两步之间要等 3s，别让用例真的睡 3 秒（等够这件事由下面的
+    # `slept` 断言盯着，不靠真睡）
+    slept = []
+    monkeypatch.setattr(core_operations.time, "sleep",
+                        lambda seconds: slept.append(seconds), raising=True)
+    return launcher, sent, slept, core_motion
+
+
+def test_trunk_lock_falls_back_to_cli_when_the_bridge_is_down(tmp_path, monkeypatch):
+    """**通道不可用时，自锁仍然必须下发出去** —— 这就是现场报的那个故障。
+
+    现场给的指令是一条 `ros2 topic pub --once`，所以兜底路径必须**逐字对得上**：
+    话题 `/trunk_control/switch_power_on`、类型 `std_msgs/msg/UInt8MultiArray`、
+    `layout.data_offset = 0`（**不是躯干目标那个 1**）、`data = [0x00, 0x01, 0x02]`。
+    """
+    launcher, sent, _slept, core_motion = _trunk_lock_launcher(tmp_path, monkeypatch)
+
+    result = launcher.set_trunk_locked(True)
+
+    assert result["ok"] is True, f"通道不可用时自锁不该失败：{result}"
+    assert len(sent) == 1, "自锁只要一条（不要并发发多条）"
+    entries = sent[0]["entries"]
+    assert len(entries) == 1
+    name, topic, msg_type, payload = entries[0]
+    assert topic == "/trunk_control/switch_power_on"
+    assert msg_type == "std_msgs/msg/UInt8MultiArray"
+    # payload 是一段要交给 `ros2 topic pub` 的 YAML 文本。**必须整个解析一遍**，
+    # 不能用 `assert "data_offset: 0" in payload` —— 花括号多一层那种错
+    # （`{{layout: {{...}}`）substring 照样命中，只有真 parse 才拦得住。
+    import yaml
+    parsed = yaml.safe_load(payload)
+    assert parsed["layout"]["data_offset"] == core_motion.TRUNK_LOCK_LAYOUT_OFFSET == 0, (
+        f"data_offset 必须是 0（与躯干目标的 1 不同）：{payload}")
+    assert parsed["layout"]["dim"] == [], f"dim 应为空表（照现场脚本）：{payload}"
+    assert parsed["data"] == list(core_motion.TRUNK_LOCK_INDEXES) == [0, 1, 2], (
+        f"电机索引必须是 H1~H3：{payload}")
+    # 与既有躯干目标 payload 同一形状（两者都只设 data_offset、不设 dim 维度）
+    from data_collector.core_motion import trunk_target_payload
+    trunk_parsed = yaml.safe_load(trunk_target_payload([0] * 6))
+    assert trunk_parsed["layout"]["dim"] == [] == parsed["layout"]["dim"], (
+        "自锁与躯干目标的 layout 形状应一致：都只设 data_offset，dim 都是空表")
+    # 唯一样本差异就是那个 data_offset 值本身（自锁 0 / 躯干目标 1）—— 两种话题
+    # 两种消息类型，别统一。
+    assert trunk_parsed["layout"]["data_offset"] == 1 != parsed["layout"]["data_offset"]
+    # 界面汇报要用的 step 形状
+    step = result["steps"][0]
+    assert step["ok"] is True and step["sent"] == 1
+    assert step["channel"] == "一次性 CLI"
+    assert core_motion.TRUNK_LOCK_AXES_TEXT in name
+
+
+def test_trunk_unlock_falls_back_to_cli_as_two_ordered_steps(tmp_path, monkeypatch):
+    """解除的兜底必须是**两步、依次发、中间等够** —— 现场确认单发一条不生效。
+
+    这三点少任何一条，现场表现都是"点了没反应"：
+    · 少第一步 → 不生效；· 并发发 → 顺序错，两步几乎同时到；· 不等 → 不生效。
+    """
+    launcher, sent, slept, core_motion = _trunk_lock_launcher(tmp_path, monkeypatch)
+
+    result = launcher.set_trunk_locked(False)
+
+    assert result["ok"] is True, f"通道不可用时解除不该失败：{result}"
+    assert len(sent) == 2, "解除是两步，各发一次"
+    flags = []
+    for call in sent:
+        assert len(call["entries"]) == 1, "两步不能并发"
+        name, topic, msg_type, payload = call["entries"][0]
+        assert topic == "/trunk_control/connect"
+        assert msg_type == "std_msgs/msg/Bool"
+        flags.append(payload.strip().endswith("true"))
+    assert flags == [False, True], f"先下使能、再上使能：{flags}"
+    # 两步之间必须等够（通道那条里是 TRUNK_LOCK_SETTLE）
+    assert slept == [core_motion.TRUNK_LOCK_SETTLE], f"两步之间没等够：{slept}"
+    assert len(result["steps"]) == 2
+
+
+def test_trunk_unlock_stops_after_a_failed_first_step(tmp_path, monkeypatch):
+    """第 1 步就没发出去时**不要**再发第 2 步（那等于"只上使能"，比不做更糟）。"""
+    from data_collector.core import ConfigManager
+    from data_collector import core_operations
+
+    launcher, sent, _slept, _cm = _trunk_lock_launcher(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def failing_first(_self, entries, timeout=6.0, label="", keep_alive=2.0):
+        calls["n"] += 1
+        code = 124 if calls["n"] == 1 else 0        # 第 1 步超时
+        return {name: code for name, *_rest in entries}
+
+    monkeypatch.setattr(core_operations.Launcher, "_publish_topics",
+                        failing_first, raising=True)
+
+    result = launcher.set_trunk_locked(False)
+
+    assert result["ok"] is False
+    assert calls["n"] == 1, "第 1 步失败后不该再发第 2 步"
+    assert "订阅者" in result["reason"], f"超时要说清是没等到订阅者：{result['reason']}"
+
+
+def test_trunk_lock_cli_path_reports_why_when_the_workspace_is_gone(tmp_path,
+                                                                     monkeypatch):
+    """工作空间不在时不能报"成功" —— 一次性 CLI 那条路的诚实判据。
+
+    `_publish_topics` 在工作空间缺失时返回 `{}`（拿不到任何退出码），
+    所以 `_lock_step` 必须把它翻成 `ok=None`（未确认），既不当成功也不当失败。
+    """
+    from data_collector import core_operations
+
+    # **不桩 `_publish_topics`** —— 要考的就是它自己"工作空间不在就返回 {}"那条行为，
+    # 桩掉它等于把这个守卫自己要考的东西换成假的。
+    launcher, _sent, _slept, _cm = _trunk_lock_launcher(
+        tmp_path, monkeypatch, stub_publish=False)
+    monkeypatch.setattr(launcher.config, "check_workspace", lambda: False)
+
+    result = launcher.set_trunk_locked(True)
+
+    assert result["ok"] is False, "拿不到结果时不能报成功"
+    assert result["steps"][0]["ok"] is None, "应如实标成「未确认」"
+    assert "没有回取到结果" in result["reason"]
+
+
+def test_trunk_lock_settle_matches_the_bridge_constant():
+    """两条通道的自锁等待时间必须一样（否则"有时能动有时不动"没法排查）。"""
+    import re
+    from pathlib import Path
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "ros_command_bridge.py"
+    text = script.read_text(encoding="utf-8")
+    match = re.search(r"^TRUNK_LOCK_SETTLE\s*=\s*([0-9.]+)", text, re.M)
+    assert match, "通道脚本里必须有 TRUNK_LOCK_SETTLE"
+    from data_collector import core_motion
+    assert float(match.group(1)) == core_motion.TRUNK_LOCK_SETTLE, (
+        f"两条通道的自锁等待不一致：通道 {match.group(1)}s vs "
+        f"兜底 {core_motion.TRUNK_LOCK_SETTLE}s")

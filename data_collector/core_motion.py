@@ -105,6 +105,12 @@ TRUNK_LOCK_LAYOUT_OFFSET = 0
 #: 会和索引脱节的地方。
 TRUNK_LOCK_AXES_TEXT = (f"H{TRUNK_LOCK_INDEXES[0] + 1}~H{TRUNK_LOCK_INDEXES[-1] + 1}"
                         if TRUNK_LOCK_INDEXES else "")
+#: 自锁 / 解除每一步之后停多久（秒）。
+#: 与 `scripts/ros_command_bridge.py::TRUNK_LOCK_SETTLE` 必须一致（两处各一份：
+#: 通道那条是常驻进程里的实现，一次性 CLI 那条是本仓库的实现 —— 同一个动作
+#: 走哪条通道都得等一样久，否则"有时能动有时不动"就没法排查了）。
+#: 解除那两步之间更必须等够：**现场确认单发一条 `connect true` 不生效**。
+TRUNK_LOCK_SETTLE = 3.0
 ARM_MOVE_TOPICS = {"left": "/arm_control/left_arm_move",
                    "right": "/arm_control/right_arm_move"}
 ARM_MOVE_MSG = "wheeled_robot_msgs/msg/ArmMove"
