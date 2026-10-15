@@ -696,3 +696,42 @@ def test_a_picker_with_no_uploader_still_opens(qapp):
         dlg.deleteLater()# ---------- 枚举：判据 ----------
 
 
+
+
+def test_records_directly_to_disk_accepts_the_mount_as_text(tmp_path):
+    """`_records_directly_to_disk` 必须接受**字符串**挂载点（别要求调用方先转 Path）。
+
+    这是一条**只出图才能发现**的既存缺陷：界面上那个挂载点来自
+    `ed_disk_mount.text()`，是字符串；而 `core.is_within` 内部直接调 `.resolve()`，
+    接字符串会抛 `AttributeError` —— 异常被面板里的 `except` 吞成一条警告日志，
+    于是「本次录制的数据已直接写在盘上 —— 无需再导出」那行提示**从来没显示过**，
+    界面上也不报错。
+
+    这里直接断言"接字符串不抛、且判定正确"，把这条吞掉的异常钉成红的。
+    """
+    from data_collector.ui.panels.export_target import ExportTargetMixin
+
+    usb = tmp_path / "usb"
+    (usb / "seq" / "2026-10-15").mkdir(parents=True)
+
+    class _Win:
+        """只借 `_records_directly_to_disk` 需要的那一样（config）。"""
+
+        def __init__(self, config):
+            self.config = config
+
+    class _Cfg:
+        def __init__(self, bag_dir):
+            self._bag_dir = bag_dir
+
+        def get_bag_dir(self):
+            return self._bag_dir
+
+    recording_dir = usb / "seq" / "2026-10-15"
+    probe = ExportTargetMixin._records_directly_to_disk.__get__(
+        _Win(_Cfg(str(recording_dir))))
+    # 字符串挂载点（面板给的就是它）
+    assert probe(str(usb)) is True, "录制落在盘上时必须认出来（且不能抛异常）"
+    assert probe(str(tmp_path / "other")) is False
+    # Path 也要能接（单元测试里直接传 Path 的情形）
+    assert probe(usb) is True

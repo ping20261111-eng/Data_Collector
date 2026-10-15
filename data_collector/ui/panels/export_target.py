@@ -15,6 +15,7 @@ v6.4.9 又拆了一次同性质的：服务器凭据（问密码 + 探一次连�
 """
 
 from html import escape as html_escape
+from pathlib import Path
 
 from PyQt5.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QFrame, QLabel,
                              QLineEdit, QPushButton, QComboBox, QToolButton,
@@ -859,12 +860,20 @@ class ExportTargetMixin(RemoteCredentialMixin):
                   f'本次录制的数据已直接写在盘上 —— 无需再导出，直接拔盘即可</span>')
         self.lb_landing_preview.setVisible(True)
 
-    def _records_directly_to_disk(self, mount: str) -> bool:
-        """本次录制的落盘目录是否就在这块盘上（判据封装在 `disk_export` 里）。"""
+    def _records_directly_to_disk(self, mount) -> bool:
+        """本次录制的落盘目录是否就在这块盘上（判据封装在 `core.is_within` 里）。
+
+        `mount` 是**字符串**（`ed_disk_mount.text()` 的返回值），所以必须先转成
+        `Path` —— `is_within` 内部直接调 `.resolve()`，接字符串会抛
+        `AttributeError`。这个错误原先被下面的 `except` 吞成一条警告日志，
+        于是「本次录制的数据已直接写在盘上 —— 无需再导出」那行提示**从来没显示过**
+        （实测 v6.5.1 出图时日志里出现
+        `判断录制落点是否已在盘上失败：'str' object has no attribute 'resolve'`）。
+        """
         try:
             from ...core import is_within
             # 问的是"本次录制的落盘目录在不在这块盘上"（不是"目标会不会在源里面"）
-            return is_within(self.config.get_bag_dir(), mount)
+            return is_within(Path(self.config.get_bag_dir()), Path(str(mount)))
         except Exception as exc:            # noqa: BLE001 —— 预览失败不该弹错
             logger.warning(f"判断录制落点是否已在盘上失败：{exc}")
             return False
