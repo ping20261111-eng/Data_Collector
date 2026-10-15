@@ -111,3 +111,37 @@ def test_pack_requires_our_record_script_copies(tmp_path):
     assert "包里缺 scripts/record_vla.sh" in output
     assert "静默回落" in output, "失败提示要说清后果（会静默回落到机器侧那份）"
     assert not list((tmp_path / "out").glob("*.tar.gz")), "失败时不该留下包"
+
+
+def test_the_shipped_config_example_parses_into_numbers():
+    """交付包里那份**配置样例**的数值字段必须真能解析成数字。
+
+    这条是被**冷启动验证**逮到的：`app_config.example.yaml` 里有一行
+    `warn_file_bytes: 3800000000# 超过这个大小的文件会提醒` —— 数字与 `#` 之间
+    少一个空格，YAML 会把注释当值的一部分，于是解析出来是字符串
+    `"3800000000# 超过…"`，`int()` 直接抛
+    `invalid literal for int() with base 10`。
+
+    后果不是"读不到那个字段"而是**首启就崩**（未捕获异常）：
+    程序首启会从这份样例生成 `app_config.yaml`，于是**每台新机器第一次打开
+    都在启动阶段挂掉**。开发机没事是因为它的 `app_config.yaml` 早于这次损坏
+    就已经生成好了 —— 坏的那份只在新机器上生效。
+
+    守卫写法不用正则去猜 YAML 语法（"数字紧跟 #" 只是一例，别的粘连形式还有），
+    直接**把每个数值型字段 parse 一次**：任何粘连都会在这里变成类型不对。
+    """
+    import yaml
+
+    example = PROJECT_ROOT / "configs" / "app_config.example.yaml"
+    assert example.is_file(), f"配置样例不在包里：{example}"
+    data = yaml.safe_load(example.read_text(encoding="utf-8"))
+
+    disk = data.get("disk_export", {})
+    assert isinstance(disk.get("warn_file_bytes"), int), (
+        f"warn_file_bytes 解析成了 {disk.get('warn_file_bytes')!r}"
+        f"（多半是数字与行尾 # 之间少了空格）")
+    assert isinstance(disk.get("min_free_margin_mb"), int), (
+        f"min_free_margin_mb 解析成了 {disk.get('min_free_margin_mb')!r}")
+    assert disk.get("mount_point") == "", (
+        "样例里 mount_point 应当留空（靠自动识别），写了具体路径等于把"
+        "某一台机器的挂载点当成通用配置发出去")
