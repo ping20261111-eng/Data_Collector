@@ -635,6 +635,12 @@ def test_choosing_the_disk_reveals_the_mount_row_and_saves_it(status_env):
 
     为什么切换就写：这个设置决定"数据送到哪儿"，只留在内存里的话，
     现场下次开程序会退回服务器 —— 而那时没人会记得自己改过。
+
+    第三条断言（状态行说清挂载点 / 就绪）在 v6.5.1 之后**依赖枚举结果**：
+    自动识别会把插着的盘填进输入框并立刻探测，所以状态行可能是
+    「✔ 硬盘就绪」而不是「请填写硬盘挂载点」—— 两者都是对的，取决于
+    **跑测试的这台机器插没插盘**。所以这里只断言"状态行不是空白"，
+    具体的两种文案各有专门的用例覆盖。
     """
     win, cm, _status = status_env
 
@@ -642,7 +648,25 @@ def test_choosing_the_disk_reveals_the_mount_row_and_saves_it(status_env):
 
     assert win.disk_mount_row.isHidden() is False
     assert cm.get_export_settings()["target"] == "disk"
-    # 没填路径时给一句"该做什么"，而不是空白
+    state = win.lb_disk_state.text().strip()
+    assert state, "状态行不能是空白：要么说没填挂载点，要么说硬盘就绪"
+
+
+def test_no_disk_and_no_mount_point_says_what_to_do(status_env, monkeypatch):
+    """没插盘、挂载点也没填 → 明确说"请填写硬盘挂载点"，而不是空白。
+
+    为什么要单独一条：自动识别之后"挂载点为空"是**正常配置**（表示全靠自动
+    识别），但**真的没插盘**时界面仍要说清下一步该做什么 —— 沉默会被理解成
+    "程序没认出盘"，而那句话正是这句话要给的。
+    """
+    from data_collector import disk_export as de
+    monkeypatch.setattr(de, "list_removable_mounts", lambda configured="": [])
+
+    win, _cm, _status = status_env
+    win.cb_export_target.setCurrentIndex(win.cb_export_target.findData("disk"))
+    win.ed_disk_mount.setText("")
+    win._probe_disk_mount()
+
     assert "挂载点" in win.lb_disk_state.text()
 
 
@@ -7270,3 +7294,4 @@ def test_no_slang_left_in_user_visible_strings(status_env):
     for word in ("盘已就绪", "未插好", "送到", "两者都送", "将保存到", "本次采集名"):
         assert word not in seen, f"口语化残留：{word}（出现在 {seen!r}）"
     assert "未就绪" in win.lb_chip_caption.text(), "未就绪态芯片文案应是「未就绪」"
+
