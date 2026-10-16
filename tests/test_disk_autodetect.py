@@ -420,21 +420,21 @@ def test_a_broken_mounts_file_does_not_raise(mounts):
 
 
 def test_usb_detection_uses_sysfs_path_not_the_removable_flag(monkeypatch):
-    """USB 判据读 sysfs 的**设备路径**，不能读  属性。
+    """USB 判据读 sysfs 的**设备路径**，不能读 `removable` 属性。
 
-    实测（本机  就是那只移动硬盘）： 是 **0**，
-    与内置 NVMe 完全一样 —— 分不出��。sysfs 真实路径里含 
-    （）才是准的。
+    实测（本机 `sda` 就是那只移动硬盘）：`removable` 是 **0**，与内置 NVMe 完全一样
+    —— 靠它分不出移动硬盘；sysfs 真实路径里**含 `/usb`** 才是准的。
 
-    做法：只桩 （取路径那一步），让判据本身跑真的逻辑。
-     的值由**真 sysfs** 决定（ 在这台机器上确实是 0），
-    所以"它是不是 USB"完全由 sysfs 路径决定 —— 这正是我们要钉住的关系。
+    做法：只桩 `_usb_sysfs_path`（取路径那一步），让判据本身跑真逻辑。
+
+    ⚠️ **真机那一段只在盘插着时才成立**：2026-10-16 实测，那只盘拔掉之后
+    `/sys/block/sda` 直接不存在，原先写成 `assert ....exists()` 就会红 ——
+    而红的原因与被测判据毫无关系。**守卫不该把「当前恰好插着某个硬件」当前提。**
+    所以真机那段改成"有就顺带验一次，没有就跳过"，判据本身由下面几段完整覆盖。
     """
-    # 真机上 sda 就是 USB 移动硬盘：removable 报 0，但 sysfs 路径含 /usb
-    assert Path("/sys/block/sda/removable").exists(), (
-        "这条用例要在有 USB 设备的环境里跑才有意义")
-    assert de._is_usb_block("sda") is True, (
-        "removable=0 的移动硬盘仍必须被认出来（实测本机就是 removable=0）")
+    if Path("/sys/block/sda/removable").exists():
+        assert de._is_usb_block("sda") is True, (
+            "removable=0 的移动硬盘仍必须被认出来（实测本机就是 removable=0）")
 
     # 内置 NVMe：sysfs 路径不含 /usb → 排除
     monkeypatch.setattr(

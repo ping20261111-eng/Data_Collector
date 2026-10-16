@@ -135,6 +135,24 @@ class ReleaseDialog(QDialog):
         head.addWidget(self.repo_label)
         outer.addLayout(head)
 
+        # 读取失败时的**多行**说明（原文 / 归属 / 建议）。
+        #
+        # ⚠️ 这段**不能塞进上面那一行**：`describe()` 的文案是**三行**、200+ 字
+        # （实测 218 字），原先把它 `.replace("\n", "　")` 压成一行塞进 `repo_label` ——
+        # 后果是那个标签需要 1905px，把 503px 的对话框**撑到 1085px**（现场那台机上
+        # 更是整行溢出到窗口外，且"读取版本列表失败"与原因粘成一句话分不清）。
+        #
+        # 现在：`repo_label` **一直显示仓库地址**（它是"这是哪个地址"，不该被错误覆盖），
+        # 失败原因另起一段、允许换行。
+        self.remote_error_label = QLabel()
+        self.remote_error_label.setObjectName("FactLabel")
+        # 纯文本：错误原文里有 `<urlopen error ...>` 这种尖括号，富文本会自动吞掉它
+        self.remote_error_label.setTextFormat(Qt.PlainText)
+        self.remote_error_label.setWordWrap(True)
+        self.remote_error_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.remote_error_label.setVisible(False)
+        outer.addWidget(self.remote_error_label)
+
         filters = QHBoxLayout()
         filters.setSpacing(SP["sp2"])
         self.edit_filter = QLineEdit()
@@ -288,6 +306,7 @@ class ReleaseDialog(QDialog):
         if not self.repo["url"]:
             self.remote_status_label.setText("未配置版本服务器，下载功能不可用")
             self.repo_label.setText("在 app_config.yaml 里填 version_repo_url")
+            self._set_remote_error("")
             self.table.setRowCount(0)
             self.on_selection_changed()
             return
@@ -295,6 +314,7 @@ class ReleaseDialog(QDialog):
             return
         self.btn_refresh.setEnabled(False)
         self.remote_status_label.setText("正在读取远端版本列表…")
+        self._set_remote_error("")
         self.fetch_thread = ReleaseFetchThread(
             self.repo["url"], self.repo["timeout"], self)
         self.fetch_thread.finished.connect(self.on_fetch_done)
@@ -308,13 +328,26 @@ class ReleaseDialog(QDialog):
             self.releases = []
             self.table.setRowCount(0)
             self.remote_status_label.setText("读取版本列表失败")
-            self.repo_label.setText((error or "").replace("\n", "　"))
+            # 仓库地址**留在原处**（不再被错误文案覆盖 —— 那是"地址"那一格的本职），
+            # 详细原因另起一段多行显示（保留 describe() 自己的换行）
+            self._set_remote_error(error or "读取版本列表失败")
             self.on_selection_changed()
             return
         self.releases = list(payload or [])
         self._rebuild_kind_filter()
         self.render_table()
         self.remote_status_label.setText(f"远端共 {len(self.releases)} 个版本")
+        self._set_remote_error("")
+
+    def _set_remote_error(self, text: str) -> None:
+        """设置 / 清空远端的失败说明（空串即隐藏）。
+
+        单独一个方法是为了让四处调用点都不必各自记住"空串要隐藏"这件事 ——
+        漏掉一处就会留下上一次的旧错误。
+        """
+        cleaned = (text or "").strip()
+        self.remote_error_label.setText(cleaned)
+        self.remote_error_label.setVisible(bool(cleaned))
 
     def _rebuild_kind_filter(self):
         """类型选项来自实际列表：后缀是打包约定（test/end/fix…），

@@ -4001,6 +4001,66 @@ def test_dialog_explains_when_repo_url_missing(ui_env, tmp_path, monkeypatch):
     assert not dialog.btn_download.isEnabled()
 
 
+def test_dialog_shows_the_fetch_failure_on_its_own_wrapped_line(ui_env, tmp_path,
+                                                               monkeypatch):
+    """读取失败时：**仓库地址留在原处**，原因另起一段（可换行），且**不把对话框撑宽**。
+
+    这条对应一个**只在出图 / 现场才看得出来**的显示缺陷：
+    `describe()` 的错误文案是**三行**（原文 / 归属 / 建议）、200+ 字，原先被
+    `.replace("\n", "　")` 压成一行塞进 `repo_label` —— 而那个标签就在
+    「读取版本列表失败」**右边同一行**里。实测：它需要 1905px，把 503px 的对话框
+    撑到 1085px；现场那台机上整行溢出到窗口外，状态与原因还粘成一句话。
+
+    **判据是结构性的，刻意不调 `sizeHint()`**：在这套**离屏 pytest 环境**里，对未
+    `show()` 过的 `ReleaseDialog` 调 `sizeHint()` 会**段错误**（实测 6/6 崩；
+    把那两处 sizeHint 去掉即 6/6 绿）。像素级的溢出数字由出图实测记录 ——
+    实测那台机器上 `repo_label` 需要 **1905px**、对话框被从 **503px 撑到 1085px**；
+    修复后 **252px / 503px**。单测里换成"长文案只许待在可换行的标签里"这种
+    确定性判据，等价且不脆。
+    """
+    from PyQt5.QtCore import Qt
+
+    from data_collector.errors import ErrorCode, describe
+    from data_collector.ui import release_dialog as rd
+
+    win, config = ui_env
+    download_dir = tmp_path / "dl"
+    download_dir.mkdir()
+    monkeypatch.setattr(config, "get_version_repo", lambda: {
+        "url": "http://172.16.10.2:9000/file/wheeled_robot/",
+        "download_dir": download_dir,
+        "auto_switch": True, "keep_archive": True, "timeout": 5.0})
+    _patch_fetch_thread(monkeypatch)
+
+    dialog = rd.ReleaseDialog(config, None)
+
+    # 先走一遍正常态（成功、空列表）：失败说明应当隐藏
+    dialog.on_fetch_done(True, [], "")
+    assert dialog.remote_error_label.isHidden(), "正常态不该显示失败说明"
+
+    # 再喂一条**真实长度**的失败文案（用真 describe()，不自己编短文本）
+    error = describe(ErrorCode.REPO_UNREACHABLE,
+                     "无法连接版本服务器 http://172.16.10.2:9000/file/wheeled_robot/："
+                     "<urlopen error [Errno 101] 网络不可达>")
+    dialog.on_fetch_done(False, None, error)
+
+    # ① 地址还在（它是「这是哪个地址」，不该被错误文案顶掉）
+    assert dialog.repo_label.text() == "http://172.16.10.2:9000/file/wheeled_robot/", (
+        "失败时仓库地址必须留在原处，不能被错误文案覆盖")
+    # ② 失败原因独立成段、可换行、保留三行结构
+    assert not dialog.remote_error_label.isHidden(), "失败说明要显示出来"
+    assert dialog.remote_error_label.wordWrap() is True, "长文案必须允许换行"
+    text = dialog.remote_error_label.text()
+    assert text.count("\n") >= 2 and "归属：" in text and "建议：" in text
+    # ③ 尖括号里的原文要留着（富文本会把 <urlopen ...> 当标签吞掉）
+    assert "<urlopen error" in text
+    assert dialog.remote_error_label.textFormat() == Qt.PlainText
+    # ④ 关键：那条 218 字的文案**只**能待在可换行的标签里 ——
+    #    地址那一格（单行、就在同一条 head 行里）绝不能承载它。
+    #    长文案进可换行标签 → 宽度由布局给，而不是由文字长度决定，这才是不撑宽的原因。
+    assert error not in dialog.repo_label.text(), "长文案不能又回到那一行里"
+
+
 def test_search_and_kind_filter_narrow_the_table(ui_env, tmp_path, monkeypatch):
     """搜索框按名字匹配、类型下拉按后缀过滤，两者可叠加。"""
     releases = _releases(("202609171012", "正式"), ("202609161641", "fix"),
