@@ -126,6 +126,25 @@ def head_target(current) -> list:
     return target
 
 
+
+def as_floats(value) -> list:
+    """把消息里的数组字段读成 ``float`` 列表。**绝不写 `x or []`**。
+
+    与 `scripts/ros_command_bridge.py::as_floats` 同一条纪律（那边写得更细）：
+
+        ValueError: The truth value of an array with more than one element is ambiguous
+
+    ROS 把 `float32[]` / `float64[]` 这类字段给成**数组对象**（numpy），而 `or` 会去问
+    "这个数组真不真" —— 数组没有"真或假"这个答案，于是**直接抛 ValueError**。
+    这个异常从 `spin_once` 里冒出来会**终止整个脚本**（现场 2026-10-16 点
+    「头部至 -32°」就是这样崩的，而界面上明明能看到角度 —— 那是**另一条订阅**，
+    "能读到角度"与"这条路能读到角度"是两件事）。
+    所以只认"是不是 None"和"能不能逐个取出来"，**与真假无关**。
+    """
+    if value is None:
+        return []
+    return [float(item) for item in value]
+
 class _HeadNode(Node):
     """只为了给发布/订阅一个节点名。"""
 
@@ -145,6 +164,10 @@ class RosStreamer:
         #: 收到过几条状态消息（**只数到达**，不管字段能不能用）——
         #: 用来把"一条都没来（话题没在发布）"与"来了但字段不对"分开报。
         self.state_msgs = 0
+        #: 字段读不出来的帧数（类型不对等）。回调里**不能抛** ——
+        #: rclpy 的 executor 会把回调异常原样抛出、`spin_once` 直接终止，
+        #: 现场看到的是一条 traceback 而不是"没读到角度"那句可照做的说明。
+        self.field_errors = 0
 
     # ---------- 订阅 ----------
     def listen(self) -> None:
@@ -154,10 +177,20 @@ class RosStreamer:
                                       self._on_trunk_state, qos)
 
     def _on_trunk_state(self, msg) -> None:
+        """收到一帧躯干角度（读当前值用）。
+
+        ⚠️ **回调里不许抛异常**：rclpy 的 executor 会把它原样抛出去，
+        `spin_once` 随之中止、脚本退出码 1。所以字段读不出来时**只计数、不抛**，
+        由 `current_missing_reason()` 如实报出来。
+        """
         self.state_msgs += 1
-        position = list(getattr(msg, "joint_position", []) or [])
+        try:
+            position = as_floats(getattr(msg, "joint_position", None))
+        except (TypeError, ValueError):
+            self.field_errors += 1
+            return
         if len(position) == TRUNK_AXIS_COUNT:
-            self._current = [float(item) for item in position]
+            self._current = position
 
     def spin(self, seconds: float) -> None:
         """在最多 ``seconds`` 秒内把消息泵进来（`spin_once` 带超时，不会忙等）。"""

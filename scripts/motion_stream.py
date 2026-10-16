@@ -226,6 +226,25 @@ def stream_line(index: int, total: int, values) -> str:
     return (f"    [{index}/{total}] " + "、".join(f"{value:.3f}" for value in values))
 
 
+
+def as_floats(value) -> list:
+    """把消息里的数组字段读成 ``float`` 列表。**绝不写 `x or []`**。
+
+    与 `scripts/ros_command_bridge.py::as_floats` 同一条纪律（那边写得更细）：
+
+        ValueError: The truth value of an array with more than one element is ambiguous
+
+    ROS 把 `float32[]` / `float64[]` 这类字段给成**数组对象**（numpy），而 `or` 会去问
+    "这个数组真不真" —— 数组没有"真或假"这个答案，于是**直接抛 ValueError**。
+    这个异常从 `spin_once` 里冒出来会**终止整个脚本**（现场 2026-10-16 点
+    「头部至 -32°」就是这样崩的，而界面上明明能看到角度 —— 那是**另一条订阅**，
+    "能读到角度"与"这条路能读到角度"是两件事）。
+    所以只认"是不是 None"和"能不能逐个取出来"，**与真假无关**。
+    """
+    if value is None:
+        return []
+    return [float(item) for item in value]
+
 class RosStreamer:
     """所有与 rclpy 打交道的动作都收在这里 —— 用例换成记录桩就能不开 ROS 地测完整流程。"""
 
@@ -240,6 +259,8 @@ class RosStreamer:
         #: 收到过几条状态消息（**只数到达**，不管字段能不能用）—— 用来把
         #: "一条都没来（话题没在发布）"与"来了但该侧没连上"分开报，两者处理方式完全不同。
         self.state_msgs = {"trunk": 0, "arm": 0}
+        #: 字段读不出来的帧数（见 `as_floats()` 与两个回调的注释）。
+        self.field_errors = 0
         #: 该侧上电 / 连接事实（`arm_state` 里带，用于把原因说得更具体）
         self.arm_connected = {"left": None, "right": None}
 
@@ -253,19 +274,35 @@ class RosStreamer:
                                       self._on_arm_state, qos)
 
     def _on_trunk_state(self, msg) -> None:
+        """收到一帧躯干角度。
+
+        ⚠️ 回调里**不许抛异常**（executor 会原样抛出、`spin_once` 终止），
+        且取数组**不能用 `or []`** —— 理由见模块里的 `as_floats()`。
+        """
         self.state_msgs["trunk"] += 1
-        position = list(getattr(msg, "joint_position", []) or [])
+        try:
+            position = as_floats(getattr(msg, "joint_position", None))
+        except (TypeError, ValueError):
+            self.field_errors += 1
+            return
         if len(position) == TRUNK_AXIS_COUNT:
-            self._trunk_values = [float(item) for item in position]
+            self._trunk_values = position
 
     def _on_arm_state(self, msg) -> None:
+        """收到一帧手臂状态。同样：不抛、不用 `or []`。"""
         self.state_msgs["arm"] += 1
         for side, attribute in (("left", "left_arm_pos"), ("right", "right_arm_pos")):
             self.arm_connected[side] = bool(getattr(msg, f"{side}_arm_connected", False))
             holder = getattr(msg, attribute, None)
-            position = list(getattr(holder, "position", []) or []) if holder else []
+            if holder is None:
+                continue
+            try:
+                position = as_floats(getattr(holder, "position", None))
+            except (TypeError, ValueError):
+                self.field_errors += 1
+                continue
             if len(position) == ARM_AXIS_COUNT:
-                self._arm_values[side] = [float(item) for item in position]
+                self._arm_values[side] = position
 
     def spin(self, seconds: float) -> None:
         """在最多 ``seconds`` 秒内把消息泵进来（`spin_once` 带超时，不会忙等）。"""

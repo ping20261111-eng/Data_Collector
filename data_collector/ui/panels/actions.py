@@ -278,7 +278,13 @@ class ActionsMixin(ExportTargetMixin):
             "之后仍然能读角度，但不接受运动指令。\n"
             "再点一次即可解除（那一下会重新使能，躯干会抬头）。\n"
             "提示：自锁等于「关节失去保持力矩」—— 若躯干当前不在支撑位，可能自行下沉")
-        self.btn_trunk_lock.triggered.connect(self.on_trunk_lock)
+        # ⚠️ **不能直接 `connect(self.on_trunk_lock)`**：`QAction.triggered` 自带一个
+        # `checked` 参数（这个 QAction 不可勾选，恒为 False），直接连过去会把它当成
+        # `locked` 传给 `on_trunk_lock(locked=...)` —— 于是**菜单里点多少次都是"解除自锁"**，
+        # 而方法里设计好的"按 `trunk_lock_sent` 推断"（`locked=None`）那条路**根本走不到**。
+        # 现场表现就是「姿势控制页里的自锁能用，菜单里那个不行」（2026-10-16 报的）。
+        # 用 lambda 明确不传参，让 `locked` 保持 None（= 按记录推断）。
+        self.btn_trunk_lock.triggered.connect(lambda *_args: self.on_trunk_lock())
 
         # 头部至 -32°（采数，现场 2026-10-15 要求）：与自锁一样"不进页面、菜单里点一下"，
         # 现场用它做采数前的定位。**点一下 = 读一次当前角度 → 只把 H6 改成目标 → 平滑到位**，

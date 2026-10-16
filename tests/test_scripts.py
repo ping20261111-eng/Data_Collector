@@ -1609,6 +1609,105 @@ def test_head_script_waits_for_the_first_frame_instead_of_assuming_zero(head_mod
     assert source == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
 
 
+
+# ========== ROS 数组字段：不能对数组求布尔值（现场踩过**两次**：2026-09-29 / 2026-10-16）==========
+#
+# ⚠️ 数组替身**不要另写一个** —— 本文件下面已经有一个 `_AmbiguousArray`
+# （2026-09-29 那次 ros_command_bridge 崩溃时留下的，与 `test_bridge_reads_state_fields_...`
+# 共用同一个）：它的 `bool()` 会抛 ValueError（正是现场那个异常），迭代与 `len()` 正常。
+# 这里只加「消息外壳」，替身直接复用那个。
+#
+# 教训：写新守卫前先 grep 一下（`_AmbiguousArray` / `as_floats`）—— 这个坑 9 月就踩过、
+# 当时也写了替身与纪律，**只是没推广到后来新写的脚本**。
+#
+
+class _StateMsg:
+    """够用的躯干状态消息替身：`joint_position` 用的是本文件已有的 `_AmbiguousArray`。"""
+
+    def __init__(self, position):
+        self.joint_position = _AmbiguousArray(position)
+
+
+def test_head_script_reads_the_current_angle_from_a_real_numpy_array(head_module):
+    """有 numpy 时，用**现场那个真实类型**再钉一遍。
+
+    替身（`_AmbiguousArray`）是自己模拟的语义；这一条用的是真的 `numpy.ndarray`
+    —— 实测 1.26.4，`list(a or [])` 抛出的报错文本与现场 traceback **逐字一致**。
+    没有 numpy 的环境自动跳过；替身那条**始终**在跑，所以覆盖不会丢。
+    """
+    np = pytest.importorskip("numpy")
+
+    streamer = head_module.RosStreamer.__new__(head_module.RosStreamer)
+    streamer.state_msgs = 0
+    streamer.field_errors = 0
+    streamer._current = None
+
+    msg = _StateMsg([0.0] * 6)
+    msg.joint_position = np.array([50.595, 90.953, 40.602, 0.0, 0.0, 0.0], dtype="float32")
+
+    streamer._on_trunk_state(msg)
+
+    assert streamer._current is not None, "真 numpy 数组也必须读得到"
+    assert [round(item, 3) for item in streamer._current] == \
+        [50.595, 90.953, 40.602, 0.0, 0.0, 0.0]
+    assert streamer.field_errors == 0
+
+
+def test_head_script_reads_the_current_angle_from_a_ros_array(head_module):
+    """`head_minus32.py` 必须能从**真实的 ROS 数组字段**里读出当前角度。
+
+    现场 2026-10-16：点「头部至 -32°」崩在
+    `position = list(getattr(msg, "joint_position", []) or [])`，
+    功能完全走不通。这条用例修复前必红（`_AmbiguousArray.__bool__` 抛 ValueError）。
+    """
+    streamer = head_module.RosStreamer.__new__(head_module.RosStreamer)
+    streamer.state_msgs = 0
+    streamer.field_errors = 0
+    streamer._current = None
+
+    angles = [50.595, 90.953, 40.602, 0.0, 0.0, 0.0]
+    streamer._on_trunk_state(_StateMsg(angles))
+
+    assert streamer._current == angles, "从数组字段里也必须读得到当前角度"
+    assert streamer.field_errors == 0, "类型是正常的，不该记成字段错误"
+
+    # 轴数不对时不写入（别把残缺的一帧当当前角度）
+    streamer_current = streamer._current
+    streamer._on_trunk_state(_StateMsg([1.0, 2.0]))
+    assert streamer._current == streamer_current
+
+
+def test_motion_stream_reads_trunk_and_arm_from_ros_arrays(stream_module):
+    """同一处写法在 `motion_stream.py` 里也有两份（躯干 / 手臂），一并钉住。
+
+    它比 `head_minus32.py` 更危险：**躯干下发与手臂下发都走它** ——
+    只要真机上 `joint_position` 是数组，这两条路都会崩。
+    """
+    streamer = stream_module.RosStreamer.__new__(stream_module.RosStreamer)
+    streamer.state_msgs = {"trunk": 0, "arm": 0}
+    streamer.field_errors = 0
+    streamer._trunk_values = None
+    streamer._arm_values = {"left": None, "right": None}
+    streamer.arm_connected = {"left": False, "right": False}
+
+    streamer._on_trunk_state(_StateMsg([1.5] * 6))
+    assert streamer._trunk_values == [1.5] * 6
+
+    class _Holder:
+        position = _AmbiguousArray([0.1] * 7)
+
+    class _ArmMsg:
+        left_arm_connected = True
+        right_arm_connected = False
+        left_arm_pos = _Holder()
+        right_arm_pos = None
+
+    streamer._on_arm_state(_ArmMsg())
+    assert streamer._arm_values["left"] == [0.1] * 7, "手臂那一路同样要能读"
+    assert streamer.arm_connected["left"] is True
+    assert streamer.field_errors == 0
+
+
 # ---------- ros_command_bridge.py（常驻命令通道）----------
 @pytest.fixture
 def bridge_module(monkeypatch):

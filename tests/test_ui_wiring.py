@@ -7352,6 +7352,42 @@ def test_trunk_lock_does_not_pass_a_callback_into_the_worker_thread(status_env,
         status_panel.StatusMixin._on_trunk_lock_done), (
         "通道切换的提示要写在结果区（读 step['channel']），不是走 on_line")
 
+def test_the_menu_trunk_lock_follows_the_record_not_the_checked_flag(status_env,
+                                                                    monkeypatch):
+    """菜单里点「躯干自锁」= 自锁；再点一下 = 解除 —— **不能永远是"解除"**。
+
+    `QAction.triggered` 自带一个 `checked` 参数（这个 QAction 不可勾选、恒为 False）。
+    直接 `connect(self.on_trunk_lock)` 会把它当成 `locked` 传进去 —— 于是菜单里点多少次
+    都是"解除自锁"，而 `on_trunk_lock` 里设计好的"按 `trunk_lock_sent` 推断"
+    （`locked=None` 那条路）**根本走不到**。
+
+    现场表现就是 2026-10-16 报的那句：「**姿势控制页里的自锁能用，菜单里那个不行**」
+    —— 姿势页的按钮显式传意图，菜单项吃到了那个 `checked=False`。
+
+    用 `action.trigger()` 而不是 `triggered.emit(...)`：**要的就是 Qt 带参触发**，
+    手动 emit 会绕开这条缺陷、把守卫变成空转。
+    """
+    win, _cm, _status_file = status_env
+    _inline_task_thread(monkeypatch)
+    monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    calls = []
+
+    def fake_locked(locked, **kwargs):
+        calls.append(locked)
+        return {"ok": True, "steps": [], "reason": ""}
+
+    monkeypatch.setattr(win.launcher, "set_trunk_locked", fake_locked)
+
+    win.trunk_lock_sent = None
+    win.btn_trunk_lock.trigger()          # 真实触发：Qt 会带上 checked=False
+    win.trunk_lock_sent = True            # 模拟"第一次自锁真的下发成功"之后的记录
+    win.btn_trunk_lock.trigger()
+
+    assert calls == [True, False], (
+        "菜单项必须按 trunk_lock_sent 推断意图（第一次自锁、第二次解除），"
+        f"实际收到 {calls} —— [False, False] 就是把 triggered 的 checked 当成了 locked")
+
 
 # ==================== 头部至 -32°（采数）：入口 / 确认 / 回报 ====================
 
