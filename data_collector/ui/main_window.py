@@ -123,7 +123,6 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         # 放在主窗口上是刻意的：它有两个入口（工具行「机器人控制 ▾」那一项、姿势控制页里
         # 躯干那一行的按钮），两处必须读同一个值 —— 各记一份就会互相矛盾。
         # 语义是「下发过什么」，不是「现在是不是自锁」：ROS 侧没有自锁状态话题。
-        self.trunk_lock_sent = None
         self._trunk_lock_thread = None               # 自锁下发的后台线程（见 status.py）
         # 头部至 -32°（采数）的后台线程，与自锁同一条理由：引用自己留着，
         # `LocalTaskThread` 刻意不接收 parent（见 status.py / threads.py 的说明）。

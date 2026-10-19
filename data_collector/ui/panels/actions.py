@@ -267,8 +267,9 @@ class ActionsMixin(ExportTargetMixin):
         # 但**不接受运动指令**。现场要的是"不进页面、在菜单里点一下就锁"。
         #
         # 与姿势控制页里躯干那一行的「自锁」按钮**共用同一个方法**（`on_trunk_lock`）：
-        # 逻辑只有一处，两个入口只是两个触发点；**记录也只有一份**
-        # （`MainWindow.trunk_lock_sent`），不会出现"页面说已自锁、菜单说可以自锁"。
+        # 逻辑只有一处，两个入口只是两个触发点，方向也只有一个（自锁）。
+        # v6.5.7 起**不再记录"是否已自锁"** —— 那个状态跟着遥操作进程走
+        # （重启遥操作即重置），上位机记不住真相（详见 `on_trunk_lock` 的 docstring）。
         #
         # 单独占一组（前面再加一条分隔线）：上面那两条是"起节点"，
         # 这条是**直接改机构状态**（让电机退出使能）—— 混在一组里会被读成"也是起个节点"。
@@ -276,14 +277,14 @@ class ActionsMixin(ExportTargetMixin):
         self.btn_trunk_lock.setToolTip(
             f"把躯干 {TRUNK_LOCK_AXES_TEXT}（脚踝 / 膝 / 大腿）切成「仅上电」："
             "之后仍然能读角度，但不接受运动指令。\n"
-            "再点一次即可解除（那一下会重新使能，躯干会抬头）。\n"
+            "重复点没有副作用；解除方式：重启遥操作"
+            "（自锁状态跟着遥操作进程走，重启即重置）。\n"
             "提示：自锁等于「关节失去保持力矩」—— 若躯干当前不在支撑位，可能自行下沉")
         # ⚠️ **不能直接 `connect(self.on_trunk_lock)`**：`QAction.triggered` 自带一个
-        # `checked` 参数（这个 QAction 不可勾选，恒为 False），直接连过去会把它当成
-        # `locked` 传给 `on_trunk_lock(locked=...)` —— 于是**菜单里点多少次都是"解除自锁"**，
-        # 而方法里设计好的"按 `trunk_lock_sent` 推断"（`locked=None`）那条路**根本走不到**。
-        # 现场表现就是「姿势控制页里的自锁能用，菜单里那个不行」（2026-10-16 报的）。
-        # 用 lambda 明确不传参，让 `locked` 保持 None（= 按记录推断）。
+        # `checked` 参数（这个 QAction 不可勾选，恒为 False）。现在 `on_trunk_lock`
+        # 不收这个参数了，直接连会 TypeError；而且一旦有人给它加回参数，`checked=False`
+        # 会被当成"方向"传进去 —— 那正是 2026-10-16 报的「页面里能用、菜单里不行」。
+        # 用 lambda 明确不传参。
         self.btn_trunk_lock.triggered.connect(lambda *_args: self.on_trunk_lock())
 
         # 头部至 -32°（采数，现场 2026-10-15 要求）：与自锁一样"不进页面、菜单里点一下"，

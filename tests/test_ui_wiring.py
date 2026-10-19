@@ -5957,11 +5957,17 @@ def test_trunk_lock_button_shows_only_when_trunk_is_enabled(status_env, tmp_path
     assert row.btn_lock.isHidden() is False, "已使能后「自锁」应当出现"
 
 
-def test_trunk_lock_sends_the_lock_then_flips_the_button(status_env, tmp_path, monkeypatch):
-    """点「自锁」→ 下发 → 成功后按钮文案翻成「解除自锁」，且**只报"已下发"**。
 
-    文案说的是"本页下发过什么"（自锁状态没有回读话题），所以它翻转发 = 本页的记录变了。
-    结果区绝不能出现"已自锁"这种把"下发过"说成"现在是"的话。
+
+def test_trunk_lock_always_sends_the_same_command(status_env, tmp_path, monkeypatch):
+    """点一次 → 下发**自锁**；再点一次 → **还是自锁**（幂等），文案始终是「自锁」。
+
+    v6.5.7 改掉了原来的「下发过就翻成解除」：自锁状态读不回来，而且它跟着
+    **遥操作进程**走（现场：重启遥操作即重置）。上位机按自己的记录翻转方向，
+    就会在真实未锁时发出解除指令（`connect false` → `connect true`，躯干抬头）——
+    现场看到的就是「我只想锁一下，机构反而动了」。
+
+    自锁指令幂等，所以「永远只发自锁」既安全又不会让现场困惑。
     """
     win, _cm, status_file = status_env
     _seed_motion_presets(tmp_path)
@@ -5977,23 +5983,26 @@ def test_trunk_lock_sends_the_lock_then_flips_the_button(status_env, tmp_path, m
                                        "sent": 3, "matched": 1}],
                             "reason": ""})[1])
 
-    dialog.on_trunk_lock_action(True)
+    dialog.on_trunk_lock_action()
+    dialog.on_trunk_lock_action()
 
+    assert calls == [True, True], f"两次点击都必须下发自锁，实际：{calls}"
     row = dialog.module_rows["trunk"]
-    assert calls == [True], "应当按 locked=True 下发"
-    assert win.trunk_lock_sent is True
-    assert row.btn_lock.text() == "解除自锁"
+    assert row.btn_lock.text() == "自锁", "按钮不该再翻成「解除自锁」"
     text = dialog.result.toPlainText()
     assert "无法回读" in text, "必须说明这个状态读不回来"
+    assert "重启遥操作" in text, "必须说清解除方式：重启遥操作"
     assert "已自锁" not in text, "不能把「下发过」说成「现在是」"
 
 
-def test_trunk_unlock_goes_through_the_two_step_path(status_env, tmp_path, monkeypatch):
-    """已下发过自锁后，再点一次就是**解除** —— 参数是 `locked=False`。
 
-    解除的实际两步（`connect false` → `connect true`）在通道层（`test_scripts.py`
-    的 `test_bridge_ensures_the_trunk_lock_and_unlock_shapes`）逐条钉住；
-    界面层只要保证"第二次点击传的是 False"。
+
+def test_the_page_never_offers_an_unlock_direction(status_env, tmp_path, monkeypatch):
+    """姿势页那个按钮**没有第二个方向** —— 点几次都是自锁。
+
+    解除能力仍在底层（`set_trunk_locked(False)`，由 `test_core.py` 覆盖它的两步时序），
+    只是界面不再提供：解除方式改成重启遥操作（自锁状态属于遥操作进程）。
+    这条守卫防的是"有人把翻转加回来"——那会在真实未锁时发解除指令。
     """
     win, _cm, status_file = status_env
     _seed_motion_presets(tmp_path)
@@ -6006,18 +6015,18 @@ def test_trunk_unlock_goes_through_the_two_step_path(status_env, tmp_path, monke
                         lambda locked: (calls.append(locked), {
                             "ok": True, "steps": [], "reason": ""})[1])
 
-    dialog.on_trunk_lock_action(True)
-    assert dialog.module_rows["trunk"].btn_lock.text() == "解除自锁"
+    row = dialog.module_rows["trunk"]
+    for _ in range(3):
+        dialog.on_trunk_lock_action()
+        assert row.btn_lock.text() == "自锁", "文案任何时候都不该出现「解除自锁」"
 
-    dialog.on_trunk_lock_action(False)
-
-    assert calls == [True, False]
-    assert win.trunk_lock_sent is False
-    assert dialog.module_rows["trunk"].btn_lock.text() == "自锁"
+    assert calls == [True, True, True]
 
 
-def test_trunk_lock_failure_keeps_the_record_untouched(status_env, tmp_path, monkeypatch):
-    """下发**失败不翻转**文案 —— 记录的是"本页装过什么"，没发出去就不算装过。"""
+
+
+def test_trunk_lock_failure_keeps_the_single_direction(status_env, tmp_path, monkeypatch):
+    """下发失败时：如实报「未完成」，按钮文案仍是「自锁」（没有状态要维护）。"""
     win, _cm, status_file = status_env
     _seed_motion_presets(tmp_path)
     _posture_status(status_file)
@@ -6028,36 +6037,33 @@ def test_trunk_lock_failure_keeps_the_record_untouched(status_env, tmp_path, mon
                         lambda locked: {"ok": False, "steps": [],
                                         "reason": "等 3s 没有订阅者（主程序没在跑？）"})
 
-    dialog.on_trunk_lock_action(True)
+    dialog.on_trunk_lock_action()
 
-    assert win.trunk_lock_sent is None, "没发出去就不该记成「下发过」"
     assert dialog.module_rows["trunk"].btn_lock.text() == "自锁"
     assert "未完成" in dialog.result.toPlainText()
+    assert "重启遥操作" in dialog.result.toPlainText()
 
 
-def test_trunk_lock_blocks_trunk_motion_but_not_the_arms(status_env, tmp_path, monkeypatch):
-    """自锁后**本页不再接受躯干运动指令**；手臂不受影响。
 
-    这是唯一"不说谎"的做法：自锁 = 退出使能，这时候发目标本来就不生效 ——
-    放过去的话，现场看到的是"点了没反应"（残差判据最后只会报"未确认"），
-    比一句明确的拦截更难懂。
 
-    只拦躯干：自锁针对的是 `switch_power_on` 给的那几个躯干电机索引，
-    手臂是另一个控制节点、另一批话题。
+def test_trunk_lock_does_not_block_trunk_motion_on_the_page(status_env, tmp_path,
+                                                           monkeypatch):
+    """**界面不再按"下发过自锁"拦住躯干动作** —— 那个判据会误伤。
+
+    自锁状态的生命周期属于遥操作进程：重启遥操作即重置，而上位机的记录还在。
+    于是会出现「真实可动、界面却拦住」——现场只会看到「点了没反应」，比不拦更难懂。
+    自锁时发出去的目标本来就会被控制节点忽略，不需要界面再猜一次。
     """
     win, _cm, status_file = status_env
     _seed_motion_presets(tmp_path)
     _posture_status(status_file, trunk=True, arms=True)
     dialog = _open_posture(win, monkeypatch)
 
-    assert dialog._enable_reason("trunk") == "", "自锁前躯干是可动的"
-
-    win.trunk_lock_sent = True
-    reason = dialog._enable_reason("trunk")
-    assert "自锁" in reason and "解除自锁" in reason, f"拦截原因要指路，实际：{reason!r}"
-
-    # 手臂那条路不受影响（`_enable_reason("left")` 走的是 arms）
-    assert dialog._enable_reason("left") == "", "自锁只针对躯干，不该连带挡住手臂"
+    assert dialog._enable_reason("trunk") == "", "未自锁时躯干可动"
+    assert not hasattr(dialog, "_trunk_locked"), (
+        "这个方法已经删了：它代表的是「上位机下发过什么」，不是真实自锁状态")
+    assert dialog._enable_reason("trunk") == "", "任何时候都不该由界面拦躯干动作"
+    assert dialog._enable_reason("left") == "", "手臂本来就不受影响"
 
 
 def test_robot_menu_has_the_trunk_lock_item(status_env):
@@ -6069,31 +6075,34 @@ def test_robot_menu_has_the_trunk_lock_item(status_env):
     assert win.btn_trunk_lock.text() == "躯干自锁"
 
 
-def test_robot_menu_lock_label_follows_the_record(status_env):
-    """菜单项文案跟着**记录**走。
 
-    这个菜单的既有约定是「一律可点、不置灰」（Qt 菜单项的悬停提示不可靠，灰着又没理由
-    会被读成"坏了"），所以"点下去会做什么"只能靠文案说清。
+
+def test_robot_menu_lock_label_is_always_the_lock(status_env, tmp_path, monkeypatch):
+    """菜单项文案**恒为「躯干自锁」**，点多少次都不会变成「解除自锁」。
+
+    这个菜单的既有约定是「一律可点、不置灰」，所以"点下去会做什么"只能靠文案说清 ——
+    正因为如此，文案必须与唯一的方向一致。
     """
     win, _cm, _status = status_env
+    _inline_task_thread(monkeypatch)
+    monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    monkeypatch.setattr(win.launcher, "set_trunk_locked",
+                        lambda locked: {"ok": True, "steps": [], "reason": ""})
 
-    for record, want in ((None, "躯干自锁"), (True, "解除自锁"), (False, "躯干自锁")):
-        win.trunk_lock_sent = record
+    for _ in range(3):
         win._sync_robot_menu()
-        assert win.btn_trunk_lock.text() == want, f"记录={record} 时文案应为「{want}」"
+        assert win.btn_trunk_lock.text() == "躯干自锁"
+        win.on_trunk_lock()
 
 
-def test_robot_menu_lock_infers_the_direction_from_the_record(status_env, monkeypatch):
-    """菜单里点一下的方向由记录推断：没下发过 → 自锁；已下发过自锁 → 解除。
 
-    菜单项只有一个，两个方向共用它 —— 所以"这一次点下去是哪个方向"必须有确定来源，
-    否则就成了"点两次才知道会怎样"。
-    """
+
+def test_robot_menu_lock_never_alternates(status_env, monkeypatch):
+    """菜单里连点两次 → **两次都下发自锁**（不再按记录交替）。"""
     win, _cm, _status = status_env
     # **必须换掉同步替身**：`on_trunk_lock` 走 `status` 模块的 `LocalTaskThread`，
-    # 用真 QThread 时这里会连起两个线程、第一个被引用覆盖后回收 —— 那是段错误
-    # （实测 exit=134，崩点就在 `status.py` 的那一行）。平时由 `_open_posture` 顺手换，
-    # 这条用例不开页面，所以要自己来。
+    # 用真 QThread 时这里会连起两个线程、第一个被引用覆盖后回收 —— 那是段错误。
     _inline_task_thread(monkeypatch)
     monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
                         lambda *args, **kwargs: _BOX.Yes)
@@ -6102,37 +6111,35 @@ def test_robot_menu_lock_infers_the_direction_from_the_record(status_env, monkey
                         lambda locked: (calls.append(locked),
                                         {"ok": True, "steps": [], "reason": ""})[1])
 
-    win.trunk_lock_sent = None
     win.on_trunk_lock()
-    win.trunk_lock_sent = True
     win.on_trunk_lock()
 
-    assert calls == [True, False], f"方向推断错了：{calls}"
+    assert calls == [True, True], f"方向不该交替：{calls}"
 
 
-def test_the_menu_entry_and_the_posture_page_share_one_record(status_env, tmp_path, monkeypatch):
-    """两个入口读**同一个记录**：从菜单锁完，姿势页那一行也要跟着翻。
 
-    各记一份的实现就地暴露 —— 菜单锁了、页面还显示「自锁」，用户会以为没锁上，
-    再去点一次（那就成了"解除"），于是越点越乱。
-    """
+
+def test_the_menu_and_the_page_both_only_send_the_lock(status_env, tmp_path, monkeypatch):
+    """两个入口共用一处实现，**方向也只有一个**：从菜单点、从页面点，都是自锁。"""
     win, _cm, status_file = status_env
     _seed_motion_presets(tmp_path)
     _posture_status(status_file, trunk=True, arms=True)
     dialog = _open_posture(win, monkeypatch)
     monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
                         lambda *args, **kwargs: _BOX.Yes)
+    calls = []
     monkeypatch.setattr(win.launcher, "set_trunk_locked",
-                        lambda locked: {"ok": True, "steps": [], "reason": ""})
+                        lambda locked: (calls.append(locked),
+                                        {"ok": True, "steps": [], "reason": ""})[1])
 
     row = dialog.module_rows["trunk"]
     assert row.btn_lock.text() == "自锁"
 
-    win.on_trunk_lock()                    # 走菜单那条路（locked=None → 按记录推断）
+    win.on_trunk_lock()                     # 菜单那条路
+    dialog.on_trunk_lock_action()           # 页面那条路
 
-    assert win.trunk_lock_sent is True
-    assert dialog._trunk_locked() is True, "页面必须读同一个记录，不能自己再记一份"
-    assert row.btn_lock.text() == "解除自锁", "菜单锁完，页面那一行的文案也要跟着翻"
+    assert calls == [True, True]
+    assert row.btn_lock.text() == "自锁", "菜单点过之后，页面文案也不该翻"
 
 
 def test_posture_single_arm_gets_disable_button(status_env, tmp_path, monkeypatch):
@@ -7377,7 +7384,7 @@ def test_trunk_lock_result_says_when_it_fell_back_to_the_cli(status_env, tmp_pat
                    "matched": -1, "channel": "一次性 CLI"}],
         "reason": ""})
 
-    dialog.on_trunk_lock_action(True)
+    dialog.on_trunk_lock_action()
 
     text = dialog.result.toPlainText()
     assert "一次性 CLI" in text, f"结果区要说清走了哪条通道：{text}"
@@ -7412,20 +7419,18 @@ def test_trunk_lock_does_not_pass_a_callback_into_the_worker_thread(status_env,
         status_panel.StatusMixin._on_trunk_lock_done), (
         "通道切换的提示要写在结果区（读 step['channel']），不是走 on_line")
 
-def test_the_menu_trunk_lock_follows_the_record_not_the_checked_flag(status_env,
-                                                                    monkeypatch):
-    """菜单里点「躯干自锁」= 自锁；再点一下 = 解除 —— **不能永远是"解除"**。
 
-    `QAction.triggered` 自带一个 `checked` 参数（这个 QAction 不可勾选、恒为 False）。
-    直接 `connect(self.on_trunk_lock)` 会把它当成 `locked` 传进去 —— 于是菜单里点多少次
-    都是"解除自锁"，而 `on_trunk_lock` 里设计好的"按 `trunk_lock_sent` 推断"
-    （`locked=None` 那条路）**根本走不到**。
 
-    现场表现就是 2026-10-16 报的那句：「**姿势控制页里的自锁能用，菜单里那个不行**」
-    —— 姿势页的按钮显式传意图，菜单项吃到了那个 `checked=False`。
+def test_the_menu_trunk_lock_ignores_the_checked_flag(status_env, monkeypatch):
+    """`QAction.triggered` 带的 `checked=False` **绝不能**被当成方向。
 
-    用 `action.trigger()` 而不是 `triggered.emit(...)`：**要的就是 Qt 带参触发**，
-    手动 emit 会绕开这条缺陷、把守卫变成空转。
+    2026-10-16 那次故障就是它：直接
+    `triggered.connect(self.on_trunk_lock)` → 每次都是 `locked=False` → 菜单里
+    点多少次都只发「解除」，而那个方向会让躯干抬头。
+
+    现在 `on_trunk_lock` 已经不收这个参数了（直接连会 TypeError），这里仍用
+    `action.trigger()` 真实触发来钉住 —— **要的就是 Qt 带参触发**，
+    手动 `triggered.emit()` 会绕开这条缺陷、把守卫变成空转。
     """
     win, _cm, _status_file = status_env
     _inline_task_thread(monkeypatch)
@@ -7439,17 +7444,26 @@ def test_the_menu_trunk_lock_follows_the_record_not_the_checked_flag(status_env,
 
     monkeypatch.setattr(win.launcher, "set_trunk_locked", fake_locked)
 
-    win.trunk_lock_sent = None
+    # 结构性判据：`on_trunk_lock` 除 self 外**不许有位置参数** ——
+    # 否则 Qt 那个 `checked=False` 会被当成第一个位置参数静默吃掉
+    # （实测：把 `report` 改回可选位置参数后，直接 connect 居然仍然是绿的）。
+    import inspect
+
+    from data_collector.ui.panels import status as status_panel
+
+    params = list(inspect.signature(
+        status_panel.StatusMixin.on_trunk_lock).parameters.values())
+    positional = [item.name for item in params[1:]
+                  if item.kind in (item.POSITIONAL_ONLY, item.POSITIONAL_OR_KEYWORD)]
+    assert positional == [], (
+        f"on_trunk_lock 不许收位置参数（否则 triggered 的 checked 会被静默吃掉）：{positional}")
+
     win.btn_trunk_lock.trigger()          # 真实触发：Qt 会带上 checked=False
-    win.trunk_lock_sent = True            # 模拟"第一次自锁真的下发成功"之后的记录
     win.btn_trunk_lock.trigger()
 
-    assert calls == [True, False], (
-        "菜单项必须按 trunk_lock_sent 推断意图（第一次自锁、第二次解除），"
-        f"实际收到 {calls} —— [False, False] 就是把 triggered 的 checked 当成了 locked")
-
-
-# ==================== 头部至 -32°（采数）：入口 / 确认 / 回报 ====================
+    assert calls == [True, True], (
+        f"两次触发都必须下发自锁，实际收到 {calls} —— "
+        "[False, ...] 就是把 triggered 的 checked 当成了方向")
 
 def test_head_to_minus32_is_reachable_from_the_robot_menu(status_env):
     """「机器人控制 ▾」里有「头部至 -32°（采数）」—— 现场点的就是这一项。

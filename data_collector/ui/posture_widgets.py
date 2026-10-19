@@ -588,7 +588,8 @@ class ModuleEnableRow(QFrame):
     #: 躯干**自锁**：True = 自锁（仅上电 / 退出使能），False = 解除自锁。
     #: 单独一个信号而不是塞进 `action_requested` —— 后者是"使能/下使能"那条
     #: `MODULE_STEPS` 路径（两个模块共用），自锁只有躯干有（SDK 只给躯干这个接口）。
-    lock_requested = pyqtSignal(bool)
+    #: 点「自锁」按钮触发。**无参** —— 这个动作只有一个方向（见 `set_lock_state`）。
+    lock_requested = pyqtSignal()
 
     def __init__(self, module: str, name: str, parent=None):
         super().__init__(parent)
@@ -613,7 +614,6 @@ class ModuleEnableRow(QFrame):
         # `switch_power_on`，双臂没有对应接口，给双臂摆一个按不动的按钮是误导。
         # 默认不显示，由页面按"检测到的使能状态 + 本页下发过什么"决定（见 mixin）。
         self.btn_lock = None
-        self._lock_next = True                  # 这一次点击的含义：True=自锁
         if module == "trunk":
             self.btn_lock = QPushButton("自锁")
             self.btn_lock.setProperty("variant", "ghost-compact")
@@ -647,23 +647,29 @@ class ModuleEnableRow(QFrame):
         """「只通了一侧」时多给一个下电出口；其余状态收起来。"""
         self.btn_disable.setVisible(bool(partial))
 
-    def set_lock_state(self, visible: bool, locked_now: bool,
-                       enabled: bool, why: str) -> None:
+    def set_lock_state(self, visible: bool, enabled: bool, why: str) -> None:
         """自锁按钮的一处收口：显示 / 文案 / 可用 / 提示语，一次定完。
 
-        文案说的是**「本页下发过什么」**，不是「现在是什么」—— 自锁状态没有回读
-        话题（`getMotorBrakeState()` 只在 C++ SDK 里），报"当前已自锁"就是编。
+        **文案恒为「自锁」，不再有两态。** 原因是一条架构判断（2026-10-19 现场教会的）：
+
+        自锁状态既**读不回来**（`getMotorBrakeState()` 只在 C++ SDK 里），它的
+        **生命周期也不归上位机** —— 现场明确「重启遥操作，自锁状态就重置」。
+        所以上位机"记得自己下发过什么"并不能推出"现在是不是自锁"；按那个记录把按钮
+        翻成「解除自锁」，就可能在**真实未锁**的时候发出解除指令（那一下会
+        `connect true`、躯干抬头）—— 这正是"点了一下、机构反而动了"的来源。
+
+        自锁指令本身**幂等**（重复发只是让电机再退出一次使能），所以"永远只发自锁"
+        既安全又不会让现场困惑。解除方式：重启遥操作。
         """
         if self.btn_lock is None:
             return
-        self._lock_next = not bool(locked_now)     # 下一次点击做什么：已下发过自锁 → 解除
-        self.btn_lock.setText("解除自锁" if locked_now else "自锁")
+        self.btn_lock.setText("自锁")
         self.btn_lock.setVisible(bool(visible))
         self.btn_lock.setEnabled(bool(enabled))
         self.btn_lock.setToolTip(why)
 
     def _on_lock_clicked(self) -> None:
-        self.lock_requested.emit(self._lock_next)
+        self.lock_requested.emit()
 
     def _on_clicked(self) -> None:
         self.action_requested.emit(self.module, self._turn_on)

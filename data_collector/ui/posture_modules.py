@@ -73,18 +73,12 @@ class PostureModulesMixin:
         module = "trunk" if group == "trunk" else "arms"
         name = "躯干" if module == "trunk" else "双臂"
 
-        # v6.4.13 躯干自锁：自锁（仅上电）期间**不接受运动指令**。
+        # ⚠️ **这里原来有一道"已下发过自锁 → 拦住躯干动作"的判断，v6.5.7 删掉了。**
         #
-        # 判据只能是"**本页有没有下发过自锁**" —— ROS 侧没有"当前是否自锁"的话题
-        # （`getMotorBrakeState()` 只存在于 C++ SDK），所以这里读不到真实状态。
-        #
-        # 为什么选择**拦住并说清**、而不是"照发 + 提示"：自锁时发出去的目标不会被执行，
-        # 残差判据最后会报"未确认"，现场看到的是"点了没反应"，比一句拦住的说明更难懂。
-        # **如实写下代价**：若自锁是在外部解除的（现场脚本），本页仍会拦一次 ——
-        # 点一下「解除自锁」即可（那一下会 connect → 抬头，是已知副作用）。
-        if module == "trunk" and self._trunk_locked():
-            return ("躯干已自锁（仅上电：能读角度、不接受运动指令）"
-                    "—— 先点「解除自锁」，再下发动作")
+        # 那个判断的依据是上位机自己的记录（`trunk_lock_sent`），而自锁状态的生命周期
+        # 属于**遥操作进程**：现场重启遥操作，自锁就重置了，而上位机的记录还在。
+        # 于是出现"真实可动、界面却拦住"——现场只会看到"点了没反应"，比不拦更难懂。
+        # 自锁时发出去的目标本来就不会被执行（那一路由控制节点忽略），不需要界面再猜。
 
         state = self._enabled(module)
         if state == MODULE_STATE_UNKNOWN:
@@ -274,24 +268,20 @@ class PostureModulesMixin:
 
             # 躯干自锁按钮（v6.4.13）：**只在"已使能"时出现** —— 未使能时它没有意义
             # （机构已经不动了），而现场容易点成"先自锁再上使能"，白跑一趟。
-            # 按钮文案表示的是**"本页下发过什么"**，不是"现在是什么"：自锁状态没有
-            # 回读话题，写"当前已自锁"就是编。
+            #
+            # 文案恒为「自锁」（v6.5.7）：自锁状态读不回来，而且它跟着**遥操作进程**
+            # 走（重启遥操作即重置）—— 上位机按自己的记录翻转文案，会在真实未锁时
+            # 发出解除指令（那一下会让躯干抬头）。详见 `AxisRow.set_lock_state`。
             if row.btn_lock is not None:
-                locked_now = self._trunk_locked()
                 if not monitor_ok:
                     lock_why = "状态读不出来：先启动状态监控"
                 elif busy:
                     lock_why = f"{name}的动作正在执行，等它出结果"
-                elif locked_now:
-                    lock_why = ("解除自锁：下使能 → 重新使能（两步）。"
-                                "会动机构 —— 那一下躯干会抬头。\n"
-                                "（自锁状态无法回读，这里按「本页下发过自锁」判断）")
                 else:
                     lock_why = (f"把躯干 {TRUNK_LOCK_AXES_TEXT} 转为「仅上电」："
                                 "之后仍能读角度，但不接受运动指令。\n"
-                                "解除方式：再点一次这个按钮")
+                                "重复点无副作用；解除方式：重启遥操作")
                 row.set_lock_state(visible=(monitor_ok and state == MODULE_STATE_ON),
-                                   locked_now=locked_now,
                                    enabled=monitor_ok and not busy,
                                    why=lock_why)
 
@@ -299,23 +289,9 @@ class PostureModulesMixin:
         """把"还有动作在跑"报给主窗口（姿势动作或任一模块动作在跑即为真）。"""
         self.busy_changed.emit(bool(self._module_actions) or self._busy)
 
-    # ================= 躯干自锁（v6.4.15） =================
-    def _trunk_locked(self) -> bool:
-        """**是否下发过自锁**（记录在主窗口上，与工具行那个入口共用）。
-
-        ⚠️ 语义是"下发过什么"，不是"现在是不是自锁" —— 后者读不到
-        （ROS 侧没有自锁/抱闸状态话题）。所有用它做判断的地方都要按这个语义解释。
-
-        记录放在主窗口（`trunk_lock_sent`）而不是这一页：工具行「机器人控制 ▾」里
-        也有同一个功能，两处各记一份迟早会互相矛盾。
-        """
-        host = self.parent()
-        if host is None:
-            return False
-        return getattr(host, "trunk_lock_sent", None) is True
-
+    # ================= 躯干自锁（v6.4.15 / v6.5.7） =================
     @guard_slot
-    def on_trunk_lock_action(self, locked: bool):
+    def on_trunk_lock_action(self):
         """这一页的「自锁 / 解除自锁」按钮 —— **委托给主窗口**那一处实现。
 
         为什么不在这一页自己做：工具行「机器人控制 ▾」里有同一个功能，
@@ -332,5 +308,8 @@ class PostureModulesMixin:
         if handler is None:
             self._report("躯干自锁不可用：主窗口没有提供这个动作（程序装配有问题）")
             return
-        handler(locked=locked, report=self._report)
+        # **不带方向**：这个入口只下发自锁那一条（幂等），解除靠重启遥操作。
+        # 曾经这里传 `locked=...`，而那个值来自上位机自己的记录 —— 记录与真实状态
+        # 会脱节（遥操作重启后自锁已重置），详见 `AxisRow.set_lock_state`。
+        handler(report=self._report)
 

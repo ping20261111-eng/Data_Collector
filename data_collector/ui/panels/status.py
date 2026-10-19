@@ -237,59 +237,65 @@ class StatusMixin:
 
     # ---------- 躯干自锁（两个入口共用这一处，v6.4.15） ----------
     def _sync_robot_menu(self):
-        """「机器人控制 ▾」弹出前刷新那两项的名字。
+        """「机器人控制 ▾」弹出前刷新那几项的名字。
 
-        自锁那一项表示的是**本页下发过什么**（`trunk_lock_sent`），不是"现在是不是自锁" ——
-        ROS 侧没有自锁状态话题（`getMotorBrakeState()` 只存在于 C++ SDK 的接口里）。
+        自锁那一项**文案恒为「躯干自锁」**（v6.5.7）：它只有这一个方向。
+        自锁状态读不回来（`getMotorBrakeState()` 只在 C++ SDK 里），而且它的生命周期
+        属于**遥操作进程** —— 现场重启遥操作即重置。上位机按自己的记录把文案翻成
+        「解除自锁」，就会在真实未锁时发出解除指令（`connect true`，躯干抬头）。
         全屏那一项表示的是**窗口当前状态**（可回读，用 `isFullScreen()`）。
         本菜单的约定是**一律可点、不置灰**，所以"点下去会做什么"只能靠文案说清。
         """
-        locked = getattr(self, "trunk_lock_sent", None) is True
-        self.btn_trunk_lock.setText("解除自锁" if locked else "躯干自锁")
+        self.btn_trunk_lock.setText("躯干自锁")
         self.btn_fullscreen.setText("退出全屏" if self.isFullScreen() else "全屏显示")
 
     @guard_slot
-    def on_trunk_lock(self, locked=None, report=None):
-        """躯干**自锁**（仅上电）/ **解除自锁** —— 两个入口共用这一处。
+    def on_trunk_lock(self, *, report=None):
+        # `report` 是 **keyword-only**（v6.5.7）。不是洁癖：`QAction.triggered` 会带一个
+        # `checked=False` 位置参数，若这里收位置参数，那个 False 会被当成 `report`
+        # 静默吃掉（`report or self.append` 恰好把它兜回 `self.append`，看起来无害）——
+        # 但语义已经错了，而且以后谁把 `report` 改成必传就会突然崩。
+        # 收成 keyword-only 之后，直接 `triggered.connect(self.on_trunk_lock)` 会
+        # TypeError，问题当场暴露。
+
+        """躯干**自锁**（仅上电）—— 两个入口共用这一处，**只有一个方向**。
 
         入口：
-          · 工具行「机器人控制 ▾」→「躯干自锁 / 解除自锁」；
+          · 工具行「机器人控制 ▾」→「躯干自锁」；
           · 姿势控制页里躯干那一行的「自锁」按钮（它把 `report` 换成自己那页的结果区）。
 
-        **记录只有一份**：`self.trunk_lock_sent`（None = 本次运行没下发过 /
-        True = 已下发自锁 / False = 已下发解除）。两处入口读同一个值，不会出现
-        "页面显示已自锁、菜单显示可以自锁"这种自相矛盾。它表示的是**下发过什么**，
-        不是"现在是不是自锁"。
+        ## 为什么不再有"解除自锁"（v6.5.7）
 
-        `locked=None` 时按记录推断（菜单项用：已下发过自锁 → 这一次是解除）；
-        姿势页那个按钮会显式传它当前文案对应的意图。
+        现场 2026-10-19 明确两条事实：① 自锁**只需要下发那一条指令**；
+        ② **重启遥操作，自锁状态就重置**。合起来说明 —— 自锁状态的生命周期属于
+        **遥操作进程**，不归上位机。
 
-        两个方向都会立刻改变机构状态（解除那一下 `connect true` 会让躯干抬头），
-        所以都先二次确认 —— 确认逻辑也只写在这一处。
+        而它又**读不回来**（`getMotorBrakeState()` 只存在于 C++ SDK 里）。所以上位机
+        按"我下发过什么"推断"现在是不是自锁"必然出错：遥操作重启后自锁已重置，
+        上位机却还记得 —— 再点一下就会发出**解除**指令（`connect false` → `connect true`，
+        那一下躯干会抬头）。现场看到的就是"我只想锁一下，机构反而动了"。
+
+        而自锁指令本身**幂等**：重复发只是让那几个电机再退出一次使能，没有副作用。
+        所以正确做法就是"永远只发自锁"，解除交给重启遥操作。
+
+        两个方向都会改变机构状态（自锁 = 关节失去保持力矩），所以仍然二次确认 ——
+        确认逻辑只写在这一处。
         """
         report = report or self.append
-        if locked is None:
-            locked = getattr(self, "trunk_lock_sent", None) is not True
-        verb = "自锁" if locked else "解除自锁"
-        if locked:
-            title = "确认躯干自锁"
-            ask = (f"将把躯干 {TRUNK_LOCK_AXES_TEXT} 转为「仅上电」（电机退出使能）：\n"
-                   "· 之后仍然能读角度；\n"
-                   "· 但不接受任何运动指令（单轴 / 预设 / 下发都会被挡住）；\n"
-                   "· 自锁等于「关节失去保持力矩」—— 若躯干当前不在支撑位，可能自行下沉；\n"
-                   "· 解除方式：再点一次这个入口（会先下使能、再上使能，那一下躯干会抬头）。\n\n"
-                   "是否继续？")
-        else:
-            title = "确认解除自锁"
-            ask = ("将向躯干下发两步：下使能 → 重新使能。\n"
-                   "注意：重新使能会让躯干抬头回默认姿态，"
-                   "请先确认现场无人处于机构运动范围内。\n\n是否继续？")
+        title = "确认躯干自锁"
+        ask = (f"将把躯干 {TRUNK_LOCK_AXES_TEXT} 转为「仅上电」（电机退出使能）：\n"
+               "· 之后仍然能读角度；\n"
+               "· 但不接受运动指令（自锁生效期间，下发的目标不会被执行）；\n"
+               "· 自锁等于「关节失去保持力矩」—— 若躯干当前不在支撑位，可能自行下沉；\n"
+               "· 重复点没有副作用；\n"
+               "· 解除方式：「重启遥操作」（自锁状态跟着遥操作进程走）。\n\n"
+               "是否继续？")
         if QMessageBox.question(self, title, ask,
                                 QMessageBox.Yes | QMessageBox.No,
                                 QMessageBox.No) != QMessageBox.Yes:
-            report(f"已取消躯干{verb}")
+            report("已取消躯干自锁")
             return
-        report(f"躯干{verb}：正在下发…")
+        report("躯干自锁：正在下发…")
         # 线程引用必须**自己留着**：`LocalTaskThread` 刻意不接收 parent（挂到窗口上当
         # 子对象，会让 Qt 在销毁窗口时连带销毁还在收尾的线程 —— 那就是 C 层段错误），
         # 所以生命周期由这里持有的引用负责。
@@ -301,16 +307,15 @@ class StatusMixin:
         # 而通道切换的提示本来就可以在最终结果里说明（见 `_on_trunk_lock_done`
         # 读 `step["channel"]`），没必要为一行字冒这个险。
         self._trunk_lock_thread = LocalTaskThread(
-            lambda value=locked: self.launcher.set_trunk_locked(value))
+            lambda: self.launcher.set_trunk_locked(True))
         self._trunk_lock_thread.finished.connect(
-            lambda ok, payload, error, value=locked, sink=report:
-                self._on_trunk_lock_done(value, ok, payload, error, sink))
+            lambda ok, payload, error, sink=report:
+                self._on_trunk_lock_done(ok, payload, error, sink))
         self._trunk_lock_thread.start()
 
     @guard_slot
-    def _on_trunk_lock_done(self, locked: bool, ok: bool, payload, error: str, report):
+    def _on_trunk_lock_done(self, ok: bool, payload, error: str, report):
         """下发回报。**只报"发出去了"，不报"生效了"** —— 自锁状态读不回来。"""
-        verb = "自锁" if locked else "解除自锁"
         if ok and isinstance(payload, dict) and payload.get("ok"):
             steps = payload.get("steps") or []
             for step in steps:
@@ -323,15 +328,16 @@ class StatusMixin:
             if "一次性 CLI" in channels:
                 report("    （本次走的是一次性 CLI：常驻通道未起，用的是与现场"
                        "手敲等价的那条 `ros2 topic pub --once`）")
-            self.trunk_lock_sent = bool(locked)
-            record = ("（记录：已下发自锁 —— 再点一次即可解除）" if locked
-                      else "（记录：已下发解除）")
-            report(f"✅ 躯干{verb}指令已下发{record}\n"
-                   f"    注意：自锁状态无法回读（ROS 侧没有这个话题），以机构实际表现为准。")
+            # 不再记任何"自锁状态"（v6.5.7）：它跟着遥操作进程走，上位机记不住真相。
+            report("✅ 躯干自锁指令已下发\n"
+                   "    注意：自锁状态无法回读（ROS 侧没有这个话题），以机构实际表现为准；\n"
+                   "    解除方式：重启遥操作（状态跟着遥操作进程走）。")
         else:
             reason = payload.get("reason") if isinstance(payload, dict) else ""
-            # 失败**不改**记录 —— 记录代表"下发过什么"，没发出去就不算
-            report(f"⚠ 躯干{verb}未完成：{reason or error or '通道没有回话'}")
+            # 失败时也要把**解除方式**说出来：现场可能已经下发过一次自锁，
+            # 这一条没成功时最想知道的是「现在怎么恢复」。
+            report(f"⚠ 躯干自锁未完成：{reason or error or '通道没有回话'}\n"
+                   "    恢复方式：重启遥操作（自锁状态跟着遥操作进程走）")
         # 姿势控制页开着的话，它那一行按钮的文案要跟着记录走（同一个真源）
         dialog = getattr(self, "_posture_dialog", None)
         if dialog is not None:
