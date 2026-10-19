@@ -4144,6 +4144,107 @@ def test_trunk_lock_settle_matches_the_bridge_constant():
         f"兜底 {core_motion.TRUNK_LOCK_SETTLE}s")
 
 
+# ==================== 使用者偏好与批量上传队列（v6.6.0） ====================
+
+def test_user_prefs_round_trip_and_defaults(tmp_path):
+    """偏好：默认值 → 写入 → 新实例读回；**未知键忽略**。"""
+    from data_collector.core import UserPrefsStore
+
+    path = tmp_path / "user_prefs.yaml"
+    store = UserPrefsStore({}, path)
+
+    assert store.get() == UserPrefsStore.DEFAULTS, "没有文件时必须给默认值"
+
+    assert store.update(record_type="vla", record_label="布草挂架",
+                        record_desc="第三轮", teleop_user="张三") is True
+    loaded = UserPrefsStore({}, path).get()          # 新实例 = 模拟重启程序
+    assert loaded["record_type"] == "vla"
+    assert loaded["record_label"] == "布草挂架"
+    assert loaded["record_desc"] == "第三轮"
+    assert loaded["teleop_user"] == "张三"
+
+    # 未知键不落盘（只认 DEFAULTS 里的几个）
+    store.update(nonsense="x")
+    assert "nonsense" not in UserPrefsStore({}, path).get()
+
+
+def test_user_prefs_survive_broken_or_hand_edited_files(tmp_path):
+    """坏文件 / 坏值**只影响它自己**，不能整份失效（否则每次都要重选一遍）。"""
+    from data_collector.core import UserPrefsStore
+
+    path = tmp_path / "user_prefs.yaml"
+    store = UserPrefsStore({}, path)
+
+    path.write_text("record_type: ???\nteleop_user: 李四\n", encoding="utf-8")
+    prefs = store.get()
+    assert prefs["record_type"] == "bag", "非法类型要回默认值"
+    assert prefs["teleop_user"] == "李四", "同文件里合法的键要照常读到"
+
+    path.write_text("{ 这不是合法 yaml", encoding="utf-8")
+    assert store.get()["record_type"] == "bag", "解析失败要按默认值继续，不能抛"
+
+    # 写入仍要能成功（覆盖掉坏文件）
+    assert store.update(teleop_user="王五") is True
+    assert UserPrefsStore({}, path).get()["teleop_user"] == "王五"
+
+
+def test_upload_batch_queue_walks_in_order_and_keeps_failures(tmp_path):
+    """批量队列：**串行**推进、失败照常记、汇总计数正确。"""
+    from data_collector.core_data import UploadBatchQueue
+
+    batch = UploadBatchQueue(["a", "b", "c"])
+    assert batch.total == 3
+
+    assert batch.next() == "a"
+    assert batch.next() is None, "上一条没 record 时不许并行给下一条"
+    batch.record(True, "ok")
+
+    assert batch.next() == "b"
+    batch.record(False, "网络不可达")          # 失败**不中断**
+
+    assert batch.next() == "c"
+    batch.record(True, "ok")
+    assert batch.next() is None
+
+    summary = batch.summary()
+    assert summary == {"total": 3, "done": 3, "ok": 2, "failed": 1,
+                       "unstarted": 0, "cancelled": False}
+    assert [row[0] for row in batch.results] == ["a", "b", "c"], "结果顺序要和选择顺序一致"
+
+
+def test_upload_batch_queue_cancel_keeps_finished_results(tmp_path):
+    """取消：清空**未开始**的，已传完的保留（汇总要如实报"做了几个"）。"""
+    from data_collector.core_data import UploadBatchQueue
+
+    batch = UploadBatchQueue(["a", "b", "c", "d"])
+    assert batch.next() == "a"
+    batch.record(True, "ok")
+
+    assert batch.next() == "b"
+    batch.cancel()                              # 正在传 b 时点取消
+
+    assert batch.pending == [], "未开始的全清空"
+    assert batch.next() is None, "取消后不再给下一条"
+    batch.record(False, "已取消")
+    summary = batch.summary()
+    assert summary["done"] == 2 and summary["ok"] == 1 and summary["failed"] == 1
+    assert summary["unstarted"] == 0 and summary["cancelled"] is True
+
+
+def test_upload_batch_percent_uses_counts_not_bytes(tmp_path):
+    """整批进度按条数等权：4 条传到第 2 条的一半 ≈ 37%，且永远不到 100（100 由收尾给）。"""
+    from data_collector.core_data import UploadBatchQueue
+
+    batch = UploadBatchQueue(["a", "b", "c", "d"])
+    assert batch.percent(0) == 0
+    batch.next()
+    batch.record(True, "ok")
+    batch.next()
+    assert batch.percent(50) == 37, batch.percent(50)      # (1 + 0.5) / 4
+    assert batch.percent(100) < 100, "未收尾时不能报 100"
+
+
+
 # ==================== 【采数】头部至 -32°：job 形状与"越界只在这一处" ====================
 # 现场 2026-10-15：点一下把 H6 走到 -32°，其余轴保持当前角度。
 # 目标 -32 超出文档量程（H6 写的是 ±30），所以这个 job 带 force —— 下面既钉 job 形状，

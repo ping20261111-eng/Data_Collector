@@ -12,6 +12,9 @@ logs/
 
 # 本地配置：含机器人/服务器地址，填入密码后绝不能入库
 configs/app_config.yaml
+# 使用者偏好（上次的录制类型/任务/描述、上次遥操的人）：每台机器不同，运行时产物
+configs/user_prefs.yaml
+configs/user_prefs.yaml.tmp
 
 # 运行时状态（遥操作 PID 等）
 *.state.json

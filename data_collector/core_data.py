@@ -54,6 +54,99 @@ TRANSFER_MODES = ("auto", "stream", "tempfile")
 COMPRESSIONS = ("store", "deflate")
 
 
+class UploadBatchQueue:
+    """批量上传的**队列状态机**（纯逻辑，不碰 Qt）。
+
+    抽出来的理由：批量上传最容易错的地方全是**计数与顺序** ——
+    "第几个 / 还剩几个 / 哪一条的失败原因" —— 而这部分埋在界面代码里就只能靠
+    手工点。这里做成纯类，单测能直接跑完"三条里第二条失败"这种路径。
+
+    约定：
+    * `next()` 只在没有在传的那一条时给出下一条（**不会并行**）；
+    * `record()` 收尾当前这一条；失败也照常记，**不抛不中断**（批量要传完再汇总）；
+    * `cancel()` 清空**未开始**的部分，已经传完的结果保留（汇总要如实报）；
+    * `percent()` 把单条进度折算成整批进度（按条数等权）。
+    """
+
+    def __init__(self, items):
+        self._pending = list(items or [])
+        self._current = None
+        self.results = []            # [(item, ok, message)]
+        self.cancelled = False
+
+    @property
+    def current(self):
+        return self._current
+
+    @property
+    def pending(self):
+        """还没开始的（不含正在传的那一条）。"""
+        return list(self._pending)
+
+    @property
+    def total(self) -> int:
+        """这一批的总条数（含已传完、正在传、未开始）。"""
+        return len(self.results) + len(self._pending) + (1 if self._current is not None else 0)
+
+    @property
+    def done(self) -> int:
+        return len(self.results)
+
+    @property
+    def failed(self) -> list:
+        return [row for row in self.results if not row[1]]
+
+    @property
+    def succeeded(self) -> list:
+        return [row for row in self.results if row[1]]
+
+    def next(self):
+        """取下一个待传项；没有就返回 None（调用方据此收尾）。"""
+        if self._current is not None:
+            return None              # 上一条还没 record，不并行
+        if self.cancelled or not self._pending:
+            return None
+        self._current = self._pending.pop(0)
+        return self._current
+
+    def record(self, ok: bool, message: str = "") -> bool:
+        """收尾当前这一条；返回是否真的记下了（没有在传的条目时返回 False）。"""
+        if self._current is None:
+            return False
+        self.results.append((self._current, bool(ok), str(message or "")))
+        self._current = None
+        return True
+
+    def cancel(self) -> None:
+        """取消整批：清空未开始的，保留已完成的结果。"""
+        self.cancelled = True
+        self._pending.clear()
+
+    def percent(self, current_percent) -> int:
+        """整批进度百分比（0~99，100 由收尾时给）。
+
+        按条数等权：按字节要先量遍所有目录（慢、且读不到的目录会让整批卡住）。
+        """
+        total = max(1, self.total)
+        try:
+            value = max(0, min(100, int(current_percent)))
+        except (TypeError, ValueError):
+            value = 0
+        return min(99, int((self.done + value / 100.0) * 100 / total))
+
+    def summary(self) -> dict:
+        """汇总用的计数：成功 / 失败 / 未开始。"""
+        return {
+            "total": self.total,
+            "done": self.done,
+            "ok": len(self.succeeded),
+            "failed": len(self.failed),
+            "unstarted": len(self._pending),
+            "cancelled": self.cancelled,
+        }
+
+
+
 # 自定义异常。每个都带 code —— 界面据此决定提示与「重试有没有意义」，
 # 而 message 里的原始细节一律保留（排障要靠它，不为了好读而把它抹掉）。
 class UploadCancelledError(AppError):

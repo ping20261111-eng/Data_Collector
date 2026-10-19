@@ -944,6 +944,108 @@ class ActionLabelStore:
         return name or self.COMMON_TASK
 
 
+# ============ 使用者偏好（跨进程记忆，v6.6.0） ============
+class UserPrefsStore:
+    """这台机器上的**使用者偏好**：上次的录制类型 / 采集任务 / 描述、上次遥操的人。
+
+    ## 为什么单独一个文件
+
+    `app_config.yaml` 是**这台机器的配置**（远端密码、挂载点、序列号），改它得按行
+    改写以保住那些说明注释；而偏好是「上次用了什么」—— 随时会变、丢了也无害、且每台
+    机器各不相同。混进那份带注释的配置，只会让两边都更难维护。
+
+    所以独立成 `configs/user_prefs.yaml`：**不进交付包**（`.gitignore` +
+    `.gitattributes` 的 `export-ignore`），不存在时按默认值工作，**第一次真正写入才创建**。
+
+    ## 为什么「保存位置」不在这里
+
+    落盘位置（本机数据盘 / 移动硬盘）刻意**只记本次会话** —— 写进文件的话，
+    盘拔了配置还指着它，下一次起录会在最不该出问题的地方失败。见
+    `ConfigManager.set_record_target` 的说明。
+
+    ## 为什么读取要逐键校验
+
+    这是**外部文件**：可能被手改坏、可能是旧版本写的、可能只写了一半。
+    一个坏键只应影响它自己，不该让整份偏好失效（那会让现场每次都要重选一遍）。
+    """
+
+    #: 已知键与默认值。**只认这几个** —— 未知键一律忽略。
+    DEFAULTS = {
+        "record_type": "bag",      # bag / vla / cmd（对应 record_<type>_script）
+        "record_label": "",        # 采集任务名（写进 info.json 的 label）
+        "record_desc": "",         # 描述
+        "teleop_user": "",         # 上一次遥操的人（下次打开对话框时预填）
+    }
+
+    #: 录制类型的合法取值（与 `RecordDialog` 的下拉一致）
+    RECORD_TYPES = ("bag", "vla", "cmd")
+
+    def __init__(self, app_config: dict, default_file: Path, *,
+                 file_key: str = "user_prefs_file"):
+        self._app_config = app_config if isinstance(app_config, dict) else {}
+        self._default_file = default_file
+        self._file_key = file_key
+
+    def file_path(self) -> Path:
+        """偏好文件：配置项 `user_prefs_file` > 项目内 `configs/user_prefs.yaml`。"""
+        raw = self._app_config.get(self._file_key)
+        if raw:
+            return Path(str(raw)).expanduser()
+        return self._default_file
+
+    def get(self) -> dict:
+        """归一化后的偏好（缺的键补默认值、类型不对的也回默认值）。"""
+        prefs = dict(self.DEFAULTS)
+        path = self.file_path()
+        data: dict = {}
+        try:
+            if path.is_file():
+                raw = load_yaml(path)
+                if isinstance(raw, dict):
+                    data = raw
+                else:
+                    logger.warning(f"使用者偏好文件格式不对（应为映射），按默认值继续：{path}")
+        except (OSError, yaml.YAMLError) as exc:
+            logger.warning(f"读取使用者偏好失败（按默认值继续）：{exc}")
+        for key in self.DEFAULTS:
+            value = data.get(key)
+            if isinstance(value, str):
+                prefs[key] = value.strip()
+        if prefs["record_type"] not in self.RECORD_TYPES:
+            prefs["record_type"] = self.DEFAULTS["record_type"]
+        return prefs
+
+    def update(self, **changes) -> bool:
+        """只改给出的已知键并落盘；写失败返回 False（**不影响当前操作**）。
+
+        落盘用「临时文件 + `os.replace`」：直接 `open(w)` 写到一半被杀会留下
+        半份 YAML，下一次读出来就是"偏好全丢"。偏好本身是辅助信息，但它读写
+        频率低、代价几乎为零，没有理由不用原子替换。
+        """
+        known = {key: value for key, value in changes.items() if key in self.DEFAULTS}
+        if not known:
+            return True
+        prefs = self.get()
+        for key, value in known.items():
+            prefs[key] = "" if value is None else str(value).strip()
+        if prefs["record_type"] not in self.RECORD_TYPES:
+            prefs["record_type"] = self.DEFAULTS["record_type"]
+        path = self.file_path()
+        tmp = path.with_name(path.name + ".tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            save_yaml(tmp, prefs)
+            os.replace(tmp, path)
+            return True
+        except OSError as exc:
+            logger.warning(f"保存使用者偏好失败（不影响当前操作）：{exc}")
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+            return False
+
+
 class ConfigManager:
     def __init__(self, config_path: Path):
         self.config_path = config_path
@@ -968,6 +1070,10 @@ class ConfigManager:
             self.app_config.get("arm_motion_file") or DEFAULT_ARM_MOTION)
         self.trunk_motion_file = self.workspace / str(
             self.app_config.get("trunk_motion_file") or DEFAULT_TRUNK_MOTION)
+        # 使用者偏好（跨进程记忆）：上次的录制类型 / 采集任务 / 描述、上次遥操的人。
+        # 独立文件 —— 见 `UserPrefsStore` 的说明。
+        self.user_prefs = UserPrefsStore(
+            self.app_config, PROJECT_ROOT / "configs" / "user_prefs.yaml")
         # 采集任务单是配置类里唯一带完整业务逻辑的一组，独立成协作者
         self.action_labels = ActionLabelStore(
             self.app_config, PROJECT_ROOT / "configs" / "action_labels.yaml",
@@ -1363,6 +1469,30 @@ class ConfigManager:
         `ActionLabelStore.get_for_task` 的说明。
         """
         return self.point_labels.get_for_task(task)
+
+    # ---------- 使用者偏好（跨进程记忆，v6.6.0） ----------
+    def get_user_prefs(self) -> dict:
+        """上次的录制类型 / 采集任务 / 描述、上次遥操的人（缺省值已补齐）。"""
+        return self.user_prefs.get()
+
+    def remember_record_settings(self, record_type: str, label: str = "",
+                                 desc: str = "") -> bool:
+        """记住这次录制的三项选择（下次打开「录制设置」时作为默认值）。
+
+        **只在录制真的启动成功后调用** —— 用户点了取消、或起录失败，不该改写记忆
+        （否则"上次用的"会变成"上次试过但没录成的那次"）。
+        """
+        return self.user_prefs.update(record_type=record_type,
+                                      record_label=label, record_desc=desc)
+
+    def remember_teleop_user(self, username: str) -> bool:
+        """记住这一次遥操的人（下次打开「启动遥操作」时预填）。
+
+        与「当前生效的标定」是两件事：那个是机器人侧配置里的值（`teleop.calibration`），
+        这个是**这台机器上一次谁在用**。两者通常相同，但换人未标定时会不同 ——
+        预填用后者，对照提示仍然显示前者。
+        """
+        return self.user_prefs.update(teleop_user=username)
 
     def get_action_labels(self) -> List[dict]:
         return self.action_labels.get()

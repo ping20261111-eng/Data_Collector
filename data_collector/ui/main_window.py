@@ -119,10 +119,8 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         self._end_effector_dialog = None            # 「末端参数」独立页面（单例）
         self.posture_action_in_flight = False  # 姿势动作进行中（姿势控制页面置位）
         self._posture_dialog = None                  # 「姿势控制」独立页面（单例）
-        # 躯干自锁的**记录**（None = 本次运行没下发过 / True = 已下发自锁 / False = 已下发解除）。
-        # 放在主窗口上是刻意的：它有两个入口（工具行「机器人控制 ▾」那一项、姿势控制页里
-        # 躯干那一行的按钮），两处必须读同一个值 —— 各记一份就会互相矛盾。
-        # 语义是「下发过什么」，不是「现在是不是自锁」：ROS 侧没有自锁状态话题。
+        # 躯干自锁**不记状态**（v6.5.7）：那个状态属于遥操作进程（重启即重置），
+        # 上位机记不住真相 —— 只保留下发用的线程引用。
         self._trunk_lock_thread = None               # 自锁下发的后台线程（见 status.py）
         # 头部至 -32°（采数）的后台线程，与自锁同一条理由：引用自己留着，
         # `LocalTaskThread` 刻意不接收 parent（见 status.py / threads.py 的说明）。
@@ -143,6 +141,23 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         #: 不会误触发；反过来在全屏里按 F11 也一定退得出来，不必先找到标题栏。
         self._fullscreen_shortcut = QShortcut(QKeySequence("F11"), self)
         self._fullscreen_shortcut.activated.connect(self.on_toggle_fullscreen)
+
+        #: 关键功能快捷键（v6.6.0，现场要求）：
+        #:   F5 = 遥操作开关（运行中按 = 停止）/ F6 = 录制开关 / F7 = 结束录制（单向）
+        #:
+        #: 为什么用**功能键**而不是带修饰的字母：字母键会被 `WindowShortcut` 吃掉 ——
+        #: 焦点在「采集任务」「描述」这些输入框里打字时按到那个字母，动作就触发了。
+        #: 功能键与文本输入不冲突（F11 全屏用的是同一条理由）。
+        #:
+        #: 为什么 F7 要单独一个"只停"：F6 是开关，正在录的时候按错一次会**开始**
+        #: 一段新录制；而"停"这个方向怎么按都安全。现场隔着手套/防护罩按键时，
+        #: 一个只会停的键比 toggle 可靠。
+        self._teleop_shortcut = QShortcut(QKeySequence("F5"), self)
+        self._teleop_shortcut.activated.connect(self.on_teleop_shortcut)
+        self._record_shortcut = QShortcut(QKeySequence("F6"), self)
+        self._record_shortcut.activated.connect(self.on_record_toggle)
+        self._stop_record_shortcut = QShortcut(QKeySequence("F7"), self)
+        self._stop_record_shortcut.activated.connect(self.on_stop_record_shortcut)
 
         # 主题：设计稿的令牌一次性铺到整个应用（各对话框一并生效，不用逐个设置）
         self.theme_mode = self.config.get_ui_theme()
@@ -220,6 +235,31 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
     def show_error(self, title, msg):
         logger.error(msg)
         QMessageBox.critical(self, title, msg)
+
+    @guard_slot
+    def on_teleop_shortcut(self):
+        """F5：遥操作开关（运行中 = 停止，未运行 = 启动）。
+
+        与按钮同一处实现：启动仍会弹「启动遥操作」对话框（选人 + 回车确认），
+        快捷键省掉的是"去找那个按钮"，不是"跳过选人"。
+        """
+        if self.teleop_running:
+            self.on_stop_teleop()
+        else:
+            self.on_teleop()
+
+    @guard_slot
+    def on_stop_record_shortcut(self):
+        """F7：**只结束录制**（单向）。
+
+        判据与 `on_record_toggle` 完全一致（会话凭据 `started_at` 也算），
+        否则会出现"界面显示在录、按 F7 却说没在录"——那正是 v6.4.13 修过的
+        那个坑（进程已死、看门狗还没复位）。
+        """
+        if self.recorder.is_active() or getattr(self.recorder, "started_at", None) is not None:
+            self.on_stop_record()
+        else:
+            self.append("当前没有在录制（F7 = 结束录制）")
 
     @guard_slot
     def on_toggle_fullscreen(self):

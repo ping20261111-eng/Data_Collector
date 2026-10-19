@@ -23,6 +23,11 @@ terminal_command: gnome-terminal
 # 所以适合做默认值（"每台机器都不同"的东西才不该进交付包，比如密码 / 挂载点）。
 # 不接这台服务器的部署把它留空即可 —— 留空 = 该功能不启用，启动自检会标一条提醒。
 version_repo_url: http://172.16.10.2:9000/file/wheeled_robot/
+
+# 使用者偏好文件（可选）：跨进程记住"上次的录制类型/采集任务/描述"和"上次遥操的人"。
+# 留空 = 用程序目录下的 configs/user_prefs.yaml（推荐）。它**不进交付包**：
+# 每台机器各记各的，跟着包发出去会让现场继承别人的选择。
+# user_prefs_file: 
 # 下载与解压的落点：归档下到这里，解压成 ${version_download_dir}/<包名>/<工作空间>。
 # 留空则取当前 workspace_root 的父目录。
 version_download_dir: ""

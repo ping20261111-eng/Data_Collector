@@ -67,11 +67,23 @@ class TeleopDialog(QDialog):
     #  而且说明文字会被压到折行（实测自然宽度只有 282，说明那行根本放不下）。
     MIN_WIDTH = 380
 
-    def __init__(self, parent=None, users=None, current: str = ""):
+    def __init__(self, parent=None, users=None, current: str = "",
+                 last_user: str = ""):
         """
         Args:
             users: 已经能直接切过去的用户名（含其它工作空间里的），列进下拉。
             current: 机器人侧当前生效的标定用户，显示出来做对照。
+            last_user: **上一次在这台机器上遥操的人**（跨进程记忆），预填进输入框。
+
+        ## 为什么现在会预填（v6.6.0，推翻了原先「刻意留空」的决定）
+
+        原先的判断是"预填之后顺手按回车就会用上一个人的参数，而现场点这个按钮
+        往往是来换人的"。现场 2026-10-19 明确要求记忆：**同一个人连续作业是常态**
+        （一台机器一个人，换人是少数），每次重敲名字才是主要负担。
+
+        「顺手回车用错人」的顾虑用另一条防住：下面那行「机器人侧当前生效：X」
+        仍然显示，且预填值就是**上一次真正启动过遥操作的人** —— 与当前生效值不一致
+        时，一眼能看出"这次要换人"。
         """
         super().__init__(parent)
         self.setWindowTitle("启动遥操作")
@@ -94,9 +106,17 @@ class TeleopDialog(QDialog):
         # 现场会以为名字已经填好了、直接点确定，然后收到一句"用户名不能为空"。
         self.combo.setLineEdit(HintLineEdit("输入或选择用户名"))
         self.combo.addItems(names)
-        # 默认**留空**，不预填当前用户：预填之后"顺手按回车"就会用上一个人的参数启动，
-        # 而现场点这个按钮往往是来换人的。当前是谁由下面那行提示说清楚，不必替人做选择。
+        # 默认预填**上一次遥操的人**（v6.6.0）：同一个人连续作业是常态，
+        # 每次重敲名字是主要负担。列表里有的选中它（下拉里能看出是已标定的人）；
+        # 不在列表里的（新人 / 换过工作空间）填成文本，方便直接改几个字。
         self.combo.setCurrentIndex(-1)
+        last_user = (last_user or "").strip()
+        if last_user:
+            matched = self.combo.findText(last_user)
+            if matched >= 0:
+                self.combo.setCurrentIndex(matched)
+            else:
+                self.combo.setEditText(last_user)
         self.name_label.setBuddy(self.combo)     # 点字段名即可聚焦输入框
         layout.addWidget(self.combo)
 
@@ -410,6 +430,10 @@ class RecordDialog(QDialog):
         self.config = config
         # 兼容入参：不传 config 时用传入的映射（或 SDK 默认表）做只读下拉
         self._fallback = dict(action_labels) if action_labels else dict(ARM_MOTION_LABELS)
+        # 上一次的选择（跨进程记忆，v6.6.0）：类型 / 采集任务 / 描述。
+        # **「保存位置」刻意不在其中** —— 它只记本次会话：写进文件的话，盘拔了
+        # 配置还指着盘，下一次起录会失败（见 core.UserPrefsStore 的说明）。
+        self._prefs = config.get_user_prefs() if config is not None else {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP["sp4"], SP["sp4"], SP["sp4"], SP["sp4"])
@@ -419,6 +443,11 @@ class RecordDialog(QDialog):
         self.type_combo = QComboBox()
         # bag/vla/cmd 对应配置项 record_<type>_script（scripts/record_bag.sh 等）
         self.type_combo.addItems(["bag", "vla", "cmd"])
+        # 默认选上一次用的类型（找不到就保持第一项 bag）
+        _preferred_type = str(self._prefs.get("record_type") or "")
+        _type_index = self.type_combo.findText(_preferred_type)
+        if _type_index >= 0:
+            self.type_combo.setCurrentIndex(_type_index)
         layout.addWidget(self.type_combo)
 
         # ---- 保存位置（v6.4.17）----
@@ -451,6 +480,8 @@ class RecordDialog(QDialog):
         layout.addWidget(field_label("描述（desc）"))
         self.desc_edit = QLineEdit()
         self.desc_edit.setPlaceholderText("可选")
+        # 默认填上一次的描述（可改）：现场同一轮采集往往重复同一句说明
+        self.desc_edit.setText(str(self._prefs.get("record_desc") or ""))
         layout.addWidget(self.desc_edit)
 
         # ---- 采集任务 ----
@@ -472,6 +503,8 @@ class RecordDialog(QDialog):
         self.label_combo.lineEdit().setPlaceholderText("可选，可自由填写")
         layout.addWidget(self.label_combo)
         self.reload_labels()
+        # 默认选上一次的采集任务（列表里有的要选中那一项以保留 action_id）
+        self._apply_preferred_label(str(self._prefs.get("record_label") or ""))
 
         layout.addSpacing(SP["sp2"])
         hbox = QHBoxLayout()
@@ -481,6 +514,9 @@ class RecordDialog(QDialog):
         cancel.clicked.connect(self.reject)
         ok = QPushButton("开始录制")
         ok.setProperty("variant", "primary")
+        # 回车即「开始录制」（与「启动遥操作」「标定设置」两个对话框一致）：
+        # 现场填完任务名直接回车就走，不必再去点按钮
+        ok.setDefault(True)
         ok.clicked.connect(self.accept)
         hbox.addWidget(cancel)
         hbox.addWidget(ok)
@@ -610,6 +646,22 @@ class RecordDialog(QDialog):
                                          item["name"], self.NAME_ROLE)
         self.label_combo.setEditText(current)
         self.label_combo.blockSignals(False)
+
+    def _apply_preferred_label(self, name: str) -> None:
+        """把记忆里的采集任务放回下拉。
+
+        **列表里存在的要 `setCurrentIndex`**（保留 UserRole 里的 action_id），
+        只有不存在的才当自由文本 —— 一律 `setEditText` 会让 action_id 丢掉，
+        而它是要写进 info.json 的。这是"恢复默认值"最容易写错的一处。
+        """
+        name = (name or "").strip()
+        if not name:
+            return
+        for index in range(self.label_combo.count()):
+            if (self.label_combo.itemData(index, self.NAME_ROLE) or "") == name:
+                self.label_combo.setCurrentIndex(index)
+                return
+        self.label_combo.setEditText(name)
 
     def open_label_manager(self):
         if self.config is None:

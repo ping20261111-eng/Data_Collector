@@ -11,3 +11,6 @@
 
 # 运行时产物：每台机器自己维护，不该随包分发
 configs/point_labels.yaml export-ignore
+# 使用者偏好：每台机器不同（上次遥操的人、上次的采集任务），跟着包发出去
+# 会让现场一解包就继承别人的选择。
+configs/user_prefs.yaml export-ignore

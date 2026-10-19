@@ -115,6 +115,27 @@ def _dismiss_modal_dialogs(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_user_prefs(tmp_path, monkeypatch):
+    """使用者偏好文件必须落在 tmp —— **测试不许写项目目录**（v6.6.0）。
+
+    v6.6.0 加了"起录成功就记住选择"，而既有录制用例真的会走 `on_record`：
+    不隔离的话，跑一次测试就在 `configs/` 下留一份 `user_prefs.yaml`
+    （里面是测试用的假任务名 / 假人名），下一次跑时又被当成"上次的选择"预填。
+
+    这类污染被 `.gitignore` 藏住了 —— `git status` 上看不见，所以更该主动隔离。
+    """
+    from data_collector import core
+
+    target = tmp_path / "user_prefs.yaml"
+    original = core.UserPrefsStore.__init__
+
+    def patched(self, app_config, default_file, **kwargs):
+        original(self, app_config, target, **kwargs)
+
+    monkeypatch.setattr(core.UserPrefsStore, "__init__", patched)
+
+
+@pytest.fixture(autouse=True)
 def _no_command_bridge(monkeypatch):
     """用例里**默认不起常驻命令通道**（v6.2.0）。
 

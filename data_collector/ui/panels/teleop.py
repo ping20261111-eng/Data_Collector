@@ -289,14 +289,20 @@ class TeleopMixin:
                 "或该版本包是否完整。")
             return
 
+        prefs = self.config.get_user_prefs()
         dlg = TeleopDialog(self, users=self.teleop.known_users(),
-                           current=self._current_calibration_user())
+                           current=self._current_calibration_user(),
+                           last_user=prefs.get("teleop_user", ""))
         if dlg.exec_() != QDialog.Accepted:
             return
         username = dlg.get_username()
         if not username:
             self.show_error("输入错误", "用户名不能为空")
             return
+        # 记住这一次的人（下次打开对话框预填）。放在这里而不是"启动成功后"：
+        # 即使随后标定被取消，这次输入的名字也确实是"这次要用的人"，
+        # 下次打开时预填它比预填更早的人更有用。
+        self.config.remember_teleop_user(username)
 
         match = self.teleop.find_user(username)
         if match is not None:

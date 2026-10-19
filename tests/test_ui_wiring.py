@@ -4253,12 +4253,17 @@ def _patch_teleop_dialogs(monkeypatch, typed, tracker="4"):
     """把「启动遥操作」的两个对话框换成替身，记录弹了哪个框、下拉里列了谁。"""
     from data_collector.ui.panels import teleop as teleop_panel
 
-    seen = {"users": [], "current": "", "calib": False, "calib_user": None}
+    seen = {"users": [], "current": "", "calib": False, "calib_user": None,
+            "last_user": ""}
 
     class FakeTeleopDialog:
-        def __init__(self, parent=None, users=None, current=""):
+        # ⚠️ 形参必须与生产 `TeleopDialog.__init__` **收敛**（v6.6.0 加了 last_user）。
+        # 替身少一个参数不会立刻报错，而是"on_teleop 一调就 TypeError、整条路静默不走" ——
+        # 现场看不见，测试里只表现为"应该启动却没启动"。
+        def __init__(self, parent=None, users=None, current="", last_user=""):
             seen["users"] = list(users or [])
             seen["current"] = current
+            seen["last_user"] = last_user
 
         def exec_(self): return QDialog.Accepted
         def get_username(self): return typed
@@ -6140,6 +6145,197 @@ def test_the_menu_and_the_page_both_only_send_the_lock(status_env, tmp_path, mon
 
     assert calls == [True, True]
     assert row.btn_lock.text() == "自锁", "菜单点过之后，页面文案也不该翻"
+
+
+def test_record_dialog_prefills_the_last_choices(status_env, tmp_path):
+    """「录制设置」要预填上次的类型 / 采集任务 / 描述（v6.6.0）。
+
+    **「保存位置」刻意不预填** —— 它只记本次会话：写进文件的话，盘拔了配置
+    还指着盘，下一次起录会失败（见 `core.UserPrefsStore` 的说明）。
+    """
+    from data_collector.ui.dialogs import RecordDialog
+
+    _win, config, _status = status_env
+    config.app_config["user_prefs_file"] = str(tmp_path / "user_prefs.yaml")
+
+    # 先探一次任务表，取一个**真实存在**的任务名 —— 用不存在的名字测不到
+    # "按下标选中"这条（不存在的名字本来就走自由文本，两种实现结果一样）。
+    probe = RecordDialog(config=config)
+    known, known_index = "", -1
+    for index in range(probe.label_combo.count()):
+        name = probe.label_combo.itemData(index, probe.NAME_ROLE)
+        if name:
+            known, known_index = name, index
+            break
+    assert known, "任务表是空的，这条守卫无从验证"
+
+    config.remember_record_settings("vla", known, "第三轮采数")
+    dlg = RecordDialog(config=config)
+
+    assert dlg.type_combo.currentText() == "vla"
+    # 选中列表项时，combo 显示的是带编号的样式文本（如「0  双臂垂下」），
+    # 所以这里断言"名字在里面"，纯名字由 `get_settings()` 给出。
+    assert known in dlg.label_combo.currentText()
+    assert dlg.desc_edit.text() == "第三轮采数"
+    # **关键判据**：必须按下标选中那一项（index 不能停在空项 0 / -1）。
+    # 只 `setEditText` 会让 index 停在上一次的位置 —— 于是 action_id 丢掉，
+    # 而它是要写进 info.json 的。
+    assert dlg.label_combo.currentIndex() == known_index, (
+        f"命中任务表时必须按下标选中：期望 index={known_index}，"
+        f"实际 {dlg.label_combo.currentIndex()}")
+    assert dlg.get_settings()["label"] == known
+
+
+def test_record_dialog_keeps_a_free_text_task_from_the_prefs(status_env, tmp_path):
+    """记下的任务名已不在任务表里时，仍要填进输入框（不能静默丢掉）。"""
+    from data_collector.ui.dialogs import RecordDialog
+
+    _win, config, _status = status_env
+    config.app_config["user_prefs_file"] = str(tmp_path / "user_prefs.yaml")
+    config.remember_record_settings("bag", "已经删掉的老任务", "")
+
+    dlg = RecordDialog(config=config)
+
+    assert dlg.label_combo.currentText().strip() == "已经删掉的老任务"
+    assert dlg.get_settings()["label"] == "已经删掉的老任务"
+    assert dlg.get_settings()["action_id"] is None
+
+
+def test_record_dialog_enter_key_starts_recording(status_env):
+    """「开始录制」按钮必须是**默认按钮** —— 回车即确认（现场要求）。"""
+    from data_collector.ui.dialogs import RecordDialog
+
+    _win, config, _status = status_env
+    from PyQt5.QtWidgets import QPushButton
+
+    dlg = RecordDialog(config=config)
+    buttons = [b for b in dlg.findChildren(QPushButton) if b.text() == "开始录制"]
+    assert buttons, "找不到「开始录制」按钮"
+    assert buttons[0].isDefault() is True, "回车应当等于点「开始录制」"
+
+
+def test_teleop_dialog_prefills_the_last_operator(status_env):
+    """「启动遥操作」要预填**上一次的人**（v6.6.0，推翻了原先刻意留空的做法）。"""
+    from data_collector.ui.dialogs import TeleopDialog
+
+    # 上一次的人已在已标定列表里 → 选中那一项（下拉里能看出是已标定的人）
+    dlg = TeleopDialog(users=["yyt", "张三"], current="yyt", last_user="张三")
+    assert dlg.get_username() == "张三"
+    assert dlg.combo.currentIndex() >= 0
+
+    # 不在列表里（新人 / 换过工作空间）→ 填成文本，方便直接改几个字
+    dlg2 = TeleopDialog(users=["yyt"], current="yyt", last_user="李四")
+    assert dlg2.get_username() == "李四"
+    assert dlg2.combo.currentIndex() == -1
+
+    # 没记过 → 保持留空（不替人做选择）
+    dlg3 = TeleopDialog(users=["yyt"], current="yyt", last_user="")
+    assert dlg3.get_username() == ""
+
+
+def test_on_teleop_passes_the_remembered_operator_to_the_dialog(status_env, tmp_path,
+                                                               monkeypatch):
+    """`on_teleop` 必须把偏好里的**上次人员**传给对话框。
+
+    只测「TeleopDialog 自己会预填」是不够的 —— 那只是**一半**的接线：
+    生产路径是 `on_teleop` 读偏好 → 传给对话框。这两层任何一层断了，
+    现场看到的都只是"弹出来是空的"。所以这条钉的是**传参**本身。
+    """
+    from PyQt5.QtWidgets import QDialog
+
+    from data_collector.ui.panels import teleop as teleop_panel
+
+    win, config, _status = status_env
+    config.app_config["user_prefs_file"] = str(tmp_path / "user_prefs.yaml")
+    config.remember_teleop_user("张三")
+
+    # on_teleop 会先检查配置文件在不在；不在就直接报错返回，走不到对话框
+    config_path = config.teleop_config_path
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    if not config_path.exists():
+        config_path.write_text("teleop:\n  calibration: default\n", encoding="utf-8")
+
+    seen = {}
+
+    class _FakeDialog:
+        def __init__(self, parent=None, users=None, current="", last_user=""):
+            seen["last_user"] = last_user
+
+        def exec_(self):
+            return QDialog.Rejected          # 直接取消：只看传参，不进后续流程
+
+    monkeypatch.setattr(teleop_panel, "TeleopDialog", _FakeDialog)
+
+    win.on_teleop()
+
+    assert seen.get("last_user") == "张三", (
+        f"on_teleop 没把上次人员传下去（收到 {seen.get('last_user')!r}）")
+
+
+def test_key_function_shortcuts_are_registered(status_env, monkeypatch):
+    """F5/F6/F7 三个快捷键要挂上，且连到对应的动作（v6.6.0）。
+
+    F7 必须是**只停**：F6 是开关，正在录制时按错会开始一段新录制。
+    """
+    win, _config, _status = status_env
+
+    shortcuts = {item.key().toString(): item for item in win.findChildren(
+        type(win._teleop_shortcut))}
+    assert "F5" in shortcuts and "F6" in shortcuts and "F7" in shortcuts
+    assert shortcuts["F5"] is win._teleop_shortcut
+
+    # F5：运行中 = 停止，未运行 = 启动
+    calls = []
+    monkeypatch.setattr(win, "teleop_running", False)
+    monkeypatch.setattr(win, "on_teleop", lambda: calls.append("start"))
+    monkeypatch.setattr(win, "on_stop_teleop", lambda: calls.append("stop"))
+    win.on_teleop_shortcut()
+    monkeypatch.setattr(win, "teleop_running", True)
+    win.on_teleop_shortcut()
+    assert calls == ["start", "stop"]
+
+    # F7：没有在录制时只提示，不启动录制
+    # ⚠️ `recorder.started_at` 是只读属性，不能 setattr —— 整个换成最小的假对象，
+    # 只提供 `on_stop_record_shortcut` 真正读的那两样。
+    class _IdleRecorder:
+        started_at = None
+
+        @staticmethod
+        def is_active():
+            return False
+
+    monkeypatch.setattr(win, "recorder", _IdleRecorder())
+    started = []
+    monkeypatch.setattr(win, "on_stop_record", lambda: started.append("stop"))
+    monkeypatch.setattr(win, "on_record", lambda: started.append("start"))
+    win.on_stop_record_shortcut()
+    assert started == [], "F7 在没有录制时不能触发起录"
+
+
+def test_upload_selected_supports_a_batch_and_shares_one_target(status_env):
+    """「上传选中」支持多选 = 批量，且**远端目标只问一次**（v6.6.0）。
+
+    为什么钉结构而不是跑一遍真上传：真上传要 SFTP/磁盘。这里钉三件在代码里
+    可判的事实 —— 用 `UploadBatchQueue`、不再走单选守卫、不再逐条问目标。
+    """
+    import inspect
+
+    from data_collector.ui import data_view
+
+    source = inspect.getsource(data_view.DataViewDialog.upload_selected_bag)
+    assert "UploadBatchQueue" in source, "批量必须走队列状态机"
+    # **取全部选中**（不是取当前一个）：断言的是取值方式本身，
+    # 只断言"不含 `_one_or_warn`"会让"改成 `[self._get_selected_bag()]`"照样绿。
+    assert "_selected_paths(self.bag_list)" in source, (
+        "批量必须取**全部**选中项（`_selected_paths`），不能退回单选")
+    assert "_get_selected_bag" not in source, (
+        "单选取值（`_get_selected_bag`）会把多选挡住 —— 那正是批量要做的事")
+    assert source.count("resolve_upload_subpath(") == 1, (
+        "整批只能问一次远端目标（问 N 次 = 现场输 N 遍密码）")
+
+    # 队列推进与取消：在界面层是"记录后推进"，不并行
+    finished = inspect.getsource(data_view.DataViewDialog._on_upload_finished)
+    assert "batch.record" in finished and "_start_next_upload" in finished
 
 
 def test_posture_single_arm_gets_disable_button(status_env, tmp_path, monkeypatch):

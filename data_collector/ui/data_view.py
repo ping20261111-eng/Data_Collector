@@ -25,7 +25,7 @@ from ..core_operations import (Launcher, TeleopManager, SdkServiceManager,
                               read_robot_status, EMERGENCY_STOP_TARGETS,
                               EMERGENCY_STOP_PART_NAMES)
 from ..core_data import RecorderManager, DataUploader, LogFetcher
-from ..core_data import UploadCancelledError
+from ..core_data import UploadBatchQueue, UploadCancelledError
 
 
 from .common import (SP, describe_export_target, ensure_remote_password,
@@ -55,6 +55,10 @@ class DataViewDialog(QDialog):
         self.fetch_dir = log_fetcher.fetch_dir
         self.upload_thread = None
         self.upload_in_progress = False
+        # 批量上传的队列状态机（v6.6.0；纯逻辑在 `core_data.UploadBatchQueue`）。
+        # 单个上传也走它（队列长度 1）—— 只有"弹不弹逐条提示"不同，见 `_finish_batch`。
+        self._upload_batch = None
+        self._upload_subpath = ""
         # 批量删除的状态：统计体积 → 确认 → 删除，两段都在后台线程里跑
         self._local_threads = []
         self._delete_ctx = None
@@ -346,34 +350,64 @@ class DataViewDialog(QDialog):
         _play_bag_folder(self, launcher, folder_path, self.append_log)
 
     def upload_selected_bag(self):
+        """上传选中的数据文件夹 —— **支持多选 = 批量**（v6.6.0）。
+
+        批量不是"把按钮改成循环"这么简单，三处必须一次想清：
+
+        1. **远端目标只问一次**：`resolve_upload_subpath` 会弹密码/选目标，
+           每个目录问一次等于让现场输 N 遍密码。整批复用同一个 subpath。
+        2. **失败不中断**：一个目录失败不代表后面的不能用 —— 传完再汇总。
+           否则"传到第 4 个断了"，剩下 20 个要重新一个个点。
+        3. **成功不逐条弹窗**：5 个目录弹 5 个模态框，每次都要点"确定"、
+           每次都挡住进度。批量只在结束时弹一次汇总。
+        """
         if self.delete_in_progress:
             QMessageBox.information(self, "提示", "删除进行中，暂不能上传")
             return
         if self.upload_in_progress:
             self._cancel_upload_in_dialog()
             return
-        folder_path = self._get_selected_bag()
-        if not folder_path:
+        folders = self._selected_paths(self.bag_list)
+        if not folders:
+            QMessageBox.warning(self, "提示", "请先选择数据文件夹")
             return
         # 与「上传数据」按钮走同一个分流点：disk 目标不问密码、不连远端
         subpath = resolve_upload_subpath(self.uploader, self)
         if subpath is None:
             self.append_log("已取消上传")
             return
-        self.append_log(f"开始导出数据，目标：{describe_export_target(self.uploader)}")
 
-        # --- 新增：显示父窗口的进度控件 ---
+        self._upload_batch = UploadBatchQueue(folders)
+        self._upload_subpath = subpath
+
+        self.append_log(f"开始上传 {len(folders)} 个数据文件夹，"
+                        f"目标：{describe_export_target(self.uploader)}")
         if self.parent() and hasattr(self.parent(), 'show_upload_progress'):
             self.parent().show_upload_progress(True)
-
         self._set_busy_controls(True)
-        self.btn_upload_selected.setText("取消上传")
-        theme.set_variant(self.btn_upload_selected, "danger")
+        self._start_next_upload()
+
+    # ---------- 批量上传（v6.6.0） ----------
+    def _start_next_upload(self):
+        """从队列取下一个开始传；队列空了就收尾（**串行，不并行**）。"""
+        batch = self._upload_batch
+        folder = batch.next() if batch is not None else None
+        if folder is None:
+            self._finish_batch()
+            return
+        multi = batch.total > 1
         self.upload_in_progress = True
+        self.btn_upload_selected.setText("取消上传")
+        self.btn_upload_selected.setEnabled(True)
+        theme.set_variant(self.btn_upload_selected, "danger")
+        if multi:
+            self.append_log(f"（{batch.done + 1}/{batch.total}）正在上传：{folder.name}")
         if self.parent() and hasattr(self.parent(), "update_upload_progress"):
-            self.parent().update_upload_progress(0)
+            self.parent().update_upload_progress(batch.percent(0))
         if self.parent() and hasattr(self.parent(), "progress_signal"):
-            self.parent().progress_signal.emit("准备打包并上传...")
+            self.parent().progress_signal.emit(
+                f"上传 {batch.done + 1}/{batch.total}：{folder.name}" if multi
+                else "准备打包并上传...")
 
         def progress_msg(text):
             if self.parent() and hasattr(self.parent(), 'progress_signal'):
@@ -382,12 +416,67 @@ class DataViewDialog(QDialog):
         self.upload_thread = UploadThread(
             self.uploader,
             lambda **kw: self.uploader.upload_specific_bag(
-                folder_path, remote_subpath_arg(subpath), **kw),
+                folder, remote_subpath_arg(self._upload_subpath), **kw),
             progress_msg)
-        if self.parent() and hasattr(self.parent(), "update_upload_progress"):
-            self.upload_thread.progress_signal.connect(self.parent().update_upload_progress)
+        self.upload_thread.progress_signal.connect(self._on_batch_progress)
         self.upload_thread.finished.connect(self._on_upload_finished)
         self.upload_thread.start()
+
+    def _on_batch_progress(self, value):
+        if self._upload_batch is None:
+            return
+        if self.parent() and hasattr(self.parent(), "update_upload_progress"):
+            self.parent().update_upload_progress(self._upload_batch.percent(value))
+
+    def _finish_batch(self):
+        """一整批结束（跑完 / 被取消）：恢复控件 + 汇总 + 刷新列表。"""
+        batch = self._upload_batch
+        self.upload_in_progress = False
+        self.btn_upload_selected.setEnabled(True)
+        self.btn_upload_selected.setText("上传选中")
+        theme.set_variant(self.btn_upload_selected, "default")
+        self._set_busy_controls(False)
+        if batch is None:
+            self.refresh_lists()
+            return
+        summary = batch.summary()
+        all_ok = summary["failed"] == 0
+        if self.parent() and hasattr(self.parent(), "update_upload_progress"):
+            self.parent().update_upload_progress(100 if all_ok else 0)
+        if self.parent() and hasattr(self.parent(), 'show_upload_progress'):
+            self.parent().show_upload_progress(False)
+        for folder, success, msg in batch.results:
+            self.append_log(("✔ " if success else "✖ ") + f"{folder.name}：{msg}")
+        if summary["cancelled"] and summary["unstarted"]:
+            self.append_log(f"已取消上传：还剩 {summary['unstarted']} 个未开始")
+
+        if summary["total"] <= 1:
+            # 单个目录：保持原有行为（现场习惯"传完弹一下"）
+            if batch.results:
+                _folder, success, msg = batch.results[0]
+                if success:
+                    QMessageBox.information(self, "成功", msg)
+                else:
+                    QMessageBox.critical(self, "失败", msg)
+        else:
+            # 批量：**只弹一次汇总**；失败清单进日志（弹窗放不下长清单）
+            if summary["cancelled"]:
+                head = (f"已取消。完成 {summary['done']} 个："
+                        f"成功 {summary['ok']} 个，失败 {summary['failed']} 个；"
+                        f"未开始 {summary['unstarted']} 个。")
+            else:
+                head = (f"共 {summary['total']} 个：成功 {summary['ok']} 个，"
+                        f"失败 {summary['failed']} 个。")
+            if summary["failed"]:
+                names = "、".join(folder.name for folder, _s, _m in batch.failed[:5])
+                more = "…" if summary["failed"] > 5 else ""
+                QMessageBox.warning(self, "批量上传完成",
+                                    f"{head}\n\n失败：{names}{more}\n"
+                                    "（每个失败的具体原因见日志区）")
+            else:
+                QMessageBox.information(self, "批量上传完成", head)
+        self._upload_batch = None
+        self.refresh_lists()
 
     # ---------- 上传期间的按钮联动 ----------
     def _busy_controls(self):
@@ -410,10 +499,15 @@ class DataViewDialog(QDialog):
     def _cancel_upload_in_dialog(self):
         """取消上传（上传过程中“上传选中”按钮会变为“取消上传”）。
 
+        批量时它取消的是**整批**：当前这一条中止后不再推进队列（`UploadBatchQueue.cancel`）。
+        取消不该被理解成"跳过这一条、继续下一个" —— 那样用户按几次都停不下来。
+
         注意：本方法必须定义在 DataViewDialog 类层级，调用处是
         self._cancel_upload_in_dialog()，不要再缩进成 upload_selected_bag 的嵌套函数。
         """
         if self.upload_in_progress:
+            if self._upload_batch is not None:
+                self._upload_batch.cancel()      # 清空**未开始**的，已传完的结果保留
             self.append_log("正在取消上传...")
             if self.upload_thread and self.upload_thread.isRunning():
                 self.upload_thread.cancel()
@@ -429,23 +523,19 @@ class DataViewDialog(QDialog):
             self.append_log("上传取消请求已发送，等待当前传输块结束...")
 
     def _on_upload_finished(self, success, msg):
-        self.btn_upload_selected.setEnabled(True)
-        self._set_busy_controls(False)
+        """一条传完：记结果，然后推进队列（队列空了才收尾）。"""
+        batch = self._upload_batch
+        if batch is not None:
+            batch.record(success, msg)
         self.upload_in_progress = False
-        self.btn_upload_selected.setText("上传选中")
-        theme.set_variant(self.btn_upload_selected, "default")
-        if self.parent() and hasattr(self.parent(), "update_upload_progress"):
-            self.parent().update_upload_progress(100 if success else 0)
-        # --- 新增：隐藏父窗口的进度控件 ---
-        if self.parent() and hasattr(self.parent(), 'show_upload_progress'):
-            self.parent().show_upload_progress(False)
-        if success:
-            QMessageBox.information(self, "成功", msg)
-            self.append_log(msg)
-        else:
-            self.append_log(f"上传失败: {msg}")
-            QMessageBox.critical(self, "失败", msg)
-        self.refresh_lists()
+        if batch is not None and batch.pending:
+            # 换引用前先等旧线程真正退出：finished 已发出、run() 正在收尾，
+            # 直接覆盖会让运行中的 QThread 被回收（C 层 abort，不是异常）
+            if self.upload_thread is not None and self.upload_thread.isRunning():
+                self.upload_thread.wait(1500)
+            self._start_next_upload()
+            return
+        self._finish_batch()
 
     def view_selected_bag(self):
         folder_path = self._get_selected_bag()

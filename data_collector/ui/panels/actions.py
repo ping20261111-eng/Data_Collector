@@ -64,7 +64,8 @@ class ActionsMixin(ExportTargetMixin):
         self.btn_teleop = QPushButton("遥操作 · 未启动")
         # 文案随状态换词（未启动/已停止/停止遥操作），固定最小宽度避免按钮跳动
         self.btn_teleop.setMinimumWidth(150)
-        self.btn_teleop.setToolTip("启动遥操作（后台运行、日志实时回显；运行中同一按钮变为停止）")
+        self.btn_teleop.setToolTip("启动遥操作（后台运行、日志实时回显；运行中同一按钮变为停止）\n"
+                                   "快捷键 F5 = 遥操作开关")
         self.btn_teleop.clicked.connect(self.on_teleop)
 
         self.btn_record = QPushButton("数据录制")

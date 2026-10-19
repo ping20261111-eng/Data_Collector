@@ -121,11 +121,13 @@ class DataOpsMixin:
         """
         if state == "recording":
             self.btn_record.setText("停止录制")
-            self.btn_record.setToolTip("结束当前录制并保存数据包")
+            self.btn_record.setToolTip("结束当前录制并保存数据包\n"
+                                       "快捷键 F6 = 录制开关；F7 = 只结束录制")
             theme.set_variant(self.btn_record, "danger")
         else:
             self.btn_record.setText("数据录制")
-            self.btn_record.setToolTip("开始数据录制（弹窗选类型与任务标签）")
+            self.btn_record.setToolTip("开始数据录制（弹窗选类型与任务标签）\n"
+                                       "快捷键 F6 = 录制开关；F7 = 只结束录制")
             theme.set_variant(self.btn_record, "default")
         self.btn_record.setEnabled(True)
         # 打点与录制同生共死：放在这里，是因为录制状态的**每一个**出口都会经过它
@@ -154,6 +156,10 @@ class DataOpsMixin:
             return
         if self.recorder.start(settings["type"], settings["name"], settings["desc"],
                                settings["label"], settings["action_id"]):
+            # 记住这次的选择（下次打开「录制设置」时作为默认值）。
+            # 放在**启动成功之后**：用户点了取消、或起录失败，不该改写"上次用的"。
+            self.config.remember_record_settings(settings["type"], settings["label"],
+                                                 settings["desc"])
             tag = settings["label"] or "(无)"
             self.append(
                 f"录制已后台启动: {settings['type']}, name={settings['name']}, "
