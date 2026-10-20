@@ -121,7 +121,12 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         self._posture_dialog = None                  # 「姿势控制」独立页面（单例）
         # 躯干自锁**不记状态**（v6.5.7）：那个状态属于遥操作进程（重启即重置），
         # 上位机记不住真相 —— 只保留下发用的线程引用。
-        self._trunk_lock_thread = None               # 自锁下发的后台线程（见 status.py）
+        # 自锁下发的后台线程**收在列表里**（v6.6.1）：连点两次时后一次不能覆盖
+        # 还活着的线程对象 —— 那会让 QThread 在运行中被回收（C 层 abort）。
+        # 引用的生命周期由这里负责，因为 `LocalTaskThread` 刻意不挂 parent。
+        self._trunk_lock_threads: list = []
+        #: 自锁还在下发时又按了一次：它一回来立刻补发（不丢这次按下）。
+        self._trunk_lock_pending = False
         # 头部至 -32°（采数）的后台线程，与自锁同一条理由：引用自己留着，
         # `LocalTaskThread` 刻意不接收 parent（见 status.py / threads.py 的说明）。
         self._head_stream_thread = None

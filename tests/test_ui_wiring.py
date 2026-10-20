@@ -5978,11 +5978,14 @@ def test_trunk_lock_always_sends_the_same_command(status_env, tmp_path, monkeypa
     _seed_motion_presets(tmp_path)
     _posture_status(status_file)
     dialog = _open_posture(win, monkeypatch)
+    # 同步替身：自锁的下发在 `LocalTaskThread` 里，真线程会让断言跑在它前面
+    # （时序抖动 = 偶发红）。本文件的界面用例一律用它。
+    _inline_task_thread(monkeypatch)
     monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
                         lambda *args, **kwargs: _BOX.Yes)
     calls = []
-    monkeypatch.setattr(win.launcher, "set_trunk_locked",
-                        lambda locked: (calls.append(locked), {
+    monkeypatch.setattr(win.launcher, "lock_trunk",
+                        lambda **kw: (calls.append("lock"), {
                             "ok": True,
                             "steps": [{"name": "躯干自锁（H1、H2、H3 转为仅上电）",
                                        "sent": 3, "matched": 1}],
@@ -5991,7 +5994,7 @@ def test_trunk_lock_always_sends_the_same_command(status_env, tmp_path, monkeypa
     dialog.on_trunk_lock_action()
     dialog.on_trunk_lock_action()
 
-    assert calls == [True, True], f"两次点击都必须下发自锁，实际：{calls}"
+    assert calls == ["lock", "lock"], f"两次点击都必须下发自锁，实际：{calls}"
     row = dialog.module_rows["trunk"]
     assert row.btn_lock.text() == "自锁", "按钮不该再翻成「解除自锁」"
     text = dialog.result.toPlainText()
@@ -6003,21 +6006,39 @@ def test_trunk_lock_always_sends_the_same_command(status_env, tmp_path, monkeypa
 
 
 def test_the_page_never_offers_an_unlock_direction(status_env, tmp_path, monkeypatch):
-    """姿势页那个按钮**没有第二个方向** —— 点几次都是自锁。
+    """姿势页那个按钮**没有第二个方向** —— 点几次都只发自锁。
 
-    解除能力仍在底层（`set_trunk_locked(False)`，由 `test_core.py` 覆盖它的两步时序），
-    只是界面不再提供：解除方式改成重启遥操作（自锁状态属于遥操作进程）。
-    这条守卫防的是"有人把翻转加回来"——那会在真实未锁时发解除指令。
+    v6.5.7 只是界面不提供「解除」；**v6.6.1 把底层也删了**（现场 2026-10-20 要求
+    「该按键只有下发自锁指令的功能」）。所以这条现在钉两件事：
+
+      · 界面点几次都只下发一条自锁（没有翻转）；
+      · **底层根本没有「解除」可调用** —— 不是"界面不调"，是"不存在"。
+
+    为什么第二件必须钉在**底层**：界面是调用方之一，不是唯一调用方。旧接口
+    `set_trunk_locked(locked: bool)` 还留着，就等于留了一条"谁想解除都能解除"的路；
+    而自锁状态**读不回来**，谁也无法判断"现在解除安不安全"。
     """
+    import inspect
+
+    from data_collector.core_operations import Launcher
+
+    assert not hasattr(Launcher, "set_trunk_locked"), (
+        "带方向的旧方法必须不存在：留着它，「解除」就仍然是一条写得出来的路径")
+    assert "locked" not in inspect.signature(Launcher.lock_trunk).parameters, (
+        "自锁方法不许有方向参数")
+
     win, _cm, status_file = status_env
     _seed_motion_presets(tmp_path)
     _posture_status(status_file)
     dialog = _open_posture(win, monkeypatch)
+    # 同步替身：自锁的下发在 `LocalTaskThread` 里，真线程会让断言跑在它前面
+    # （时序抖动 = 偶发红）。本文件的界面用例一律用它。
+    _inline_task_thread(monkeypatch)
     monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
                         lambda *args, **kwargs: _BOX.Yes)
     calls = []
-    monkeypatch.setattr(win.launcher, "set_trunk_locked",
-                        lambda locked: (calls.append(locked), {
+    monkeypatch.setattr(win.launcher, "lock_trunk",
+                        lambda **kw: (calls.append("lock"), {
                             "ok": True, "steps": [], "reason": ""})[1])
 
     row = dialog.module_rows["trunk"]
@@ -6025,7 +6046,7 @@ def test_the_page_never_offers_an_unlock_direction(status_env, tmp_path, monkeyp
         dialog.on_trunk_lock_action()
         assert row.btn_lock.text() == "自锁", "文案任何时候都不该出现「解除自锁」"
 
-    assert calls == [True, True, True]
+    assert calls == ["lock", "lock", "lock"]
 
 
 
@@ -6036,10 +6057,13 @@ def test_trunk_lock_failure_keeps_the_single_direction(status_env, tmp_path, mon
     _seed_motion_presets(tmp_path)
     _posture_status(status_file)
     dialog = _open_posture(win, monkeypatch)
+    # 同步替身：自锁的下发在 `LocalTaskThread` 里，真线程会让断言跑在它前面
+    # （时序抖动 = 偶发红）。本文件的界面用例一律用它。
+    _inline_task_thread(monkeypatch)
     monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
                         lambda *args, **kwargs: _BOX.Yes)
-    monkeypatch.setattr(win.launcher, "set_trunk_locked",
-                        lambda locked: {"ok": False, "steps": [],
+    monkeypatch.setattr(win.launcher, "lock_trunk",
+                        lambda **kw: {"ok": False, "steps": [],
                                         "reason": "等 3s 没有订阅者（主程序没在跑？）"})
 
     dialog.on_trunk_lock_action()
@@ -6092,8 +6116,8 @@ def test_robot_menu_lock_label_is_always_the_lock(status_env, tmp_path, monkeypa
     _inline_task_thread(monkeypatch)
     monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
                         lambda *args, **kwargs: _BOX.Yes)
-    monkeypatch.setattr(win.launcher, "set_trunk_locked",
-                        lambda locked: {"ok": True, "steps": [], "reason": ""})
+    monkeypatch.setattr(win.launcher, "lock_trunk",
+                        lambda **kw: {"ok": True, "steps": [], "reason": ""})
 
     for _ in range(3):
         win._sync_robot_menu()
@@ -6106,22 +6130,106 @@ def test_robot_menu_lock_label_is_always_the_lock(status_env, tmp_path, monkeypa
 def test_robot_menu_lock_never_alternates(status_env, monkeypatch):
     """菜单里连点两次 → **两次都下发自锁**（不再按记录交替）。"""
     win, _cm, _status = status_env
-    # **必须换掉同步替身**：`on_trunk_lock` 走 `status` 模块的 `LocalTaskThread`，
-    # 用真 QThread 时这里会连起两个线程、第一个被引用覆盖后回收 —— 那是段错误。
+    # 同步替身：只为时序确定（真线程会让断言跑在下发之前）。
+    # 这条用例原来还兼着"别让第一个线程被引用覆盖"的职责 —— v6.6.1 起线程引用
+    # 收在列表里，覆盖问题本身已经修掉；那个行为改由
+    # `test_a_second_press_while_in_flight_is_resent_not_dropped` 钉。
     _inline_task_thread(monkeypatch)
     monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
                         lambda *args, **kwargs: _BOX.Yes)
     calls = []
-    monkeypatch.setattr(win.launcher, "set_trunk_locked",
-                        lambda locked: (calls.append(locked),
+    monkeypatch.setattr(win.launcher, "lock_trunk",
+                        lambda **kw: (calls.append("lock"),
                                         {"ok": True, "steps": [], "reason": ""})[1])
 
     win.on_trunk_lock()
     win.on_trunk_lock()
 
-    assert calls == [True, True], f"方向不该交替：{calls}"
+    assert calls == ["lock", "lock"], f"每一次点击都要真的发一条：{calls}"
 
 
+
+
+def test_a_second_press_while_in_flight_is_resent_not_dropped(status_env, monkeypatch):
+    """自锁还在路上时再按一次 → **这次按下不丢**，它一回来立刻补发（v6.6.1）。
+
+    现场反馈「发一两次可能没触发」，而"再按一次"是唯一的补救手段（没有解除可点）。
+    所以判据是：**每一次按下都对应一次真实下发** ——
+      · 上一条还在路上 → 记 `_trunk_lock_pending`；
+      · 它一回来 → 补发一条（不并发抢通道：通道是串行的，并发只会让两条互相等超时）。
+
+    线程替身做成**可控的**（`release()` 才真正执行），否则测不到"在路上"这个状态 ——
+    用同步替身的话 `isRunning()` 恒为 False，pending 那条路根本不会被走到。
+    """
+    from data_collector.ui.panels import status as status_panel
+
+    win, _cm, _status = status_env
+    # 钉结构：线程引用必须在列表里（单个属性会在第二次按下时覆盖还活着的那个对象，
+    # 那是 QThread 运行中被回收 = C 层 abort）。
+    assert isinstance(win._trunk_lock_threads, list), (
+        "线程引用要收在列表里，不能在原位覆盖")
+
+    class _Sig:
+        def __init__(self):
+            self.slots = []
+
+        def connect(self, slot):
+            self.slots.append(slot)
+
+        def emit(self, *args):
+            for slot in self.slots:
+                slot(*args)
+
+    class _ManualThread:
+        """`release()` 之前一直停在下发途中。"""
+
+        def __init__(self, task):
+            self.task = task
+            self.finished = _Sig()
+            self.done = False
+
+        def start(self):
+            pass                        # 故意不跑：模拟"还没回来"
+
+        def isRunning(self):
+            return not self.done
+
+        def release(self):
+            self.done = True
+            self.finished.emit(True, self.task(), "")
+
+    monkeypatch.setattr(status_panel, "LocalTaskThread", _ManualThread)
+    monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
+                        lambda *args, **kwargs: _BOX.Yes)
+    calls = []
+    monkeypatch.setattr(win.launcher, "lock_trunk",
+                        lambda **kw: (calls.append("lock"),
+                                      {"ok": True, "steps": [], "reason": ""})[1])
+
+    win.on_trunk_lock()                # 第一条：在路上
+    win.on_trunk_lock()                # 第二条：不能被吞掉
+
+    assert calls == [], "两条都还没回来，此时不该有结果"
+    assert len(win._trunk_lock_threads) == 1, "同一时刻只该有一条在路上"
+    assert win._trunk_lock_pending is True, "第二次按下必须记账（不许丢）"
+    assert "还在下发中" in win.log.toPlainText(), "要告诉现场这一下被记下了"
+
+    first = win._trunk_lock_threads[0]
+    first.release()                    # 第一条回来 → 应当补发一条
+
+    assert win._trunk_lock_pending is False, "补发之后要清账"
+    running = [thread for thread in win._trunk_lock_threads if thread.isRunning()]
+    assert len(running) == 1, "同一时刻只该有一条在路上"
+    assert running[0] is not first, "补发的是一条**新的**下发"
+    assert "正在重发" in win.log.toPlainText(), "补发要在日志里看得出来"
+
+    running[0].release()
+    assert calls == ["lock", "lock"], f"两次按下 = 两次真实下发：{calls}"
+    assert win._trunk_lock_busy() is False, "都发完了就不该再算「在路上」"
+    # 已结束的引用**留到下一次下发前才摘**（不在 finished 槽里丢：那时 run() 可能
+    # 还没返回，丢最后一个引用 = 销毁运行中的 QThread = abort）。
+    assert any(thread is running[0] for thread in win._trunk_lock_threads), (
+        "刚结束时引用还要在 —— 槽里摘引用会撞上 run() 尚未返回的窗口")
 
 
 def test_the_menu_and_the_page_both_only_send_the_lock(status_env, tmp_path, monkeypatch):
@@ -6130,11 +6238,14 @@ def test_the_menu_and_the_page_both_only_send_the_lock(status_env, tmp_path, mon
     _seed_motion_presets(tmp_path)
     _posture_status(status_file, trunk=True, arms=True)
     dialog = _open_posture(win, monkeypatch)
+    # 同步替身：自锁的下发在 `LocalTaskThread` 里，真线程会让断言跑在它前面
+    # （时序抖动 = 偶发红）。本文件的界面用例一律用它。
+    _inline_task_thread(monkeypatch)
     monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
                         lambda *args, **kwargs: _BOX.Yes)
     calls = []
-    monkeypatch.setattr(win.launcher, "set_trunk_locked",
-                        lambda locked: (calls.append(locked),
+    monkeypatch.setattr(win.launcher, "lock_trunk",
+                        lambda **kw: (calls.append("lock"),
                                         {"ok": True, "steps": [], "reason": ""})[1])
 
     row = dialog.module_rows["trunk"]
@@ -6143,7 +6254,7 @@ def test_the_menu_and_the_page_both_only_send_the_lock(status_env, tmp_path, mon
     win.on_trunk_lock()                     # 菜单那条路
     dialog.on_trunk_lock_action()           # 页面那条路
 
-    assert calls == [True, True]
+    assert calls == ["lock", "lock"]
     assert row.btn_lock.text() == "自锁", "菜单点过之后，页面文案也不该翻"
 
 
@@ -7572,9 +7683,12 @@ def test_trunk_lock_result_says_when_it_fell_back_to_the_cli(status_env, tmp_pat
     _seed_motion_presets(tmp_path)
     _posture_status(status_file)
     dialog = _open_posture(win, monkeypatch)
+    # 同步替身：自锁的下发在 `LocalTaskThread` 里，真线程会让断言跑在它前面
+    # （时序抖动 = 偶发红）。本文件的界面用例一律用它。
+    _inline_task_thread(monkeypatch)
     monkeypatch.setattr("data_collector.ui.posture.QMessageBox.question",
                         lambda *args, **kwargs: _BOX.Yes)
-    monkeypatch.setattr(win.launcher, "set_trunk_locked", lambda locked, **kw: {
+    monkeypatch.setattr(win.launcher, "lock_trunk", lambda **kw: {
         "ok": True,
         "steps": [{"name": "躯干自锁（H1~H3 转为仅上电）", "sent": 1,
                    "matched": -1, "channel": "一次性 CLI"}],
@@ -7634,11 +7748,11 @@ def test_the_menu_trunk_lock_ignores_the_checked_flag(status_env, monkeypatch):
                         lambda *args, **kwargs: _BOX.Yes)
     calls = []
 
-    def fake_locked(locked, **kwargs):
-        calls.append(locked)
+    def fake_lock(**kwargs):
+        calls.append("lock")
         return {"ok": True, "steps": [], "reason": ""}
 
-    monkeypatch.setattr(win.launcher, "set_trunk_locked", fake_locked)
+    monkeypatch.setattr(win.launcher, "lock_trunk", fake_lock)
 
     # 结构性判据：`on_trunk_lock` 除 self 外**不许有位置参数** ——
     # 否则 Qt 那个 `checked=False` 会被当成第一个位置参数静默吃掉
@@ -7657,9 +7771,8 @@ def test_the_menu_trunk_lock_ignores_the_checked_flag(status_env, monkeypatch):
     win.btn_trunk_lock.trigger()          # 真实触发：Qt 会带上 checked=False
     win.btn_trunk_lock.trigger()
 
-    assert calls == [True, True], (
-        f"两次触发都必须下发自锁，实际收到 {calls} —— "
-        "[False, ...] 就是把 triggered 的 checked 当成了方向")
+    assert calls == ["lock", "lock"], (
+        f"两次触发都必须下发自锁，实际收到 {calls}")
 
 def test_head_to_minus32_is_reachable_from_the_robot_menu(status_env):
     """「机器人控制 ▾」里有「头部至 -32°（采数）」—— 现场点的就是这一项。

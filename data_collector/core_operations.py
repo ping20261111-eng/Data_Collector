@@ -19,13 +19,12 @@ from .core import (
     load_calibrations, load_yaml, normalize_user,
 )
 # 姿势控制用到的常量与 payload 构造函数（话题名/消息类型/单位换算只有一处定义 —— 见 core_motion）
-from .core_motion import (BOOL_MSG, HEAD_DATA_AXIS_INDEX, HEAD_DATA_DURATION_SEC,
+from .core_motion import (HEAD_DATA_AXIS_INDEX, HEAD_DATA_DURATION_SEC,
                           HEAD_DATA_HOLD_SEC, HEAD_DATA_RATE, HEAD_DATA_STREAM_TIMEOUT,
                           HEAD_DATA_TARGET_DEG, HEAD_STREAM_SCRIPT,
                           MOTION_STREAM_SCRIPT, STREAM_TIMEOUT_PAD,
-                          TRUNK_CONNECT_TOPIC, TRUNK_LOCK_AXES_TEXT,
-                          TRUNK_LOCK_INDEXES, TRUNK_LOCK_LAYOUT_OFFSET,
-                          TRUNK_LOCK_MSG, TRUNK_LOCK_SETTLE, TRUNK_LOCK_TOPIC,
+                          TRUNK_LOCK_AXES_TEXT, TRUNK_LOCK_INDEXES,
+                          TRUNK_LOCK_LAYOUT_OFFSET, TRUNK_LOCK_MSG, TRUNK_LOCK_TOPIC,
                           stream_job_args, stream_job_key)
 # 常驻命令通道（v6.2.0）：姿态控制的下发走它，起不来就降级到一次性 CLI
 from .ros_bridge import RosBridge
@@ -1892,90 +1891,67 @@ class Launcher:
             return {"ok": None, "reason": self.bridge_note or "常驻通道不可用"}
         return bridge.ensure("trunk_non_realtime", on_line=on_line)
 
-    def set_trunk_locked(self, locked: bool, on_line=None) -> dict:
-        """躯干**自锁** / **解除自锁**（v6.4.13）。
+    def lock_trunk(self, on_line=None) -> dict:
+        """躯干**自锁**（仅上电 / 退出使能）—— **只有这一个方向**（v6.6.1）。
 
-        - **自锁**（`locked=True`）：往 `/trunk_control/switch_power_on` 发一条
-          `UInt8MultiArray`，把 `core_motion.TRUNK_LOCK_INDEXES`（H1~H3）切成
-          **「仅上电」** —— 电机**退出使能**。效果：**还能读角度**（`trunk_state` 照常），
-          但**不接受运动指令**。做法逐字取自现场脚本
-          `shell-switch_pown_on_test/swich_pown_on.sh` 里那段「#自锁」。
-        - **解除**（`locked=False`）：`connect false` → 等 → `connect true`
-          （现场确认的两步；单发一条 `connect true` 不生效）。
-          ⚠️ **会动机构**：`connect true` 会让躯干抬头，调用方必须先确认。
-          ⚠️ **v6.5.7 起界面不再提供这个方向**：自锁状态跟着**遥操作进程**走
-          （现场：重启遥操作即重置），上位机无法知道它何时被重置，按自己的记录
-          翻转方向会在真实未锁时发出解除指令。界面只下发自锁；解除 = 重启遥操作。
-          这个能力保留在底层（命令行/脚本仍可用），只是不再由界面推断触发。
+        往 `/trunk_control/switch_power_on` 发一条 `UInt8MultiArray`，把
+        `core_motion.TRUNK_LOCK_INDEXES`（H1~H3，腿部承重三轴）切成「仅上电」——
+        电机**退出使能**。效果：**还能读角度**（`trunk_state` 照常发布），
+        但**不接受运动指令**。做法逐字取自现场脚本
+        `shell-switch_pown_on_test/swich_pown_on.sh` 里那段「#自锁」。
 
-        **状态不可回读**：ROS 侧没有任何"当前是否自锁"的话题
-        （`getMotorBrakeState()` 只存在于 C++ SDK 接口里），所以这里只说
-        "发出去了 / 没发出去"，**不说"现在是自锁状态"**。界面同理。
+        ## 为什么**没有**「解除」（v6.6.1，现场 2026-10-20 要求）
 
-        走**常驻通道**（与其它"一次性指令"同一条路），不新开机制；
-        **通道起不来时降级到一次性 CLI**（`ros2 topic pub --once`），与
-        `publish_motion` 同一套范式 —— 这条降级是必需而不是可选的，原因见下面。
+        这条命令原先还有一个方向：`connect false` → 等 → `connect true`（解除自锁）。
+        v6.5.7 已经把**界面**上的这个方向删掉，但方法签名还留着 `locked: bool`，
+        于是"解除"这件事在底层仍然是**可表达的** —— 一个参数、一条 `if`、一条 op，
+        谁写脚本/测试碰一下就能发出去。现场要求「这个按键只有下发自锁指令的功能」，
+        所以这里**连表达能力一起删掉**：方法没有方向参数，调用方写不出第二种。
+
+        判据不是"界面没暴露"，而是**"类型上不存在"** —— 前者靠人守，后者靠编译器/测试守。
+
+        ## 状态不可回读
+
+        ROS 侧没有任何"当前是否自锁"的话题（`getMotorBrakeState()` 只存在于 C++ SDK），
+        所以这里只说"发出去了 / 没发出去"，**不说"现在是自锁状态"**。界面同理。
+        恢复方式只有一条：**重启遥操作**（自锁状态跟着遥操作进程走）。
+
+        ## 通道不可用怎么办
+
+        走**常驻通道**，起不来就降级到一次性 CLI（`ros2 topic pub --once`）。
+        这条降级是必需的：现场 2026-10-15 报「躯干自锁无法使用」，根因就是通道起不来时
+        这里直接返回失败 —— 而自锁是单条一次性指令，根本不依赖常驻进程存活
+        （与 `publish_motion` / 急停 / 下电 / 夹爪的既有约定一致：通道不是必须的）。
         """
         bridge = self.bridge(on_line=on_line)
         if bridge is not None:
-            # 解除是两步、每步都要等够（见 TRUNK_LOCK_SETTLE），
-            # 所以给它比默认 20s 更宽的窗口，别让"其实在做"被读成超时。
-            timeout = 20.0 if locked else 40.0
-            return bridge.ensure("trunk_lock" if locked else "trunk_unlock",
-                                 timeout=timeout, on_line=on_line)
-        # ⚠️ **这里原来直接返回"通道不可用"，等于这个功能没有**（现场 2026-10-15 报
-        # 「躯干自锁无法使用」）。自锁是**单条一次性指令** —— 现场给的就是一条
-        # `ros2 topic pub --once /trunk_control/switch_power_on ...`，它根本不依赖
-        # 常驻进程存活。通道起不来的那些原因（缺 rclpy / 启动期崩 / 工作空间路径不对）
-        # 与"能不能发这一条"无关，于是通道一挂自锁就彻底不可用；这也与本文件
-        # `publish_motion` / 急停 / 下电 / 夹爪的既有约定（**通道不是必须的**）不一致。
+            return bridge.ensure("trunk_lock", timeout=20.0, on_line=on_line)
         logger.warning(f"躯干自锁：常驻通道不可用，降级到一次性 CLI（{self.bridge_note}）")
-        return self._trunk_lock_via_cli(locked, on_line=on_line)
+        return self._trunk_lock_via_cli(on_line=on_line)
 
-    def _trunk_lock_via_cli(self, locked: bool, on_line=None) -> dict:
-        """躯干自锁 / 解除的**一次性 CLI** 路径（常驻通道不可用时的兜底）。
-
-        与 `publish_motion` 兜底到 `_publish_topics` 是同一套机制；区别只有一处：
-        解除那**两步必须依次发、每步之间等够**（现场确认单发一条 `connect true`
-        不生效），不能像 `publish_motion` 那样一条命令并发下去。
+    def _trunk_lock_via_cli(self, on_line=None) -> dict:
+        """躯干自锁的**一次性 CLI** 路径（常驻通道不可用时的兜底）。
 
         返回形状与通道那条**保持一致**（`{ok, steps, reason}`，每个 step 带
         `name` / `sent` / `matched`），所以界面的汇报文案两边都能用。
         """
         if on_line:
             on_line("躯干自锁：常驻通道不可用，改用一次性 CLI 下发")
-        steps = []
-        if locked:
-            # 照现场脚本 `swich_pown_on.sh` 那一段：`UInt8MultiArray`，
-            # `layout` 只有 `data_offset`（**0**，与躯干目标的 1 不同，别混），
-            # `data` 是电机索引 H1~H3 → 0x00/0x01/0x02。
-            payload = ("{layout: {dim: [], data_offset: "
-                       f"{TRUNK_LOCK_LAYOUT_OFFSET}}}, data: ["
-                       + ", ".join(f"0x{index:02x}" for index in TRUNK_LOCK_INDEXES)
-                       + "]}")
-            name = f"躯干自锁（{TRUNK_LOCK_AXES_TEXT} 转为仅上电）"
-            codes = self._publish_topics(
-                [(name, TRUNK_LOCK_TOPIC, TRUNK_LOCK_MSG, payload)],
-                timeout=10.0, label="躯干自锁", keep_alive=2.0)
-            steps.append(self._lock_step(name, codes.get(name)))
-        else:
-            for index, flag in enumerate((False, True), start=1):
-                name = ("躯干下使能（解除自锁 · 第 1 步）" if index == 1
-                        else "躯干重新使能（解除自锁 · 第 2 步）")
-                codes = self._publish_topics(
-                    [(name, TRUNK_CONNECT_TOPIC, BOOL_MSG,
-                      f"data: {'true' if flag else 'false'}")],
-                    timeout=10.0, label=name, keep_alive=TRUNK_LOCK_SETTLE)
-                step = self._lock_step(name, codes.get(name))
-                steps.append(step)
-                if step["ok"] is not True:
-                    break                      # 第 1 步就没成，别再发第 2 步
-                if index == 1:
-                    time.sleep(TRUNK_LOCK_SETTLE)
-        failed = [s for s in steps if s["ok"] is not True]
-        if failed:
-            return {"ok": False, "steps": steps, "reason": failed[0]["reason"]}
-        return {"ok": True, "steps": steps, "reason": ""}
+        # 照现场脚本 `swich_pown_on.sh` 那一段：`UInt8MultiArray`，
+        # `layout` 只有 `data_offset`（**0**，与躯干目标的 1 不同，别混），
+        # `data` 是电机索引 H1~H3 → 0x00/0x01/0x02。
+        payload = ("{layout: {dim: [], data_offset: "
+                   f"{TRUNK_LOCK_LAYOUT_OFFSET}}}, data: ["
+                   + ", ".join(f"0x{index:02x}" for index in TRUNK_LOCK_INDEXES)
+                   + "]}")
+        name = f"躯干自锁（{TRUNK_LOCK_AXES_TEXT} 转为仅上电）"
+        codes = self._publish_topics(
+            [(name, TRUNK_LOCK_TOPIC, TRUNK_LOCK_MSG, payload)],
+            timeout=10.0, label="躯干自锁", keep_alive=2.0)
+        step = self._lock_step(name, codes.get(name))
+        if step["ok"] is not True:
+            return {"ok": False, "steps": [step], "reason": step["reason"]}
+        return {"ok": True, "steps": [step], "reason": ""}
 
     @staticmethod
     def _lock_step(name: str, code) -> dict:

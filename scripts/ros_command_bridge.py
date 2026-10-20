@@ -124,10 +124,8 @@ TRUNK_LOCK_INDEXES = (0, 1, 2)
 #: 躯干目标那个 1 是 v6.3.3 用现场实测换来的，不是所有 MultiArray 都得填 1。
 TRUNK_LOCK_LAYOUT_OFFSET = 0
 
-#: 自锁 / 解除各步之后停多久（秒）。解除是**两步**（现场确认）：
-#: `connect false → 等 → connect true`。比现场脚本里"单发一条 connect true"多一步
-#: "先下使能" —— 道理与「改完 motor_mode 必须重发 connect 才生效」同源：
-#: 电源/连接状态变了之后，要让节点重新走一遍连接才认这个新状态。
+#: 自锁那一发之后停多久（秒），等控制节点把"仅上电"处理完再回话。
+#: （解除方向已删 —— v6.6.1，见 `ensure_trunk_lock` 的说明。）
 TRUNK_LOCK_SETTLE = 3.0
 
 #: 消息类型 → 建消息的函数名（表在下面，**逐字段显式构造**，不做通用 YAML→消息转换）
@@ -729,8 +727,13 @@ class Bridge:
         `/trunk_control/switch_power_on` 发一条 `UInt8MultiArray`，`data` 是**电机索引**。
 
         自锁之后：**还能读角度**（`trunk_state` 照常发布），但**不接受运动指令**。
-        恢复只有一条路 —— `connect true`（SDK 原文「可以执行 connectDev 恢复电机到使能状态」），
-        见 `ensure_trunk_unlock`。
+        恢复方式只有一条：**重启遥操作**（自锁状态跟着遥操作进程走）。
+
+        ⚠️ **这里原先还有一个 `ensure_trunk_unlock`（`connect false` → `connect true`），
+        v6.6.1 删掉了**（现场 2026-10-20 要求：这个动作只有"下发自锁"一个方向）。
+        删的是**能力本身**，不只是界面入口：`op=ensure` 也不再接受 `what="trunk_unlock"`
+        （会返回「不认识的 what」）。留着它等于留一把随时能开的锁 ——
+        自锁状态**读不回来**，谁也无法判断"现在解除是不是安全"。
 
         **状态不可回读**：ROS 侧没有任何"当前是否自锁"的话题
         （`getMotorBrakeState()` 只存在于 C++ SDK 的接口里），所以这里只能保证
@@ -749,30 +752,6 @@ class Bridge:
             return {"ok": False, "steps": [result], "reason": result["reason"]}
         self.spin(TRUNK_LOCK_SETTLE)
         return {"ok": True, "steps": [result], "reason": ""}
-
-    def ensure_trunk_unlock(self, progress=None) -> dict:
-        """**解除自锁**：`connect false` → 等 → `connect true`。
-
-        为什么是两步、而不是像现场脚本那样单发一条 `connect true`：现场确认单发不生效。
-        道理与「改完 `motor_mode` 必须重发 `connect` 才生效」同源 ——
-        电源/连接状态变了之后，要让控制节点重新走一遍连接流程才认。
-
-        ⚠️ **会动机构**：`connect true` 会让躯干抬头回默认姿态（与"上使能"同一后果），
-        调用方（界面）必须先二次确认。这个后果与 `ensure_trunk_non_realtime` 是同一条。
-        """
-        steps = [
-            {"name": "躯干下使能（解除自锁 · 第 1 步）", "topic": "/trunk_control/connect",
-             "type": "std_msgs/msg/Bool", "payload": {"data": False}},
-            {"name": "躯干重新使能（解除自锁 · 第 2 步）", "topic": "/trunk_control/connect",
-             "type": "std_msgs/msg/Bool", "payload": {"data": True}},
-        ]
-        results = []
-        for step in steps:
-            results.append(self.publish(step, progress))
-            if not results[-1]["ok"]:
-                return {"ok": False, "steps": results, "reason": results[-1]["reason"]}
-            self.spin(TRUNK_LOCK_SETTLE)
-        return {"ok": True, "steps": results, "reason": ""}
 
     def ensure_arm_point_mode(self, side, progress=None) -> dict:
         """让某侧手臂回到"能接受 `ArmMove`"的状态：退出 follow / servoj。
@@ -876,8 +855,6 @@ def handle(bridge: Bridge, request: dict, progress=None) -> dict:
             return bridge.ensure_trunk_non_realtime(progress)
         if what == "trunk_lock":
             return bridge.ensure_trunk_lock(progress)
-        if what == "trunk_unlock":
-            return bridge.ensure_trunk_unlock(progress)
         if what == "arm_point_mode":
             side = request.get("side")
             if side not in ("left", "right"):

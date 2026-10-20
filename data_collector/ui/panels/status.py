@@ -264,22 +264,34 @@ class StatusMixin:
           · 工具行「机器人控制 ▾」→「躯干自锁」；
           · 姿势控制页里躯干那一行的「自锁」按钮（它把 `report` 换成自己那页的结果区）。
 
-        ## 为什么不再有"解除自锁"（v6.5.7）
+        ## 这个按键只有"下发自锁指令"这一件事（v6.6.1）
 
-        现场 2026-10-19 明确两条事实：① 自锁**只需要下发那一条指令**；
-        ② **重启遥操作，自锁状态就重置**。合起来说明 —— 自锁状态的生命周期属于
-        **遥操作进程**，不归上位机。
+        现场 2026-10-20 明确：「取消解除自锁功能，该按键只有下发自锁指令的功能」。
+        所以**解除那个方向从底层就删了**（`Launcher.lock_trunk()` 没有方向参数，
+        通道也不再接受 `what="trunk_unlock"`）—— 不是只从界面藏起来。
 
-        而它又**读不回来**（`getMotorBrakeState()` 只存在于 C++ SDK 里）。所以上位机
-        按"我下发过什么"推断"现在是不是自锁"必然出错：遥操作重启后自锁已重置，
-        上位机却还记得 —— 再点一下就会发出**解除**指令（`connect false` → `connect true`，
-        那一下躯干会抬头）。现场看到的就是"我只想锁一下，机构反而动了"。
+        自锁状态**读不回来**（`getMotorBrakeState()` 只存在于 C++ SDK），而且它的生命周期
+        属于**遥操作进程**（现场：重启遥操作即重置）。按"我下发过什么"推断"现在是不是自锁"
+        必然出错：遥操作重启后自锁已重置，上位机却还记得。而自锁指令本身**幂等** ——
+        重复发只是让那几个电机再退出一次使能。所以正确做法就是"永远只发自锁"，
+        恢复交给重启遥操作。
 
-        而自锁指令本身**幂等**：重复发只是让那几个电机再退出一次使能，没有副作用。
-        所以正确做法就是"永远只发自锁"，解除交给重启遥操作。
+        ## 为什么按下第二次一定会再发一条
 
-        两个方向都会改变机构状态（自锁 = 关节失去保持力矩），所以仍然二次确认 ——
-        确认逻辑只写在这一处。
+        现场反馈「发一两次可能没触发」，而**再按一次是唯一的补救手段**（没有解除可点）。
+        所以这里的判据是：**每一次按下都要对应一次真实的下发** ——
+
+        · 上一条已经回来 → 直接再发（`_start_trunk_lock`）；
+        · 上一条还在路上 → 记下 `_trunk_lock_pending`，它一回来**立刻补发一次**
+          （不会丢、也不会并发抢通道：通道本身是串行的，并发只会让两条互相等超时）。
+
+        线程引用收在列表里，**不在原位覆盖**：`LocalTaskThread` 刻意不挂 parent，
+        如果在它还跑着的时候把 `self._trunk_lock_thread` 换成新对象，旧对象会被 Python
+        回收 —— 那是「QThread: Destroyed while thread is still running」，C 层直接 abort。
+        现场表现就是"点快了两下，程序没了"。这也是 v6.6.1 之前"发一两次没反应"的
+        一个真实成因（不是机器人侧）。
+
+        自锁会改变机构状态（关节失去保持力矩），所以仍然二次确认 —— 确认逻辑只写在这一处。
         """
         report = report or self.append
         title = "确认躯干自锁"
@@ -287,31 +299,53 @@ class StatusMixin:
                "· 之后仍然能读角度；\n"
                "· 但不接受运动指令（自锁生效期间，下发的目标不会被执行）；\n"
                "· 自锁等于「关节失去保持力矩」—— 若躯干当前不在支撑位，可能自行下沉；\n"
-               "· 重复点没有副作用；\n"
-               "· 解除方式：「重启遥操作」（自锁状态跟着遥操作进程走）。\n\n"
+               "· 重复点没有副作用（每次都会真的再发一条）；\n"
+               "· 恢复方式：「重启遥操作」（自锁状态跟着遥操作进程走）。\n\n"
                "是否继续？")
         if QMessageBox.question(self, title, ask,
                                 QMessageBox.Yes | QMessageBox.No,
                                 QMessageBox.No) != QMessageBox.Yes:
             report("已取消躯干自锁")
             return
-        report("躯干自锁：正在下发…")
+        self._start_trunk_lock(report)
+
+    # ---------- 躯干自锁的下发（v6.6.1） ----------
+    def _trunk_lock_busy(self) -> bool:
+        """有没有一条自锁指令还在路上。"""
+        return any(thread.isRunning() for thread in self._trunk_lock_threads)
+
+    def _prune_trunk_lock_threads(self) -> None:
+        """摘掉**已经结束**的线程引用（在"下一次下发"时做）。
+
+        ⚠️ **不能在 `finished` 槽里摘**：`finished` 是在 `run()` 里发出去的，
+        那一刻 `run()` 可能还没返回、`isRunning()` 仍是 True —— 丢掉最后一个引用
+        （`LocalTaskThread` 不挂 parent）就等于销毁一个"仍在运行"的 QThread，
+        Qt 会直接 abort。放在下一次下发前摘，那时它早已退出，安全。
+        """
+        self._trunk_lock_threads = [thread for thread in self._trunk_lock_threads
+                                    if thread.isRunning()]
+
+    def _start_trunk_lock(self, report, *, resend: bool = False):
+        """真正下发那一条自锁指令（`resend=True` = 补发，不再二次确认）。"""
+        self._prune_trunk_lock_threads()
+        if self._trunk_lock_busy():
+            # 已经在路上：**记账，别丢掉这一次按下**。通道是串行的，并发只会让
+            # 两条互相等超时（20s 窗口），现场看到的就是"两条都没反应"。
+            self._trunk_lock_pending = True
+            report("上一次自锁指令还在下发中 —— 已记下，它一回来立刻再发一次")
+            return
         # 线程引用必须**自己留着**：`LocalTaskThread` 刻意不接收 parent（挂到窗口上当
-        # 子对象，会让 Qt 在销毁窗口时连带销毁还在收尾的线程 —— 那就是 C 层段错误），
-        # 所以生命周期由这里持有的引用负责。
-        #
-        # ⚠️ **刻意不传 `on_line`**：这个回调是在后台线程里被调的，而两个入口的
-        # `report` 都不保证线程安全 —— 主窗口那个走 `log_signal.emit`（安全），
-        # 但姿势控制页那个（`PostureDialog._report`）是**直接碰控件**
-        # （`self.result.append` / `setText`），Qt 控件只能在主线程动 → 段错误。
-        # 而通道切换的提示本来就可以在最终结果里说明（见 `_on_trunk_lock_done`
-        # 读 `step["channel"]`），没必要为一行字冒这个险。
-        self._trunk_lock_thread = LocalTaskThread(
-            lambda: self.launcher.set_trunk_locked(True))
-        self._trunk_lock_thread.finished.connect(
+        # 子对象，会让 Qt 在销毁窗口时连带销毁还在收尾的线程 —— 那就是 C 层段错误）。
+        # 收在列表里而不是单个属性：连点两次时**不能覆盖**还活着的那个线程对象。
+        # 结束的引用由 `_prune_trunk_lock_threads()` 在**下一次下发前**摘（不在
+        # finished 槽里摘 —— 那时 run() 可能还没返回）。
+        thread = LocalTaskThread(lambda: self.launcher.lock_trunk())
+        self._trunk_lock_threads.append(thread)
+        thread.finished.connect(
             lambda ok, payload, error, sink=report:
                 self._on_trunk_lock_done(ok, payload, error, sink))
-        self._trunk_lock_thread.start()
+        report("躯干自锁：正在重发…" if resend else "躯干自锁：正在下发…")
+        thread.start()
 
     @guard_slot
     def _on_trunk_lock_done(self, ok: bool, payload, error: str, report):
@@ -328,23 +362,30 @@ class StatusMixin:
             if "一次性 CLI" in channels:
                 report("    （本次走的是一次性 CLI：常驻通道未起，用的是与现场"
                        "手敲等价的那条 `ros2 topic pub --once`）")
-            # 不再记任何"自锁状态"（v6.5.7）：它跟着遥操作进程走，上位机记不住真相。
+            # 不记任何"自锁状态"：它跟着遥操作进程走，上位机记不住真相。
             report("✅ 躯干自锁指令已下发\n"
                    "    注意：自锁状态无法回读（ROS 侧没有这个话题），以机构实际表现为准；\n"
-                   "    解除方式：重启遥操作（状态跟着遥操作进程走）。")
+                   "    若机构没有反应，可再点一次（每次都真的再发一条）；\n"
+                   "    恢复方式：重启遥操作（状态跟着遥操作进程走）。")
         else:
             reason = payload.get("reason") if isinstance(payload, dict) else ""
-            # 失败时也要把**解除方式**说出来：现场可能已经下发过一次自锁，
+            # 失败时也要把**恢复方式**说出来：现场可能已经下发过一次自锁，
             # 这一条没成功时最想知道的是「现在怎么恢复」。
             report(f"⚠ 躯干自锁未完成：{reason or error or '通道没有回话'}\n"
+                   "    可以再点一次重发（每次都真的再发一条）；\n"
                    "    恢复方式：重启遥操作（自锁状态跟着遥操作进程走）")
-        # 姿势控制页开着的话，它那一行按钮的文案要跟着记录走（同一个真源）
+        # 姿势控制页开着的话，它那一行按钮的文案要跟着刷新（同一个真源）
         dialog = getattr(self, "_posture_dialog", None)
         if dialog is not None:
             try:
                 dialog._apply_module_buttons()
             except Exception as exc:                       # noqa: BLE001
                 logger.debug(f"刷新姿势页的自锁按钮失败（不影响下发结果）：{exc}")
+        # 上一次按下的那一条**没有丢**：这里补发一次（只补一次，不攒队列 ——
+        # 自锁幂等，攒 N 条也只是重复 N 次同样的动作）。
+        if self._trunk_lock_pending:
+            self._trunk_lock_pending = False
+            self._start_trunk_lock(report, resend=True)
 
     # ---------- 头部至 -32°（采数，与自锁同构） ----------
     @guard_slot

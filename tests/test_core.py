@@ -4008,8 +4008,8 @@ def _trunk_lock_launcher(tmp_path, monkeypatch, *, stub_publish=True):
     if stub_publish:
         monkeypatch.setattr(core_operations.Launcher, "_publish_topics",
                             fake_publish, raising=True)
-    # 解除那两步之间要等 3s，别让用例真的睡 3 秒（等够这件事由下面的
-    # `slept` 断言盯着，不靠真睡）
+    # 自锁只有一条、不用等；`slept` 留着是为了"谁要是在这条路上加了 sleep，
+    # 这里能看见" —— 现场不需要在自锁后面等（等的是通道那边的 TRUNK_LOCK_SETTLE）。
     slept = []
     monkeypatch.setattr(core_operations.time, "sleep",
                         lambda seconds: slept.append(seconds), raising=True)
@@ -4025,7 +4025,7 @@ def test_trunk_lock_falls_back_to_cli_when_the_bridge_is_down(tmp_path, monkeypa
     """
     launcher, sent, _slept, core_motion = _trunk_lock_launcher(tmp_path, monkeypatch)
 
-    result = launcher.set_trunk_locked(True)
+    result = launcher.lock_trunk()
 
     assert result["ok"] is True, f"通道不可用时自锁不该失败：{result}"
     assert len(sent) == 1, "自锁只要一条（不要并发发多条）"
@@ -4059,52 +4059,32 @@ def test_trunk_lock_falls_back_to_cli_when_the_bridge_is_down(tmp_path, monkeypa
     assert core_motion.TRUNK_LOCK_AXES_TEXT in name
 
 
-def test_trunk_unlock_falls_back_to_cli_as_two_ordered_steps(tmp_path, monkeypatch):
-    """解除的兜底必须是**两步、依次发、中间等够** —— 现场确认单发一条不生效。
+def test_trunk_unlock_is_no_longer_expressible(tmp_path, monkeypatch):
+    """「解除自锁」**在底层已不可表达**（v6.6.1，现场 2026-10-20 要求）。
 
-    这三点少任何一条，现场表现都是"点了没反应"：
-    · 少第一步 → 不生效；· 并发发 → 顺序错，两步几乎同时到；· 不等 → 不生效。
+    删的不是界面入口，是**能力本身**：方法没有方向参数，通道也不再认
+    `what="trunk_unlock"`。判据从"界面没暴露"升级成"类型上写不出来" ——
+    前者靠人守，后者靠测试守：任何人把 `locked: bool` 加回来，这条立刻红。
     """
-    launcher, sent, slept, core_motion = _trunk_lock_launcher(tmp_path, monkeypatch)
+    import inspect
 
-    result = launcher.set_trunk_locked(False)
-
-    assert result["ok"] is True, f"通道不可用时解除不该失败：{result}"
-    assert len(sent) == 2, "解除是两步，各发一次"
-    flags = []
-    for call in sent:
-        assert len(call["entries"]) == 1, "两步不能并发"
-        name, topic, msg_type, payload = call["entries"][0]
-        assert topic == "/trunk_control/connect"
-        assert msg_type == "std_msgs/msg/Bool"
-        flags.append(payload.strip().endswith("true"))
-    assert flags == [False, True], f"先下使能、再上使能：{flags}"
-    # 两步之间必须等够（通道那条里是 TRUNK_LOCK_SETTLE）
-    assert slept == [core_motion.TRUNK_LOCK_SETTLE], f"两步之间没等够：{slept}"
-    assert len(result["steps"]) == 2
-
-
-def test_trunk_unlock_stops_after_a_failed_first_step(tmp_path, monkeypatch):
-    """第 1 步就没发出去时**不要**再发第 2 步（那等于"只上使能"，比不做更糟）。"""
-    from data_collector.core import ConfigManager
     from data_collector import core_operations
 
     launcher, sent, _slept, _cm = _trunk_lock_launcher(tmp_path, monkeypatch)
-    calls = {"n": 0}
 
-    def failing_first(_self, entries, timeout=6.0, label="", keep_alive=2.0):
-        calls["n"] += 1
-        code = 124 if calls["n"] == 1 else 0        # 第 1 步超时
-        return {name: code for name, *_rest in entries}
+    assert not hasattr(core_operations.Launcher, "set_trunk_locked"), (
+        "带方向的那个方法必须不存在 —— 留着它，解除就仍然是一条可以被写出来的路径")
+    params = inspect.signature(core_operations.Launcher.lock_trunk).parameters
+    assert "locked" not in params, f"自锁方法不许有方向参数：{list(params)}"
 
-    monkeypatch.setattr(core_operations.Launcher, "_publish_topics",
-                        failing_first, raising=True)
+    result = launcher.lock_trunk()
 
-    result = launcher.set_trunk_locked(False)
-
-    assert result["ok"] is False
-    assert calls["n"] == 1, "第 1 步失败后不该再发第 2 步"
-    assert "订阅者" in result["reason"], f"超时要说清是没等到订阅者：{result['reason']}"
+    assert result["ok"] is True
+    assert len(sent) == 1, "只剩一个方向：一条 switch_power_on"
+    name, topic, msg_type, _payload = sent[0]["entries"][0]
+    assert topic == "/trunk_control/switch_power_on"
+    assert msg_type == "std_msgs/msg/UInt8MultiArray"
+    assert "自锁" in name
 
 
 def test_trunk_lock_cli_path_reports_why_when_the_workspace_is_gone(tmp_path,
@@ -4122,7 +4102,7 @@ def test_trunk_lock_cli_path_reports_why_when_the_workspace_is_gone(tmp_path,
         tmp_path, monkeypatch, stub_publish=False)
     monkeypatch.setattr(launcher.config, "check_workspace", lambda: False)
 
-    result = launcher.set_trunk_locked(True)
+    result = launcher.lock_trunk()
 
     assert result["ok"] is False, "拿不到结果时不能报成功"
     assert result["steps"][0]["ok"] is None, "应如实标成「未确认」"

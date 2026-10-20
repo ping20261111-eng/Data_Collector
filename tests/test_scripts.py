@@ -1945,12 +1945,16 @@ def test_bridge_uint8_array_clamps_instead_of_asserting(bridge_module):
     assert list(message.data) == [0, 255, 44]
 
 
-def test_bridge_ensures_the_trunk_lock_and_unlock_shapes(bridge_module):
-    """自锁 = **1 步**；解除 = **2 步**（先下使能、再上使能）。
+def test_bridge_trunk_lock_is_the_only_direction_left(bridge_module):
+    """自锁 = **1 步**；**解除那个方向已从协议层删掉**（v6.6.1）。
 
-    现场脚本里解除只发一条 `connect true`，而现场确认那样不生效 —— 正确做法是
-    `connect false` → `connect true`（与"改完 motor_mode 必须重发 connect 才生效"同源）。
-    这个步数差是这条功能最容易写错的地方，所以逐条钉住话题与数据。
+    现场 2026-10-20 要求「取消解除自锁功能，该按键只有下发自锁指令的功能」。
+    v6.5.7 只删了界面入口，协议层还留着 `what="trunk_unlock"` 与方法 ——
+    也就是说"解除"仍然是一个可以被发出去的动作。这里把它一起删掉，
+    并**在协议边界上钉住**：发过去只能得到「不认识的 what」。
+
+    为什么连协议层也要删：自锁状态**读不回来**，谁也无法判断"现在解除安不安全"。
+    留一个能解除的 RPC，等于留一把随时能开的锁。
     """
     bridge, _node = _make_bridge(bridge_module)
     sent = []
@@ -1971,11 +1975,13 @@ def test_bridge_ensures_the_trunk_lock_and_unlock_shapes(bridge_module):
     assert payload["layout"]["data_offset"] == 0
 
     sent.clear()
-    bridge.ensure_trunk_unlock()
-    assert [item[1] for item in sent] == ["/trunk_control/connect",
-                                          "/trunk_control/connect"], "解除是两步"
-    assert [item[3]["data"] for item in sent] == [False, True], "先下使能、再上使能"
-    assert all(item[2] == "std_msgs/msg/Bool" for item in sent)
+    assert not hasattr(bridge, "ensure_trunk_unlock"), (
+        "解除自锁的方法必须删掉 —— 留着它，「解除」就仍然是一条能被发出去的动作")
+    # 协议层也不认：按老客户端的样子发一条 `what="trunk_unlock"`
+    reply = bridge_module.handle(bridge, {"op": "ensure", "what": "trunk_unlock"})
+    assert reply["ok"] is False, f"协议层不该接受解除指令：{reply}"
+    assert "不认识" in reply["reason"], f"要明确说不认识这个 what：{reply}"
+    assert sent == [], "被拒之后不许真的发出任何一条 connect"
 
 
 def test_bridge_prewarms_the_lock_topic(bridge_module):
