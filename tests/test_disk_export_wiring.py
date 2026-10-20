@@ -196,8 +196,13 @@ def test_invalid_target_behaves_like_server(tmp_path, monkeypatch):
 
 # ---------- 磁盘侧真实执行（不打桩 DiskExportTarget） ----------
 
-def test_disk_export_writes_an_archive(tmp_path, monkeypatch):
-    """真跑一次：挂载点检查被放行后，归档真的落到盘上。"""
+def test_disk_export_copies_the_folder_without_an_archive(tmp_path, monkeypatch):
+    """真跑一次：盘上得到的是**原样的目录**，不是 zip/tar（v6.7.0）。
+
+    现场 2026-10-20：「传到移动硬盘里的数据还是不要压缩了」。所以这条判据是
+    **盘上没有任何归档** + **数据文件按原相对路径存在且内容一致** ——
+    只断言"有文件"是不够的：一个 zip 里也能"有文件"。
+    """
     mount = tmp_path / "mnt"
     mount.mkdir()
     (mount / ".nerv_volume").write_text("ok", encoding="utf-8")
@@ -212,9 +217,12 @@ def test_disk_export_writes_an_archive(tmp_path, monkeypatch):
                    "  require_volume_id: true\n")
 
     assert up.upload_bag_folder(folder) is True
-    archives = list(mount.rglob("*.zip"))
-    assert len(archives) == 1, f"盘上应有归档，实际 {[p.name for p in mount.rglob('*')]}"
-    assert archives[0].stat().st_size > 0
+
+    assert not list(mount.rglob("*.zip")), "磁盘目标不该再产出 zip"
+    assert not list(mount.rglob("*.tar")), "磁盘目标不该再产出 tar"
+    copies = list(mount.rglob("a.mcap"))
+    assert len(copies) == 1, f"数据文件应按原路径落到盘上，实际 {[p for p in mount.rglob('*')]}"
+    assert copies[0].read_bytes() == b"x" * 2048
     # 半成品必须不留
     assert not list(mount.rglob("*.partial"))
 
@@ -289,28 +297,20 @@ def test_bag_dir_cancel_is_honored_by_the_disk_path(tmp_path, monkeypatch):
     assert not list(mount.rglob("*.partial"))
 
 
-def test_producer_handles_both_file_protocols(tmp_path, monkeypatch):
-    """`producer` 收到的 `sink` 是**回调**，而打包器要的是**文件对象**（zipfile 会
-    调 `flush`）。中间那层适配必须同时满足 `write` 与 `flush` —— v6.3.6 实测：
-    只补 `write` 会报 `'object has no attribute 'flush'`，而 zip 根本没生成。
+def test_disk_export_does_not_pack(tmp_path, monkeypatch):
+    """磁盘目标**一次也不走打包器**（v6.7.0）。
 
-    这条钉的是**契约**而不是实现细节：`sink` 是回调（`bytes -> None`）这件事
-    写在 `DiskExportTarget.write_stream` 的契约里，改动那边就要同步改这里。
+    比"盘上没有 zip"更强的判据：如果哪天有人为了"统一两条路"把打包接回磁盘侧，
+    盘上可能先出现一个 zip、而这条会在**调用点**就红 —— 直接指出是哪条路又被打包了。
     """
     mount = tmp_path / "mnt3"
     mount.mkdir()
     (mount / ".nerv_volume").write_text("ok", encoding="utf-8")
     monkeypatch.setattr("os.path.ismount", lambda p: True)
 
-    seen = {}
-    original = DataUploader._pack_folder
-
-    def spy(self, folder, fp, fmt, compress, entries, **kw):
-        seen["has_write"] = callable(getattr(fp, "write", None))
-        seen["has_flush"] = callable(getattr(fp, "flush", None))
-        return original(self, folder, fp, fmt, compress, entries, **kw)
-
-    monkeypatch.setattr(DataUploader, "_pack_folder", spy)
+    packed = []
+    monkeypatch.setattr(DataUploader, "_pack_folder",
+                        lambda self, *a, **kw: packed.append(a[1:3]))
 
     folder = _bag(tmp_path)
     up = _uploader(tmp_path,
@@ -318,43 +318,46 @@ def test_producer_handles_both_file_protocols(tmp_path, monkeypatch):
                    "disk_export:\n"
                    f"  mount_point: {mount}\n")
     assert up.upload_bag_folder(folder) is True
-    assert seen == {"has_write": True, "has_flush": True}, \
-        f"传给打包器的对象必须像文件对象，实际探测到 {seen}"
+    assert packed == [], f"磁盘导出不该调用打包器：{packed}"
 
 
-def test_disk_archive_is_readable_zip(tmp_path, monkeypatch):
-    """落盘的归档必须是**真能打开的 zip**，不是"看起来像包"的字节流。
+def test_disk_copy_keeps_the_original_layout(tmp_path, monkeypatch):
+    """子目录、文件名、内容都要与源目录逐一对齐（**结构不变**是直拷的意义）。
 
-    `disk_export` 的原子写入是"临时文件 + rename"，中间任何一步出错都可能
-    留下一个完整文件名的截断包 —— 下游按文件名取用会把残缺数据当正常数据。
+    原子写入（`.partial` + rename）中间任何一步出错都可能留下一个完整文件名的
+    截断文件 —— 下游按文件名取用会把残缺数据当正常数据，所以临时文件也必须清掉。
     """
-    import zipfile
-
     mount = tmp_path / "mnt4"
     mount.mkdir()
     (mount / ".nerv_volume").write_text("ok", encoding="utf-8")
     monkeypatch.setattr("os.path.ismount", lambda p: True)
 
     folder = _bag(tmp_path, name="鞠躬")
+    (folder / "metadata.yaml").write_text("version: 5\n", encoding="utf-8")
+    nested = folder / "sub"
+    nested.mkdir()
+    (nested / "b.db3").write_bytes(b"y" * 1024)
+
     up = _uploader(tmp_path,
                    "export_target: disk\n"
                    "disk_export:\n"
                    f"  mount_point: {mount}\n")
     assert up.upload_bag_folder(folder) is True
 
-    archives = list(mount.rglob("*.zip"))
-    assert len(archives) == 1
-    with zipfile.ZipFile(archives[0]) as zf:
-        assert zf.namelist() == ["鞠躬/a.mcap"]
-        assert zf.read("鞠躬/a.mcap") == b"x" * 2048
+    target = next(p for p in mount.rglob("a.mcap")).parent
+    assert target.name == "鞠躬", f"bag 目录名要保持原样，实际 {target.name}"
+    assert (target / "metadata.yaml").read_text(encoding="utf-8") == "version: 5\n"
+    assert (target / "sub" / "b.db3").read_bytes() == b"y" * 1024
     # 原子写入的临时文件不许留下
     assert not list(mount.rglob("*.partial"))
 
 
-def test_content_verification_writes_sidecar_on_disk(tmp_path, monkeypatch):
-    """开了 `verify_content` → 盘上也应有 `.sha256` 边车文件（与远端同构）。
+def test_content_verification_writes_checksums(tmp_path, monkeypatch):
+    """开了 `verify_content` → 盘上应写 `SHA256SUMS`（逐文件，`sha256sum -c` 可用）。
 
-    离线场景没有服务器来复核，边车文件是"这份数据没坏"的**唯一**外部凭据。
+    磁盘侧已经没有"单个归档"了，所以不再有 `<包名>.sha256` 边车；逐文件清单
+    更有用：哪个文件坏了能直接定位到名字，而不是整包一个摘要。
+    离线场景没有服务器来复核，这份清单是"数据没坏"的**唯一**外部凭据。
     """
     mount = tmp_path / "mnt5"
     mount.mkdir()
@@ -369,9 +372,85 @@ def test_content_verification_writes_sidecar_on_disk(tmp_path, monkeypatch):
     up.verify_content = True
 
     assert up.upload_bag_folder(folder) is True
-    sidecars = list(mount.rglob("*.sha256"))
-    assert len(sidecars) == 1, "开了内容校验却没有边车文件"
-    assert sidecars[0].read_text(encoding="utf-8").strip().split()[0]
+    checklists = list(mount.rglob("SHA256SUMS"))
+    assert len(checklists) == 1, "开了内容校验却没有 SHA256SUMS"
+    line = checklists[0].read_text(encoding="utf-8").strip()
+    digest, name = line.split()
+    assert len(digest) == 64 and name == "a.mcap", line
+    # 与真实内容对得上（不是随便写了一个串）
+    import hashlib
+    assert digest == hashlib.sha256(b"x" * 2048).hexdigest()
+
+
+def test_second_export_skips_files_already_on_the_disk(tmp_path, monkeypatch):
+    """同一份数据再导一次 → **不重复拷**，并在日志里如实报"跳过"（v6.7.0）。
+
+    为什么需要它：盘被拔、程序被杀之后重跑一次导出，如果每次都全量重拷几 GB，
+    现场会以为"这功能很慢"；而跳过会不会把**改过的**文件也跳掉？判据里带了
+    mtime（±2s），重录/改过的文件时间会变，不会被误跳。
+    """
+    mount = tmp_path / "mnt6"
+    mount.mkdir()
+    (mount / ".nerv_volume").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr("os.path.ismount", lambda p: True)
+
+    folder = _bag(tmp_path)
+    up = _uploader(tmp_path,
+                   "export_target: disk\n"
+                   "disk_export:\n"
+                   f"  mount_point: {mount}\n")
+    assert up.upload_bag_folder(folder) is True
+
+    messages = []
+    assert up.upload_bag_folder(folder, progress_cb=messages.append) is True
+
+    text = "\n".join(messages)
+    assert "跳过 1 个" in text, f"第二次导出应全部跳过：{text}"
+    assert "新复制 0 个" in text, text
+
+
+def test_cancel_keeps_the_files_already_copied(tmp_path, monkeypatch):
+    """取消导出：已复制的文件**保留在盘上**，不留半截临时文件。
+
+    取消的语义是"别往下做了"，不是"把已经做好的删掉"—— 后者会让中断过的大批量
+    导出每次都从头再来（而跳过判据正是靠这些已落盘的文件生效的）。
+    """
+    from data_collector import disk_export as de
+    from data_collector.core_data import UploadCancelledError
+
+    mount = tmp_path / "mnt7"
+    mount.mkdir()
+    (mount / ".nerv_volume").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr("os.path.ismount", lambda p: True)
+
+    folder = _bag(tmp_path)
+    (folder / "b.mcap").write_bytes(b"z" * 512)          # 两个文件，才有"第二个被取消"
+
+    real = de.DiskExportTarget.copy_file
+    copied = {"n": 0}
+
+    def cancel_on_second(self, source, target, **kwargs):
+        if copied["n"] >= 1:
+            raise UploadCancelledError("用户取消导出")
+        copied["n"] += 1
+        return real(self, source, target, **kwargs)
+
+    monkeypatch.setattr(de.DiskExportTarget, "copy_file", cancel_on_second)
+
+    up = _uploader(tmp_path,
+                   "export_target: disk\n"
+                   "disk_export:\n"
+                   f"  mount_point: {mount}\n")
+    messages = []
+    assert up.upload_bag_folder(folder, progress_cb=messages.append) is False
+    from data_collector.core_data import ErrorCode
+    assert up.last_code is ErrorCode.CANCELLED
+    assert "已复制 1 个" in up.last_error, up.last_error
+
+    landed = list(mount.rglob("a.mcap"))
+    assert len(landed) == 1, "第一个文件的完整副本必须留在盘上"
+    assert landed[0].read_bytes() == b"x" * 2048
+    assert not list(mount.rglob("*.partial")), "取消不该留下半截文件"
 
 
 # ---------- 落点分层：挂载点 / 序列号 / 采集日期 / bag 名（v6.4.3） ----------
@@ -545,6 +624,21 @@ def test_both_mode_keeps_the_remote_subpath_for_the_server_half(tmp_path, monkey
             path = target_dir / filename
             path.write_bytes(b"payload")
             return path
+
+        def copy_file(self, source, target, on_chunk=None, digest=False):
+            """磁盘侧现在走**逐文件复制**；替身少这个方法就是 AttributeError。
+
+            （这正是"替身签名要跟生产收敛"那类缺陷：少了它，用例红在
+            `'_Fake' object has no attribute 'copy_file'`，看起来像生产代码坏了。）
+            """
+            import hashlib
+            data = Path(source).read_bytes()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            if on_chunk:
+                on_chunk(len(data))
+            return {"bytes": len(data),
+                    "digest": hashlib.sha256(data).hexdigest() if digest else ""}
 
     import data_collector.disk_export as de
     monkeypatch.setattr(de, "DiskExportTarget", _Fake)

@@ -28,6 +28,7 @@ from ...core_operations import (Launcher, TeleopManager, SdkServiceManager,
                               read_robot_status, EMERGENCY_STOP_TARGETS,
                               EMERGENCY_STOP_PART_NAMES)
 from ...core_data import RecorderManager, DataUploader, LogFetcher
+from ...verify import verification_report_path
 from ...core_data import UploadCancelledError
 from ...core_points import PointRecorder
 from ...errors import describe
@@ -411,11 +412,15 @@ class DataOpsMixin:
 
     @guard_slot
     def on_bag_rate_stat(self):
-        """采集统计：选一份采集数据，跑完整话题频率统计（bag_rate_stat.py）。
+        """**数据验证**：选一份采集数据，跑全量话题帧率检查，并把结果写进那个目录。
 
         v6.5.1 起用 `BagPickerDialog`（按时间倒序列出全部 bag、显示体积与话题文件数）
         取代系统目录选择框 —— 后者只有目录名，分不清哪个是 bag、也没法定点判断
-        要统计哪一次，而且选到非 bag 目录不会当场拦。
+        要验证哪一次，而且选到非 bag 目录不会当场拦。
+
+        v6.7.0 起这个动作用户可见的名字是「数据验证」（原「采集统计」）：
+        它回答的是"这批数据能不能用"（每个话题有没有消息、帧率稳不稳、时间戳有没有
+        倒退），而不是"采了多少"。结果**落在数据自己的目录里**，跟着数据一起被拷走。
         """
         from ..dialogs import BagPickerDialog
         dlg = BagPickerDialog(self, uploader=self.uploader)
@@ -424,11 +429,16 @@ class DataOpsMixin:
         folder_path = dlg.selected_path()
         if folder_path is None:
             return
+        report_path = verification_report_path(folder_path)
         try:
-            self.launcher.launch_bag_rate_stat(str(folder_path))
-            self.append(f"已启动采集统计：{folder_path}")
+            self.launcher.launch_bag_rate_stat(str(folder_path), str(report_path))
         except Exception as e:
-            self.show_error("启动失败", f"无法启动采集统计脚本：{e}")
+            self.show_error("启动失败", f"无法启动数据验证脚本：{e}")
+            return
+        # 报告路径**显式说出来**：现场要交给别人时，"这份数据验证过没有"
+        # 就是去那个目录里找这个文件，而不是去猜最新的一份是哪个。
+        self.append(f"已启动数据验证：{folder_path}")
+        self.append(f"    完成后结果保存在数据目录内：{report_path.name}")
 
     @guard_slot
     def on_view_data(self):

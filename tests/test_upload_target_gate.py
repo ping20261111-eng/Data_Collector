@@ -267,6 +267,21 @@ def _fake_disk(monkeypatch, recorded, redirect_to):
         def filesystem_type(self):
             return "exfat"
 
+        def copy_file(self, source, target, on_chunk=None, digest=False):
+            """磁盘侧现在逐文件直拷（v6.7.0）；替身少这个方法就是 AttributeError。
+
+            替身必须跟生产收敛：缺了它，用例红在"导出失败"，
+            看起来像生产代码坏了，实际是替身没跟上。
+            """
+            import hashlib
+            data = Path(source).read_bytes()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            if on_chunk:
+                on_chunk(len(data))
+            return {"bytes": len(data),
+                    "digest": hashlib.sha256(data).hexdigest() if digest else ""}
+
         def write_stream(self, target_dir, filename, producer, **kw):
             # 替身要自己建目录：生产代码的目录由 `prepare` 建（真实实现里
             # prepare 会 mkdir），替身不建就是"测试自己造的失败"。
@@ -376,6 +391,21 @@ def test_both_keeps_the_remote_subpath_for_the_server_half(tmp_path, monkeypatch
 
         def filesystem_type(self):
             return "exfat"
+
+        def copy_file(self, source, target, on_chunk=None, digest=False):
+            """磁盘侧现在逐文件直拷（v6.7.0）；替身少这个方法就是 AttributeError。
+
+            替身必须跟生产收敛：缺了它，用例红在"导出失败"，
+            看起来像生产代码坏了，实际是替身没跟上。
+            """
+            import hashlib
+            data = Path(source).read_bytes()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+            if on_chunk:
+                on_chunk(len(data))
+            return {"bytes": len(data),
+                    "digest": hashlib.sha256(data).hexdigest() if digest else ""}
 
         def write_stream(self, target_dir, filename, producer, **kw):
             target_dir.mkdir(parents=True, exist_ok=True)

@@ -469,7 +469,7 @@ class StatusMixin:
             theme.set_state(self.sdk_service_label, "none")
 
         monitor_running = self._robot_monitor_running()
-        # "监控"这个词在界面里有四处（状态监控 / 性能监控 / 采集统计），
+        # "监控"这个词在界面里有四处（状态监控 / 性能监控 / 数据验证），
         # 按钮文案带上限定词，免得与日志区的"性能监控"混为一谈
         self.btn_robot_monitor.setText("停止状态监控" if monitor_running else "启动状态监控")
         self._update_robot_status(read_robot_status(self.config), monitor_running)

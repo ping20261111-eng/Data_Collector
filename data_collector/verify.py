@@ -52,6 +52,28 @@ SINGLE_FILE_LIMIT_FS = ("vfat", "fat", "fat12", "fat16", "fat32", "msdos")
 LIMITED_FS = SINGLE_FILE_LIMIT_FS
 
 
+#: 数据验证报告的文件名格式。
+#: **必须与 `scripts/bag_rate_stat.py` 的 `REPORT_NAME_FMT` 逐字一致** ——
+#: 脚本在没带 `--report` 时按它自己定名，应用侧按它算出"结果会落在哪"写进日志。
+#: 两份字面量刻意不合并：那个脚本要能**独立**在机器人上跑（不 import 本包）。
+#: 守卫：`test_verify_report_name_matches_the_script`。
+VERIFY_REPORT_NAME_FMT = "数据验证结果_%Y%m%d-%H%M%S.txt"
+
+
+def verification_report_path(bag: Path, when=None) -> Path:
+    """一次数据验证的报告落在**数据自己的目录里**（v6.7.0）。
+
+    为什么放在 bag 目录内而不是集中某个 reports/：数据是要被拷走的（移动硬盘 /
+    服务器 / 交给别人），报告跟着数据走才不会被落下；集中存放的那份，一旦有人
+    只拷了 bag 目录，报告就丢了 —— 而"这批数据验证过没有"正是最需要随数据一起
+    回答的问题。
+    """
+    from datetime import datetime
+
+    stamp = (when or datetime.now()).strftime(VERIFY_REPORT_NAME_FMT)
+    return Path(bag) / stamp
+
+
 def sha256_file(path: Path, tail_bytes: Optional[int] = None) -> str:
     """算本地文件的 SHA-256（十六进制）。
 

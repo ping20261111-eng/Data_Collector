@@ -530,7 +530,11 @@ def test_a_local_bag_is_still_exported_to_the_disk(tmp_path, mounted_disk):
     mgr = _mgr(tmp_path, mount=usb, bag_dir=str(tmp_path / "localbags"))
     uploader = DataUploader(mgr)
     assert uploader._export_to_disk(local) is True
-    assert list(usb.rglob("vla_20261014110000.zip")), "常规路径必须仍然导出"
+    # v6.7.0 起磁盘侧不打包：**目录**落在序列号/日期/名字下，不再有 zip
+    landed = list(usb.rglob("part.mcap"))
+    assert len(landed) == 1, "常规路径必须仍然导出"
+    assert landed[0].parent.name == "vla_20261014110000"
+    assert not list(usb.rglob("*.zip")), "磁盘侧不该再有归档"
 
 
 def test_the_skip_needs_a_real_mount_not_just_a_matching_path(tmp_path, unmounted_disk):

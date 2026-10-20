@@ -28,6 +28,7 @@ from .core_motion import (HEAD_DATA_AXIS_INDEX, HEAD_DATA_DURATION_SEC,
                           stream_job_args, stream_job_key)
 # 常驻命令通道（v6.2.0）：姿态控制的下发走它，起不来就降级到一次性 CLI
 from .ros_bridge import RosBridge
+from .verify import verification_report_path
 
 
 def _terminate_stream(proc: subprocess.Popen, force: bool = False) -> None:
@@ -3250,18 +3251,121 @@ class Launcher:
         return self._run_script(
             script, "回放", args, mode="terminal", proc_name="play_bag")
 
-    def launch_bag_rate_stat(self, bag_path: str) -> subprocess.Popen:
-        """对指定 bag 做完整话题频率统计（新终端，避免阻塞 UI）。
+    def launch_bag_rate_stat(self, bag_path: str,
+                             report_path: str = "") -> subprocess.Popen:
+        """对指定 bag 做**数据验证**（全量话题帧率 + 落一份报告到数据目录）。
 
         bag_rate_stat.py 由 python3 直接执行，需要先 source 工作空间的 setup.bash
         才能 import rclpy / rosbag2_py / sensor_msgs。
+
+        `report_path` 为空时脚本自己按 `<bag>/数据验证结果_<时间>.txt` 定名
+        （独立运行时也能出报告）；由界面调用时**显式传**一个，日志里才说得清
+        "结果会落在哪个文件"，而不是让现场去目录里找最新的一份。
         """
         if not bag_path:
             raise ValueError("bag 路径不能为空")
-        script = self._script_for("bag_rate_stat_script", "频率统计脚本", "bag_rate_stat.py")
+        script = self._script_for("bag_rate_stat_script", "数据验证脚本", "bag_rate_stat.py")
+        args = [shlex.quote(str(bag_path))]
+        if report_path:
+            args += ["--report", shlex.quote(str(report_path))]
         return self._run_script(
-            script, "采集统计", [shlex.quote(str(bag_path))], mode="terminal",
+            script, "数据验证", args, mode="terminal",
             env="ros", runner="python3", hold=True, proc_name="bag_rate_stat")
+
+    def verify_bag_folders(self, bag_paths, on_progress=None, should_stop=None,
+                           timeout: float = 1800.0) -> dict:
+        """**批量数据验证**：逐个 bag 跑一次 `bag_rate_stat.py --no-plot`。
+
+        每个 bag 的报告写回**它自己的目录**（`数据验证结果_<时间>.txt`），
+        跟着数据一起被拷走 —— 这正是"结果放在数据同一目录下"的落点。
+
+        ## 为什么串行、为什么后台、为什么加 `--no-plot`
+
+        * **串行**：一次几十份，并行只会同时抢 IO 与 CPU，帧率统计本身就是读全量
+          数据的事；串行的总时长几乎不变，但内存与磁盘压力可控。
+        * **后台 + 捕获输出**：批量不该弹 N 个终端窗口、也不该等人一个个关图；
+          输出只在失败时才有用（`stdout/stderr` 一起收进 `reason`）。
+        * **`--no-plot`**：脚本因此不碰图形后端 —— 现场没有 X11（SSH 进来跑）时
+          也不会整批失败。
+
+        Args:
+            bag_paths: bag 目录序列。
+            on_progress: `f(str)` 进度回调。**在工作线程里被调**，调用方自己负责
+                转到主线程（界面这边走 `progress_signal.emit`）。
+            should_stop: `f() -> bool`；在**每个 bag 之间**检查（不打断正在跑的那一份，
+                那样留下的报告是半截的）。
+            timeout: 单个 bag 的上限（秒）。
+
+        Returns:
+            `{ok, total, done, succeeded, failed, stopped, results}`；
+            `results` 每项 `{bag, ok, report, code, reason}`。
+        """
+        paths = [Path(item) for item in (bag_paths or [])]
+        summary = {"ok": True, "total": len(paths), "done": 0, "succeeded": 0,
+                   "failed": 0, "stopped": False, "results": [], "reason": ""}
+        if not paths:
+            summary.update(ok=False, reason="没有选中任何数据文件夹")
+            return summary
+        if not self.config.check_workspace():
+            summary.update(ok=False,
+                           reason=f"工作空间不存在: {self.config.workspace}")
+            return summary
+        script = self._script_for("bag_rate_stat_script", "数据验证脚本", "bag_rate_stat.py")
+
+        for index, bag in enumerate(paths, start=1):
+            if should_stop is not None and should_stop():
+                summary["stopped"] = True
+                if on_progress:
+                    on_progress(f"已请求停止：完成 {summary['done']} 个，"
+                                f"剩余 {len(paths) - summary['done']} 个未验证")
+                break
+            report = verification_report_path(bag)
+            if on_progress:
+                on_progress(f"（{index}/{len(paths)}）正在验证：{bag.name}")
+            args = [shlex.quote(str(bag)), "--no-plot",
+                    "--report", shlex.quote(str(report))]
+            cmd = self._build_cmd(script, args, cwd=None, env="ros", runner="python3",
+                                  prelude="", hold=False)
+            try:
+                completed = subprocess.run(["bash", "-c", cmd], capture_output=True,
+                                           text=True, timeout=timeout)
+                code = completed.returncode
+                tail = (completed.stderr or completed.stdout or "").strip().splitlines()
+            except subprocess.TimeoutExpired:
+                code, tail = 124, [f"超过 {timeout:g}s 未完成"]
+            except OSError as exc:
+                code, tail = -1, [str(exc)]
+
+            written = report.is_file()
+            ok = code == 0 and written
+            reason = ""
+            if not ok:
+                if code == 124:
+                    reason = f"超时（{timeout:g}s）"
+                elif not written and code == 0:
+                    # 脚本正常退出却没写报告：多半是目录不可写，必须说清是"没落盘"，
+                    # 而不是让现场以为"验证过了、只是没找到文件"。
+                    reason = "脚本已退出但没有生成报告（数据目录不可写？）"
+                else:
+                    reason = tail[-1] if tail else f"退出码 {code}"
+            summary["results"].append({
+                "bag": str(bag), "ok": ok,
+                "report": str(report) if written else "",
+                "code": code, "reason": reason,
+            })
+            summary["done"] += 1
+            if ok:
+                summary["succeeded"] += 1
+            else:
+                summary["failed"] += 1
+            if on_progress:
+                on_progress(f"    {'✔' if ok else '✖'} {bag.name}："
+                            f"{'报告已写入 ' + report.name if ok else reason}")
+
+        summary["ok"] = summary["failed"] == 0 and not summary["stopped"]
+        if summary["stopped"] and summary["failed"] == 0:
+            summary["reason"] = "已按要求停止（未验证的保持原状）"
+        return summary
 
     def launch_monitor_performance(self, output_dir: str = "") -> subprocess.Popen:
         """录制性能监控（新终端，等待 ros2 bag record 启动后采样）。"""

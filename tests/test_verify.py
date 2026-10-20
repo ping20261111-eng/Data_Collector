@@ -258,3 +258,42 @@ def test_verify_remote_digest_match_returns_digest(tmp_path):
     up = Uploader.__new__(Uploader)
     up.verify_content = True
     assert up._verify_remote_digest(FakeSftp(), local, "/r", len(payload)) == expected
+
+
+# ---------- 数据验证报告的落点（v6.7.0） ----------
+
+def test_verify_report_name_matches_the_script():
+    """报告名格式在**应用侧与脚本里必须逐字一致**。
+
+    两份字面量是刻意的（脚本要能独立在机器人上跑，不 import 本包）—— 但一旦
+    有人只改了其中一处，现场就会出现"日志说报告叫 A、目录里躺着 B"，而这条守卫
+    正是那种"两边都改才成立"的契约唯一能自动化检查的地方。
+    """
+    import re
+
+    from data_collector import verify
+
+    content = (Path(__file__).resolve().parents[1] / "scripts" / "bag_rate_stat.py") \
+        .read_text(encoding="utf-8")
+    matched = re.search(r"^REPORT_NAME_FMT = '([^']+)'", content, re.MULTILINE)
+    assert matched, "脚本里找不到 REPORT_NAME_FMT"
+    assert matched.group(1) == verify.VERIFY_REPORT_NAME_FMT, (
+        f"脚本 {matched.group(1)!r} != 应用 {verify.VERIFY_REPORT_NAME_FMT!r}")
+
+
+def test_verification_report_sits_inside_the_bag_directory(tmp_path):
+    """报告落在**数据自己的目录里**（要求：结果放在数据的同一目录下）。
+
+    钉的是"父目录就是那个 bag"，不是"文件名长什么样" —— 落点错了，
+    现场拷数据时报告就会被落下，而它正是"这批数据验证过没有"的唯一凭据。
+    """
+    from datetime import datetime
+
+    from data_collector.verify import verification_report_path
+
+    bag = tmp_path / "bag_a"
+    bag.mkdir()
+    report = verification_report_path(bag, when=datetime(2026, 10, 20, 11, 2, 3))
+
+    assert report.parent == bag, f"报告应直接放在 bag 目录下，实际 {report.parent}"
+    assert report.name == "数据验证结果_20261020-110203.txt", report.name

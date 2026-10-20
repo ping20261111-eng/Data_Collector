@@ -206,7 +206,7 @@ class ActionsMixin(ExportTargetMixin):
         self._start_disk_probe_timer()
 
         # ---- 第三行（三级）：工具（低频，药丸幽灵按钮 + 二级菜单）----
-        self.btn_bag_stat = QPushButton("采集统计")
+        self.btn_bag_stat = QPushButton("数据验证")
         self.btn_bag_stat.setProperty("variant", "ghost")
         self.btn_bag_stat.clicked.connect(self.on_bag_rate_stat)
 

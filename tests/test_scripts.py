@@ -1945,6 +1945,57 @@ def test_bridge_uint8_array_clamps_instead_of_asserting(bridge_module):
     assert list(message.data) == [0, 255, 44]
 
 
+# ---------- 数据验证：报告写进数据目录（v6.7.0） ----------
+
+def test_bag_rate_stat_writes_the_report_before_it_plots():
+    """报告必须**先落盘再弹图** —— 否则"没人关窗口就没有报告"。
+
+    `show_results` 里是 `plt.show(block=True)`：它会一直挂到操作员关掉窗口。
+    把写报告放在它后面，等于把"报告存在"这件事绑在"有人去关窗口"上 ——
+    而现场常常是"跑完就走，回头再来看文件"。这条钉的是**源码里的先后顺序**，
+    因为运行时没法在离屏环境真的等一个人去点关闭。
+    """
+    content = (SCRIPTS / "bag_rate_stat.py").read_text(encoding="utf-8")
+    write_at = content.index("write_report(report_path")
+    plot_at = content.index("show_results(samples, results, bag.name)")
+    assert write_at < plot_at, "报告要在弹图之前写"
+
+
+def test_bag_rate_stat_report_lands_in_the_bag_directory(tmp_path):
+    """`build_report` / `write_report`：内容齐、落点在 bag 目录里。"""
+    from datetime import datetime
+
+    module = _load_module("bag_rate_stat_report", "bag_rate_stat.py")
+    bag = tmp_path / "bag_a"
+    bag.mkdir()
+    samples = {"/vision/rgb": [1, 2, 3]}
+    results = {"/vision/rgb": {"hz": 30.0, "mean_ms": 33.3, "std_ms": 1.2,
+                               "p95_ms": 35.0, "max_ms": 50.0, "nonpositive": 0}}
+
+    text = module.build_report(bag, samples, results,
+                               generated_at=datetime(2026, 10, 20, 11, 0, 0),
+                               host="testmaster-001")
+    assert "数据验证结果" in text
+    assert str(bag) in text, "报告要写明是哪一份数据"
+    assert "/vision/rgb" in text and "30.000 Hz" in text
+    # 没录到的话题要点出来（现场最关心的就是"哪个话题是空的"）
+    assert "缺失" in text and "/joint_states" in text
+
+    target = module.write_report(bag / "数据验证结果_20261020-110000.txt", text)
+    assert target.parent == bag
+    assert target.read_text(encoding="utf-8") == text
+    assert not list(bag.glob("*.partial")), "写报告不该留下临时文件"
+
+
+def test_bag_rate_stat_no_plot_skips_the_gui_requirement():
+    """`--no-plot` 是批量验证的前提：没有它，SSH 进来（无 X11）整批都会失败。"""
+    content = (SCRIPTS / "bag_rate_stat.py").read_text(encoding="utf-8")
+    assert "if not args.no_plot:" in content, "图形后端检查必须受 --no-plot 控制"
+    assert "add_argument('--no-plot'" in content
+    # 报告名格式与月/日/时/分/秒有关，必须是真的 strftime 串（不是写死名字）
+    assert "%Y%m%d-%H%M%S" in content
+
+
 def test_bridge_trunk_lock_is_the_only_direction_left(bridge_module):
     """自锁 = **1 步**；**解除那个方向已从协议层删掉**（v6.6.1）。
 

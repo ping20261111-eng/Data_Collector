@@ -193,7 +193,7 @@ def _modules(trunk: str = "off", arms: str = "off") -> dict:
 def test_main_window_exposes_stat_and_monitor_buttons(ui_env):
     win, cm = ui_env
     assert win.btn_monitor_perf.text() == "性能监控"
-    assert win.btn_bag_stat.text() == "采集统计"
+    assert win.btn_bag_stat.text() == "数据验证", "v6.7.0 起这个动作叫「数据验证」"
     # 按钮都接在 Launcher 脚本解析后的路径上
     assert cm.get_script_path("monitor_performance_script") == \
         PROJECT_ROOT / "scripts" / "monitor_record_performance.sh"
@@ -2932,7 +2932,7 @@ def test_local_task_thread_has_no_parent(qapp):
 def test_robot_menu_wired(ui_env):
     """机器控制类功能全在**一个**二级菜单里（现场："对机器控制的功能全放在一个二级菜单内"）。
 
-    工具行只剩 采集统计 / 性能监控 / 机器人控制 ▾（+ 按需出现的「停止相机标定」）；
+    工具行只剩 数据验证 / 性能监控 / 机器人控制 ▾（+ 按需出现的「停止相机标定」）；
     菜单是一层到底的 7 项，用分隔线分组，不做三级。
     v6.4.15 加了「躯干自锁」（现场要求：不进页面就能锁）—— 它单独占一组：
     上面那两条是"起节点"，它是"直接改机构状态"，混在一起会被读成"也是起个节点"。
@@ -2945,7 +2945,7 @@ def test_robot_menu_wired(ui_env):
 
     # 工具行：三个常驻按钮，「相机标定 ▾」这类子菜单入口已经没有了
     row = [win.btn_bag_stat.text(), win.btn_monitor_perf.text(), win.btn_robot_menu.text()]
-    assert row == ["采集统计", "性能监控", "机器人控制 ▾"]
+    assert row == ["数据验证", "性能监控", "机器人控制 ▾"]
     assert "▾" in win.btn_robot_menu.text()          # 不写 ▾ 用户看不出能展开
 
     menu = win.btn_robot_menu.menu()
@@ -3501,6 +3501,9 @@ def _inline_task_thread(monkeypatch):
     monkeypatch.setattr(export_remote_module, "LocalTaskThread", _InlineThread)
     # v6.4.15 加入：躯干自锁（工具行「机器人控制 ▾」那一项走的也是它，见 status.py）。
     monkeypatch.setattr(status_module, "LocalTaskThread", _InlineThread)
+    # v6.7.0 加入：批量数据验证（「查看数据」→「批量验证」跑的是它）。
+    from data_collector.ui import data_view as data_view_module
+    monkeypatch.setattr(data_view_module, "LocalTaskThread", _InlineThread)
 
 
 def test_stop_main_cleans_up_in_background_after_confirm(ui_env, monkeypatch):
@@ -6258,6 +6261,81 @@ def test_the_menu_and_the_page_both_only_send_the_lock(status_env, tmp_path, mon
     assert row.btn_lock.text() == "自锁", "菜单点过之后，页面文案也不该翻"
 
 
+def test_data_verification_tells_where_the_report_goes(status_env, tmp_path, monkeypatch):
+    """单份「数据验证」：把报告路径传给启动器，并在日志里说清落在哪个文件（v6.7.0）。"""
+    from PyQt5.QtWidgets import QDialog
+
+    win, _config, _status = status_env
+    bag = tmp_path / "bag_a"
+    bag.mkdir()
+
+    class _FakePicker:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def exec_(self):
+            return QDialog.Accepted
+
+        def selected_path(self):
+            return bag
+
+    # 对话框是在 `on_bag_rate_stat` 里**函数内 import** 的，所以桩打在定义处
+    monkeypatch.setattr("data_collector.ui.dialogs.BagPickerDialog", _FakePicker)
+    seen = {}
+    monkeypatch.setattr(win.launcher, "launch_bag_rate_stat",
+                        lambda path, report="": seen.update(path=path, report=report))
+
+    win.on_bag_rate_stat()
+
+    assert seen["path"] == str(bag)
+    report = Path(seen["report"])
+    assert report.parent == bag, f"报告必须落在数据自己的目录里：{report}"
+    assert report.name.startswith("数据验证结果_"), report.name
+    log = win.log.toPlainText()
+    assert "已启动数据验证" in log, log[-400:]
+    assert report.name in log, "日志里要说清报告的文件名，现场才不用去猜"
+
+
+def test_batch_verify_is_wired_in_the_data_view(status_env):
+    """「批量验证」的接线：按钮、取全部选中、交给启动器、收尾弹**一次**汇总（v6.7.0）。
+
+    ## 为什么这里钉结构，而不是实例化对话框跑一遍
+
+    实测：在这个离屏夹具里**单独**（`-k`）构造 `DataViewDialog` 会在收尾阶段
+    C 层段错误（v6.6.1 基线的既有用例同样复现，与本次改动无关；整文件跑不出现）。
+    而这条守卫要回答的是"接线有没有断"，不是"Qt 对话框能不能建" ——
+    所以按本文件既有的做法（见 `test_upload_selected_supports_a_batch_and_shares_one_target`），
+    钉**源码里的接线点**，行为层由 `test_core.py` 的 `verify_bag_folders` 用例覆盖。
+    """
+    import inspect
+
+    from data_collector.ui import data_view
+
+    panel = inspect.getsource(data_view.DataViewDialog._build_bag_panel)
+    assert 'QPushButton("批量验证")' in panel, "数据文件夹面板里要有「批量验证」"
+    assert "btn_verify_selected.clicked.connect(self.verify_selected_bags)" in panel
+    assert "self.btn_verify_selected," in panel, "按钮要真的挂进面板标题行"
+
+    busy = inspect.getsource(data_view.DataViewDialog._busy_controls)
+    assert "btn_verify_selected" in busy, "验证期间要跟着禁用其他入口"
+
+    handler = inspect.getsource(data_view.DataViewDialog.verify_selected_bags)
+    assert "_selected_paths(self.bag_list)" in handler, "批量必须取**全部选中**"
+    assert "verify_bag_folders" in handler, "要交给启动器去跑"
+    assert "self._verify_stop = True" in handler, "验证中再点一次要能停"
+    # 参数拼装属于 core（`--no-plot` / `--report` 都在那边），界面不该各写一份。
+    # ⚠️ 只查**去掉 docstring 之后的代码**：docstring 里本来就会提到这个参数名
+    #（我第一次写成整段 substring，结果被自己的说明文字判红）。
+    code = handler.split('"""', 2)[-1]
+    assert "--no-plot" not in code and "--report" not in code, \
+        "界面不该自己拼脚本参数"
+
+    finished = inspect.getsource(data_view.DataViewDialog._on_verify_finished)
+    assert "self.btn_verify_selected.setText(\"批量验证\")" in finished, "收尾要复原按钮"
+    assert "QMessageBox.information" in finished and "QMessageBox.warning" in finished, \
+        "收尾只弹一次汇总（成功/有失败两种）"
+
+
 def test_record_dialog_prefills_the_last_choices(status_env, tmp_path):
     """「录制设置」要预填上次的类型 / 采集任务 / 描述（v6.6.0）。
 
@@ -7898,3 +7976,4 @@ def test_the_angle_column_width_is_computed_from_the_widest_literal(qapp):
     assert pw.ANGLE_WIDEST_TEXT == "-150.0929", (
         "最宽字面量由 `fmt_number(round(v, 4))` 与 H2 的 ±150 量程推出："
         "负号 + 3 位整数 + 小数点 + 4 位小数")
+

@@ -21,6 +21,7 @@
   所以在导出**之前**就把超限文件点出来，让用户决定换盘还是继续。
   只提醒不拦截 —— 现场不能被程序硬性卡住交不出数据。
 """
+import hashlib
 import os
 import shutil
 from dataclasses import dataclass
@@ -290,6 +291,75 @@ class DiskExportTarget:
         if progress_cb:
             progress_cb(f"已写入移动硬盘：{final_path.name}（{_mb(written)}）")
         return final_path
+
+
+    #: 复制时的读块大小。4MB 是"足够大的顺序 IO + 进度不至于太粗"的折中
+    #: （与 `verify.VERIFY_CHUNK` 同量级）。
+    COPY_CHUNK = 4 * 1024 * 1024
+
+    def copy_file(self, source: Path, target: Path,
+                  on_chunk: Optional[Callable[[int], None]] = None,
+                  digest: bool = False) -> Dict[str, object]:
+        """把 `source` 复制成 `target` —— **不压缩、不打包**（v6.7.0）。
+
+        磁盘导出为什么不再产出一个 zip：盘本身就是文件系统，打包只是给"搬运"
+        加了一道解压步骤；而且打包要"读一遍写一遍"，解压又是"读一遍写一遍"，
+        同盘搬运的 IO 直接翻倍。MCAP / 视频本身已是压缩格式，再 DEFLATE 只耗 CPU。
+
+        ## 原子性与可恢复
+
+        **先写 `<target>.partial` 再 `os.replace`**：与 `write_stream` 同一条理由 ——
+        移动硬盘随时可能被拔，直接写最终文件名会在盘上留下一个"看起来完整、
+        实际半截"的文件，而它会被下游当成正常数据取走。
+
+        ## 返回值
+
+        `{"bytes": 写入字节数, "digest": sha256 十六进制或 ""}`。`digest=True` 时
+        一边复制一边算 —— 校验就不必再把源文件读一遍（几 GB × 2 的差别）。
+        """
+        tmp = target.with_name(target.name + ".partial")
+        written = 0
+        hasher = hashlib.sha256() if digest else None
+        try:
+            with open(source, "rb") as src, open(tmp, "wb") as out:
+                while True:
+                    chunk = src.read(self.COPY_CHUNK)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    written += len(chunk)
+                    if hasher is not None:
+                        hasher.update(chunk)
+                    if on_chunk is not None:
+                        on_chunk(len(chunk))
+        except OSError as exc:
+            _quiet_unlink(tmp)
+            if is_device_lost(exc):
+                raise DeviceDisconnectedError(
+                    f"移动硬盘在写入时断开（本文件已写入 {_mb(written)}）：\n"
+                    f"{exc}\n已复制的文件保留，本次中断。",
+                    partial_path=target,
+                ) from exc
+            raise AppError(
+                ErrorCode.LOCAL_IO,
+                f"写入移动硬盘失败：{target}\n{exc}",
+            ) from exc
+        except BaseException:
+            _quiet_unlink(tmp)
+            raise
+        try:
+            os.replace(tmp, target)
+        except OSError as exc:
+            _quiet_unlink(tmp)
+            raise AppError(ErrorCode.LOCAL_IO,
+                           f"写入移动硬盘后改名失败：{target}\n{exc}") from exc
+        # 保留修改时间：现场按文件时间判断"哪一段先录的"；也是下次导出能
+        # "看出这个文件已经拷过"的依据（见 `DataUploader._already_exported`）。
+        try:
+            os.utime(target, (source.stat().st_atime, source.stat().st_mtime))
+        except OSError as exc:
+            logger.debug(f"保留修改时间失败（不影响数据本身）：{target}（{exc}）")
+        return {"bytes": written, "digest": hasher.hexdigest() if hasher else ""}
 
 
 def _quiet_unlink(path: Path) -> None:

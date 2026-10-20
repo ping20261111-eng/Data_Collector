@@ -63,6 +63,12 @@ class DataViewDialog(QDialog):
         self._local_threads = []
         self._delete_ctx = None
         self.delete_in_progress = False
+        # 批量数据验证（v6.7.0）：串行跑，每份报告写回它自己的目录。
+        # `_verify_stop` 只会在**两个 bag 之间**被检查 —— 打断正在跑的那一份
+        # 只会留下半截报告，比"多等一分钟"糟得多。
+        self._verify_thread = None
+        self._verify_stop = False
+        self.verify_in_progress = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP["sp4"], SP["sp4"], SP["sp4"], SP["sp4"])
@@ -169,6 +175,12 @@ class DataViewDialog(QDialog):
         self.btn_upload_selected = QPushButton("上传选中")
         self.btn_upload_selected.setProperty("variant", "primary")
         self.btn_upload_selected.clicked.connect(self.upload_selected_bag)
+        self.btn_verify_selected = QPushButton("批量验证")
+        self.btn_verify_selected.setProperty("variant", "ghost")
+        self.btn_verify_selected.setToolTip(
+            "对选中的数据文件夹逐个做数据验证（话题帧率 / 时间戳），\n"
+            "结果写到各自的数据目录里（数据验证结果_<时间>.txt）；支持多选")
+        self.btn_verify_selected.clicked.connect(self.verify_selected_bags)
         self.btn_play_bag = QPushButton("播放选中")
         self.btn_play_bag.setProperty("variant", "ghost")
         self.btn_play_bag.clicked.connect(self.play_selected_bag)
@@ -181,6 +193,7 @@ class DataViewDialog(QDialog):
         self.btn_delete_selected_bag.clicked.connect(self.delete_selected_bags)
 
         head, _ = make_panel_head("数据文件夹", [self.btn_upload_selected,
+                                                self.btn_verify_selected,
                                                 self.btn_play_bag,
                                                 self.btn_view_selected_bag,
                                                 self.btn_delete_selected_bag])
@@ -489,7 +502,8 @@ class DataViewDialog(QDialog):
         return (self.btn_refresh, self.btn_fetch_selected,
                 self.btn_view_selected_log, self.btn_view_selected_bag,
                 self.btn_delete_selected_bag, self.btn_delete_selected_log,
-                self.btn_play_bag, self.btn_remote_browser)
+                self.btn_play_bag, self.btn_remote_browser,
+                self.btn_verify_selected)
 
     def _set_busy_controls(self, busy: bool) -> None:
         for button in self._busy_controls():
@@ -536,6 +550,97 @@ class DataViewDialog(QDialog):
             self._start_next_upload()
             return
         self._finish_batch()
+
+    # ---------- 批量数据验证（v6.7.0） ----------
+    def verify_selected_bags(self):
+        """对选中的数据文件夹**逐个**做数据验证，报告写回各自目录。
+
+        与「数据验证」（工具行那个按钮）的分工：那个是**单份、带图**，用来细看
+        某一批的帧率曲线；这里是**多份、只看报告**，用来把一天采的十几批批量过一遍。
+        两者跑的是同一个脚本（`bag_rate_stat.py`），只是批量这边带 `--no-plot`。
+        """
+        if self.verify_in_progress:
+            # 按钮在验证期间就是"取消"：只置标志，让它在两个 bag 之间停下。
+            self._verify_stop = True
+            self.append_log("已请求停止：当前这一份做完就不再继续")
+            return
+        if self.upload_in_progress or self.delete_in_progress:
+            QMessageBox.information(self, "提示", "上传 / 删除进行中，暂不能做数据验证")
+            return
+        folders = self._selected_paths(self.bag_list)
+        if not folders:
+            QMessageBox.warning(self, "提示", "请先选择数据文件夹")
+            return
+        launcher = getattr(self.parent(), "launcher", None) if self.parent() else None
+        if launcher is None:
+            QMessageBox.warning(self, "提示", "数据验证不可用：主窗口没有提供启动器")
+            return
+
+        self._verify_stop = False
+        self.verify_in_progress = True
+        self.btn_verify_selected.setText("取消验证")
+        theme.set_variant(self.btn_verify_selected, "danger")
+        self.btn_verify_selected.setEnabled(True)      # 它就是"取消"，必须可点
+        self._set_busy_controls(True)
+        self.append_log(f"开始数据验证：{len(folders)} 个数据文件夹（结果写回各自目录）")
+
+        def progress(text):
+            # **在工作线程里被调**：只能走信号，不能碰控件
+            if self.parent() and hasattr(self.parent(), "progress_signal"):
+                self.parent().progress_signal.emit(text)
+
+        thread = LocalTaskThread(
+            lambda: launcher.verify_bag_folders(
+                folders, progress, lambda: self._verify_stop))
+        self._verify_thread = thread
+        thread.finished.connect(self._on_verify_finished)
+        thread.start()
+
+    def _on_verify_finished(self, ok, payload, message):
+        """批量验证收尾：恢复控件 → 逐条写日志 → 弹一次汇总。"""
+        self.verify_in_progress = False
+        self._verify_stop = False
+        self.btn_verify_selected.setText("批量验证")
+        theme.set_variant(self.btn_verify_selected, "ghost")
+        self._set_busy_controls(False)
+        if not isinstance(payload, dict):
+            self.append_log(f"数据验证失败：{message or '没有返回结果'}")
+            QMessageBox.critical(self, "数据验证失败", message or "没有返回结果")
+            return
+
+        results = payload.get("results") or []
+        for item in results:
+            name = Path(item.get("bag", "")).name
+            if item.get("ok"):
+                self.append_log(f"✔ {name}：报告 {Path(item['report']).name}")
+            else:
+                self.append_log(f"✖ {name}：{item.get('reason') or '未完成'}")
+
+        total = int(payload.get("total") or 0)
+        done = int(payload.get("done") or 0)
+        succeeded = int(payload.get("succeeded") or 0)
+        failed = int(payload.get("failed") or 0)
+        stopped = bool(payload.get("stopped"))
+        self.refresh_lists()
+
+        if total and not done and not stopped:
+            QMessageBox.critical(self, "数据验证未开始",
+                                 payload.get("reason") or "数据验证没能启动")
+            return
+        failed_names = [Path(item["bag"]).name for item in results if not item.get("ok")]
+        if stopped:
+            head = f"已停止：完成 {done}/{total}（成功 {succeeded} 个、失败 {failed} 个）"
+        else:
+            head = f"共 {done} 个：成功 {succeeded} 个、失败 {failed} 个"
+        detail = "\n\n报告已写入各自的数据目录：" +                  "\n".join(Path(item["report"]).name for item in results if item.get("ok")) \
+                 if succeeded else ""
+        if failed_names:
+            more = "…" if len(failed_names) > 5 else ""
+            QMessageBox.warning(self, "数据验证完成",
+                                f"{head}\n\n失败：{'、'.join(failed_names[:5])}{more}"
+                                "\n（原因见日志区）" + detail)
+        else:
+            QMessageBox.information(self, "数据验证完成", head + detail)
 
     def view_selected_bag(self):
         folder_path = self._get_selected_bag()

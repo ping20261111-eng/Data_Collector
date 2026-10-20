@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Offline full-bag statistics.
-Usage: python3 scripts/bag_rate_stat.py BAG_DIRECTORY
+"""Offline full-bag verification (数据验证).
+Usage: python3 scripts/bag_rate_stat.py BAG_DIRECTORY [--report FILE]
 All recorded frames of the seven target topics are analyzed, without resampling.
 Only header.stamp is analyzed; all plots share one window without pagination.
-No report files are written.
+A plain-text report is written **into the bag directory** by default
+(`数据验证结果_<YYYYmmdd-HHMMSS>.txt`), so the result travels with the data.
 FILE zstd bags expand beside the compressed file; existing expanded files are reused.
 Requires the ROS environment of the robot workspace
 (source ${ROBOT_WORKSPACE:-<工作空间>}/install/setup.bash), python3-matplotlib,
@@ -11,6 +12,7 @@ zstd and fonts-noto-cjk.
 """
 import argparse
 from collections import defaultdict
+from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
 import statistics
@@ -27,7 +29,92 @@ TOPIC_TYPES['/joint_states'] = 'sensor_msgs/msg/JointState'
 
 ROS_ENV_HINT = ('缺少 ROS 2 Python 环境，脚本需要先 source 机器人工作空间的 setup.bash：\n'
                 '  source ${ROBOT_WORKSPACE:-<工作空间>}/install/setup.bash\n'
-                '上位机界面点击「采集统计」时会自动 source，请确认工作空间里存在 install/setup.bash。')
+                '上位机界面点击「数据验证」时会自动 source，请确认工作空间里存在 install/setup.bash。')
+
+
+#: 报告文件名格式。**与 `data_collector/verify.py` 的同名常量必须一致** ——
+#: 应用侧要靠它算出"结果会落在哪"并写进日志，而脚本要在没带 `--report` 时自己定名。
+#: 两份字面量是刻意的：这个脚本要能**独立**在机器人上跑（不 import 我们的包）。
+REPORT_NAME_FMT = '数据验证结果_%Y%m%d-%H%M%S.txt'
+
+
+def build_report(bag_path, samples, results, *, generated_at=None, host=None):
+    """把一次验证的结果组织成**纯文本报告**（纯函数，不碰 IO，便于单测）。
+
+    为什么报告由脚本写、不由上位机截终端输出：分析完就知道全部结论了，而
+    `plt.show(block=True)` 会把进程挂在那儿等操作员关窗口 —— 让上位机去"等它退出
+    再落盘"，等于把报告的存在绑在"有人去关窗口"上。写完再弹图，
+    报告一定在盘上（bag 目录里），与操作员看不看图无关。
+    """
+    from datetime import datetime as _datetime
+    import socket
+
+    when = generated_at or _datetime.now()
+    host = host or socket.gethostname()
+    # ⚠️ 不能直接 `key not in results`：`/joint_states` 会被按关节名集合**分组**
+    # 成 `/joint_states [a,b,...]` 这样的键。判"这个话题有没有数据"必须与
+    # `analyze_bag` 里那条打印逻辑一致（`key == topic or key.startswith(topic + ' [')`），
+    # 否则报告会写出「有数据 -4」这种自相矛盾的数字。
+    def _has_data(topic):
+        return any(key == topic or key.startswith(topic + ' [') for key in results)
+
+    missing = [topic for topic in TOPIC_TYPES if not _has_data(topic)]
+    lines = [
+        '数据验证结果',
+        '=' * 60,
+        f'生成时间: {when:%Y-%m-%d %H:%M:%S}',
+        f'主机: {host}',
+        f'数据目录: {bag_path}',
+        f'分析分组: {len(results)}；目标话题 {len(TOPIC_TYPES)} 个'
+        f'（有数据 {len(TOPIC_TYPES) - len(missing)}，缺失 {len(missing)}）',
+        '',
+        '一、逐话题（Header 帧间隔，全量原始帧、无重采样）',
+        '-' * 60,
+    ]
+    for index, key in enumerate(sorted(results), start=1):
+        stat = results[key]
+        lines.append(f'{index}. {key}')
+        lines.append(f'   帧数: {len(samples[key])}')
+        if stat:
+            hz = f'{stat["hz"]:.3f} Hz' if stat['hz'] is not None else '无效（间隔均值 <= 0）'
+            lines.append(f'   频率: {hz}')
+            lines.append(f'   间隔: 均值 {stat["mean_ms"]:.3f} ms / 标准差 {stat["std_ms"]:.3f} ms'
+                         f' / P95 {stat["p95_ms"]:.3f} ms / 最大 {stat["max_ms"]:.3f} ms')
+            lines.append(f'   非正间隔: {stat["nonpositive"]} 帧')
+        else:
+            lines.append('   频率: 帧数不足（少于 2 帧，无法计算间隔）')
+        lines.append('')
+    lines += ['二、结论', '-' * 60]
+    if missing:
+        lines.append(f'· 缺失 {len(missing)} 个目标话题（整段没有消息）：')
+        lines += [f'    - {key}' for key in missing]
+    else:
+        lines.append('· 全部目标分组均有数据。')
+    bad = [key for key, stat in sorted(results.items())
+           if not stat or stat['nonpositive']]
+    if bad:
+        lines.append(f'· 需要复查 {len(bad)} 个分组（无有效间隔，或存在非递增时间戳）：')
+        lines += [f'    - {key}' for key in bad]
+    else:
+        lines.append('· 所有分组的帧间隔均可计算，且没有非递增时间戳。')
+    lines.append('')
+    return '\n'.join(lines)
+
+
+def write_report(path, text):
+    """写报告（先写 `.partial` 再改名）。
+
+    与磁盘导出同一条理由：**读到半份报告比读不到更糟** —— 半份报告看起来像
+    "验证过了、某几个话题是空的"，而实际只是写文件被打断。
+    """
+    from pathlib import Path as _Path
+
+    target = _Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(target.name + '.partial')
+    temporary.write_text(text, encoding='utf-8')
+    temporary.replace(target)
+    return target
 
 
 def require_ros_environment():
@@ -242,18 +329,27 @@ def analyze_bag(bag_path):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('bag', help='bag directory containing metadata.yaml')
+    # ⚠️ help 里**不要拼 `REPORT_NAME_FMT`**：argparse 的 help 走 `%` 展开，
+    # 那个格式串里的 `%Y`/`%m` 会让 `--help` 直接抛 ValueError（现场一敲帮助就崩）。
+    parser.add_argument('--report', default='',
+                        help='报告路径；默认写进 <bag>/数据验证结果_<时间>.txt')
+    parser.add_argument('--no-plot', action='store_true',
+                        help='只分析并写报告，不弹图（批量验证用：不需要图形后端，也不等人关窗口）')
     args = parser.parse_args()
     require_ros_environment()
-    try:
-        plt = plotting()
-        from matplotlib import get_backend, rcsetup
-        if get_backend().lower() not in {name.lower() for name in rcsetup.interactive_bk}:
-            parser.error('当前没有可用图形后端。请在桌面终端运行，或配置 SSH X11 转发；'
-                         '可安装 sudo apt install python3-tk')
-        probe = plt.figure()
-        plt.close(probe)
-    except (ImportError, RuntimeError) as exc:
-        parser.error(f'{exc}; sudo apt install python3-matplotlib fonts-noto-cjk')
+    # 批量验证（`--no-plot`）**不碰图形后端**：它要在后台串行跑几十份，
+    # 既不该因为"没有 X11"就失败，也不该在无人值守时弹一屋子窗口。
+    if not args.no_plot:
+        try:
+            plt = plotting()
+            from matplotlib import get_backend, rcsetup
+            if get_backend().lower() not in {name.lower() for name in rcsetup.interactive_bk}:
+                parser.error('当前没有可用图形后端。请在桌面终端运行，或配置 SSH X11 转发；'
+                             '可安装 sudo apt install python3-tk')
+            probe = plt.figure()
+            plt.close(probe)
+        except (ImportError, RuntimeError) as exc:
+            parser.error(f'{exc}; sudo apt install python3-matplotlib fonts-noto-cjk')
     bag = Path(args.bag).resolve()
     if not (bag / 'metadata.yaml').is_file():
         parser.error(f'找不到 {bag / "metadata.yaml"}')
@@ -267,7 +363,18 @@ def main():
             print(f'  Header: {hz} Hz, std {value["std_ms"]:.3f} ms, '
                   f'P95 {value["p95_ms"]:.3f} ms, max {value["max_ms"]:.3f} ms, '
                   f'nonpositive {value["nonpositive"]}')
-    show_results(samples, results, bag.name)
+    # 报告**先落盘再弹图**：`show_results` 里 `plt.show(block=True)` 会一直等操作员
+    # 关窗口 —— 把写报告放在它后面，等于"没人关窗口就没有报告"。
+    report_path = (Path(args.report) if args.report
+                   else bag / datetime.now().strftime(REPORT_NAME_FMT))
+    try:
+        written = write_report(report_path, build_report(bag, samples, results))
+        print(f'验证报告已保存：{written}', flush=True)
+    except OSError as exc:
+        # 盘只读 / 没权限时不能让整次验证白跑：图照常弹，但必须说清报告没写下来
+        print(f'⚠ 验证报告写入失败（分析结果仍会显示）：{exc}', flush=True)
+    if not args.no_plot:
+        show_results(samples, results, bag.name)
 
 
 if __name__ == '__main__':

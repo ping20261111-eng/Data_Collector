@@ -397,7 +397,7 @@ def test_launcher_bag_rate_stat_requires_bag_path(launcher_env):
 
 
 def test_launcher_bag_rate_stat_sources_workspace_setup(launcher_env):
-    """采集统计直接跑 python3，必须先 source 工作空间 setup.bash（否则缺 rclpy）。"""
+    """数据验证直接跑 python3，必须先 source 工作空间 setup.bash（否则缺 rclpy）。"""
     launcher, tmp, _cfg, calls = launcher_env
     setup = tmp / "install" / "setup.bash"
     setup.parent.mkdir(parents=True, exist_ok=True)
@@ -478,11 +478,118 @@ def test_launcher_allows_non_executable_script(tmp_path, monkeypatch):
 
 # ---------- 回归测试：脚本调用必须自带 ROS 环境 ----------
 def test_bag_rate_stat_script_mentions_ros_environment():
-    """采集统计脚本自身要给出 source setup.bash 的提示（独立运行时也有明确报错）。"""
+    """数据验证脚本自身要给出 source setup.bash 的提示（独立运行时也有明确报错）。"""
     content = (PROJECT_ROOT / "scripts" / "bag_rate_stat.py").read_text(encoding="utf-8")
     assert "require_ros_environment()" in content
     assert "install/setup.bash" in content
     assert "rclpy" in content
+
+
+def test_launcher_bag_rate_stat_passes_the_report_into_the_data_dir(launcher_env):
+    """单份数据验证要把**报告路径**传给脚本，且落点在那个 bag 目录里（v6.7.0）。
+
+    要求原话是「完成数据验证后，将结果放在数据的同一目录下」。只靠脚本自己按
+    `<bag>/数据验证结果_<时间>.txt` 定名也能满足，但那样**日志说不清报告叫什么**；
+    显式传一个路径，现场才能"照着日志里的文件名去目录里找"。
+    """
+    from data_collector.verify import VERIFY_REPORT_NAME_FMT
+
+    launcher, tmp, _cfg, calls = launcher_env
+    bag = tmp / "bag_a"
+    bag.mkdir()
+    report = bag / "报告.txt"
+
+    launcher.launch_bag_rate_stat(str(bag), str(report))
+
+    command, _terminal = calls["terminal"]
+    assert "--report" in command, f"没把报告路径传给脚本：{command}"
+    assert str(report) in command
+    # 单份验证仍然要弹图（带 `--no-plot` 的是批量那条路）
+    assert "--no-plot" not in command
+    assert VERIFY_REPORT_NAME_FMT.endswith(".txt")
+
+
+def test_verify_bag_folders_runs_each_bag_and_writes_reports(launcher_env, monkeypatch):
+    """批量验证：**逐个**跑、每份报告写回自己的目录、带 `--no-plot`（v6.7.0）。"""
+    import re
+
+    from data_collector import core_operations
+
+    launcher, tmp, _cfg, _calls = launcher_env
+    bags = []
+    for name in ("bag_a", "bag_b"):
+        folder = tmp / name
+        folder.mkdir()
+        bags.append(folder)
+
+    commands = []
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        command = argv[2]
+        commands.append(command)
+        matched = re.search(r"--report\s+'?([^'\s]+)'?", command)
+        assert matched, f"命令行里没有 --report：{command}"
+        Path(matched.group(1)).write_text("报告", encoding="utf-8")
+        return _Done()
+
+    monkeypatch.setattr(core_operations.subprocess, "run", fake_run)
+    progress = []
+    summary = launcher.verify_bag_folders(bags, progress.append)
+
+    assert summary["ok"] is True, summary
+    assert summary["total"] == 2 and summary["done"] == 2
+    assert summary["succeeded"] == 2 and summary["failed"] == 0
+    assert len(commands) == 2, "每个 bag 各跑一次"
+    assert all("--no-plot" in item for item in commands), "批量不该弹图"
+    for item, folder in zip(summary["results"], bags):
+        assert Path(item["report"]).parent == folder, \
+            f"报告必须落在数据自己的目录里：{item['report']}"
+    assert any("1/2" in line for line in progress), progress
+
+
+def test_verify_bag_folders_stops_between_bags(launcher_env, monkeypatch):
+    """中途停止：**当前这一份跑完才停**（不打断正在分析的进程）。
+
+    打断正在跑的那一份，只会留下半截报告 —— 比"多等一分钟"糟得多。
+    未开始的那些保持原状，汇总里如实报 `stopped`。
+    """
+    import re
+
+    from data_collector import core_operations
+
+    launcher, tmp, _cfg, _calls = launcher_env
+    bags = []
+    for name in ("bag_a", "bag_b", "bag_c"):
+        folder = tmp / name
+        folder.mkdir()
+        bags.append(folder)
+
+    ran = []
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        command = argv[2]
+        matched = re.search(r"--report\s+'?([^'\s]+)'?", command)
+        Path(matched.group(1)).write_text("报告", encoding="utf-8")
+        ran.append(command)
+        return _Done()
+
+    monkeypatch.setattr(core_operations.subprocess, "run", fake_run)
+    summary = launcher.verify_bag_folders(bags, should_stop=lambda: len(ran) >= 1)
+
+    assert summary["stopped"] is True
+    assert summary["done"] == 1, f"停之前只该跑完一份：{summary}"
+    assert summary["ok"] is False, "被停止的批次不能报成功"
+    assert len(ran) == 1
 
 
 def test_launcher_record_unknown_type_raises(tmp_path):

@@ -50,6 +50,16 @@ def _current_operator() -> str:
 PACK_CHUNK = 4 * 1024 * 1024        # 单次读写块大小（进度粒度 vs 系统调用开销）
 PROGRESS_INTERVAL = 1024 * 1024     # 每写出/读入 1MB 通知一次进度
 ARCHIVE_FORMATS = ("zip", "tar")
+
+
+def _human_size(value: float) -> str:
+    """把字节数写成现场看得懂的大小（日志与结果文案共用一处，别各写一份）。"""
+    size = float(value)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{int(size)} B" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
 TRANSFER_MODES = ("auto", "stream", "tempfile")
 COMPRESSIONS = ("store", "deflate")
 
@@ -809,7 +819,7 @@ class DataUploader:
         subdirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
         return subdirs
 
-    # ---------- 采集数据候选（给「采集统计」等"选一个 bag"用） ----------
+    # ---------- 采集数据候选（给「数据验证」等"选一个 bag"用） ----------
 
     def looks_like_bag(self, folder: Path) -> bool:
         """这个目录是不是一个 rosbag 采集目录。
@@ -838,7 +848,7 @@ class DataUploader:
         - 选到非 bag 目录**当场就该拦**，而不是等脚本跑起来才报错。
 
         只扫一层（`root` 的直接子目录）：bag 是平铺的，深层扫描在几百个目录的
-        机器上要几百毫秒到几秒，而这个对话框是每次点「采集统计」都开的。
+        机器上要几百毫秒到几秒，而这个对话框是每次点「数据验证」都开的。
         扫不到就返回空列表并让界面说清"这个目录下没有可统计的采集数据"，
         同时保留「浏览其它位置」给盘上的 / 别的机器来的数据。
         """
@@ -1299,11 +1309,19 @@ class DataUploader:
 
     def _export_to_disk(self, folder_path: Path,
                         progress_cb=None, progress_percent=None) -> bool:
-        """把一次采集的数据写到本地挂载的移动硬盘。
+        """把一次采集的数据写到本地挂载的移动硬盘 —— **不压缩、不打包**（v6.7.0）。
 
         与远端路径的差异是**刻意的**（见 `disk_export` 的模块说明）：不建 SSH、
-        不断点续传、不算远端空间。打包器共用 `_pack_folder`——它接受任意文件对象，
-        所以"边打包边写盘"不需要第二套实现。
+        不断点续传、不算远端空间；而且**磁盘侧根本不打包**：
+
+        | | 远端（SFTP） | 移动硬盘 |
+        | --- | --- | --- |
+        | 形态 | 单个 `.tar`/`.zip` 流式直传 | 原样的目录树，逐文件复制 |
+        | 理由 | SFTP 一次一个文件，打包省往返 | 盘就是文件系统，打包只多加一道解压 |
+
+        打包在盘上没有任何收益：读一遍写一遍再加解压读一遍写一遍，同盘搬运的 IO
+        翻倍；而 MCAP / 视频本身就是压缩格式，再 DEFLATE 只耗 CPU。现场要把数据
+        交给别人时，还得先解压一次 —— 多一道手续就多一次出错机会。
 
         ## 落点为什么不用远端子路径
 
@@ -1348,8 +1366,6 @@ class DataUploader:
                 "也可以把导出目标改回服务器。",
             )
 
-        archive_name = self._archive_name(folder)
-        est_size = self._estimate_archive_size(total_size, len(entries), self.transfer_format)
         # 落点：挂载点/<序列号>/<采集日期>/<bag 名>/（理由见 `_disk_subpath`）
         subpath = f"{self._disk_subpath(folder)}/{folder.name}"
 
@@ -1378,7 +1394,8 @@ class DataUploader:
         # 两次之间被拔，第二次会报"创建目录时断开"，而目录其实第一次就建好了，
         # 现场会照着这个提示去查一个已经过去的故障。
         try:
-            target_dir = disk.prepare(subpath, total_bytes=est_size)   # ① 挂载点 ② 盘标识 ③ 空间
+            # 空间预检用**真实总量**（不再叠加归档头的估算）：磁盘侧没有归档头。
+            target_dir = disk.prepare(subpath, total_bytes=total_size)   # ① 挂载点 ② 盘标识 ③ 空间
         except AppError as exc:
             return self._fail(exc.code, exc.message)
 
@@ -1402,67 +1419,137 @@ class DataUploader:
         def running() -> bool:
             return not self.upload_cancelled
 
-        # `_pack_folder` 的 `fp` 要的是一个**有 `.write()`/`flush()` 的文件对象**
-        # （它直接当 zipfile/tarfile 的 fileobj 用），而 `write_stream` 给的
-        # `sink` 是**写入回调**（bytes -> None）。两者语义不同，所以套一层适配。
-        #
-        # 复用已有的 `ProgressWriter`（它本来就是"把只顺序写的目标包装成
-        # zipfile 可用的文件对象"，职责完全一致），不另造一个只写壳。
-        class _CallbackSink:
-            """把写入回调伪装成文件对象，供 zipfile/tarfile 使用。"""
+        copied = 0
+        skipped = 0
+        bytes_done = 0
+        checksums = []
 
-            def __init__(self, fn):
-                self._fn = fn
+        def tick(count: int) -> None:
+            nonlocal bytes_done
+            bytes_done += count
+            if progress_percent and total_size:
+                # 卡在 99：最后一个字节落盘并 rename 之后才算完（同 `write_stream`）
+                progress_percent(min(99, int(bytes_done * 100 / total_size)))
+            if progress_cb and bytes_done % (64 * 1024 * 1024) < count:
+                progress_cb(f"正在复制到移动硬盘：{_human_size(bytes_done)}")
 
-            def write(self, data) -> int:
-                self._fn(data)
-                return len(data)
-
-            def flush(self) -> None:
-                """zipfile 关闭前会 flush。这里**不能报错**：底层的
-                "已写入多少"由 `write_stream` 自己统计，flush 对磁盘侧无意义。"""
-
-        def producer(sink) -> None:
-            self._pack_folder(
-                folder, ProgressWriter(_CallbackSink(sink)),
-                self.transfer_format,
-                self.transfer_compression == "deflate",
-                entries, running_cb=running, collect_digest=self.verify_content,
-            )
+        # 上次被拔盘 / 被强杀留下的 `.partial` 先清掉：这些是**我们自己的**临时文件
+        # （不是用户数据），留着既占空间，也让"盘上到底有什么"说不清。
+        swept = self._sweep_partials(target_dir)
+        if swept and progress_cb:
+            progress_cb(f"已清理上次中断留下的 {swept} 个临时文件（.partial）")
 
         try:
-            disk.write_stream(
-                target_dir, archive_name, producer,
-                progress_cb=progress_cb, progress_percent=progress_percent,
-                # **必须传总量**：`write_stream` 要用它把已写字节换算成百分比。
-                # 不传的话它只发文字进度、不发百分比（发一个错的数字比不发更糟）。
-                total_bytes=est_size,
-            )
+            for path, size in entries:
+                self._check_cancel(running, "导出")
+                dest = target_dir / path.relative_to(folder)
+                if self._already_exported(dest, path, size):
+                    # 盘上已经有同一份（拔盘中转后重跑）：**不重复拷几 GB**。
+                    # 也算进度 —— 否则进度条会在"其实已经拷完"的地方停住。
+                    skipped += 1
+                    tick(size)
+                    continue
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                result = disk.copy_file(path, dest, on_chunk=tick,
+                                        digest=self.verify_content)
+                copied += 1
+                if self.verify_content:
+                    # 复制时已经算过源文件摘要，这里**只回读目标**比对
+                    # （少读一遍源文件：几 GB 的数据，一遍就是几十秒）。
+                    actual = sha256_file(dest)
+                    if actual != result["digest"]:
+                        return self._fail(
+                            ErrorCode.LOCAL_IO,
+                            f"复制后校验不一致：{dest}\n"
+                            f"源 {result['digest']} / 目标 {actual}")
+                    checksums.append(f"{actual}  {path.relative_to(folder).as_posix()}")
+            if self.verify_content and checksums:
+                self._write_checksums(target_dir, checksums)
+        except UploadCancelledError:
+            # 取消保留已复制的文件：删掉它们等于"取消 = 白拷一遍"，而且盘上
+            # 有完整文件比没有好。下次导出会因为 size+mtime 命中而跳过它们。
+            self.last_code = ErrorCode.CANCELLED
+            self.last_error = (f"已取消导出（已复制 {copied} 个、跳过 {skipped} 个；"
+                               "已复制的文件保留在盘上）")
+            logger.info(self.last_error)
+            if progress_cb:
+                progress_cb(self.last_error)
+            return False
         except AppError as exc:
             # 拔盘/空间/IO 都已是带码异常，原样保留码，界面才能给对建议
             return self._fail(exc.code, exc.message)
-        except Exception as exc:
+        except OSError as exc:
+            return self._fail(ErrorCode.LOCAL_IO, f"导出到移动硬盘失败：{exc}")
+        except Exception as exc:                       # noqa: BLE001
             return self._fail(ErrorCode.LOCAL_IO, f"导出到移动硬盘失败：{exc}")
 
-        if self.verify_content:
-            try:
-                written = target_dir / archive_name
-                # 校验要**把刚写完的归档整个再读一遍**（几 GB 的盘就是几秒），
-                # 而进度条此刻已经是 100%。不说的话，现场看到的就是
-                # "满格了但程序还在动"—— 与其让那几秒显得像卡住，不如如实讲。
-                if progress_cb:
-                    progress_cb("正在校验内容（读取归档文件计算 SHA-256）")
-                write_sha256_sidecar(written, sha256_file(written))
-            except OSError as exc:
-                # 边车文件写不出来不算导出失败：数据已经在盘上且已验过内容
-                logger.warning(f"写 .sha256 边车文件失败（数据本身已写入）：{exc}")
-
-        logger.info(f"已导出到移动硬盘：{target_dir / archive_name}")
+        logger.info(f"已导出到移动硬盘：{target_dir}"
+                    f"（复制 {copied} 个 / 跳过 {skipped} 个 / {_human_size(total_size)}）")
         if progress_cb:
             # 日志里给**完整落点层级**，而不是只有文件名 ——
             # 盘插满几十台机器的数据时，"在哪个目录下"才是现场要找的东西。
-            progress_cb(f"已导出到移动硬盘：{subpath}/{archive_name}")
+            progress_cb(
+                f"已导出到移动硬盘：{subpath}/\n"
+                f"  共 {len(entries)} 个文件：新复制 {copied} 个、已存在跳过 {skipped} 个"
+                f"（{_human_size(total_size)}，未压缩，目录结构保持原样）")
         return True
+
+    @staticmethod
+    def _already_exported(dest: Path, source: Path, size: int) -> bool:
+        """目标已存在且"看起来是同一份" → 跳过（拔盘中转后重跑不必再拷几 GB）。
+
+        判据用 **体积 + 修改时间（±2s）**，不算摘要：算摘要要读全量，而这条判断
+        回答的只是"要不要再拷一遍"，不是"数据对不对"（那个由 `verify_content`
+        负责）。mtime 容差 2s 是因为 FAT 系列只存 2s 粒度 —— 精确比较会让
+        "明明拷过"变成"每次都重拷"，正好毁掉这条判断的意义。
+        """
+        try:
+            info = dest.stat()
+        except OSError:
+            return False
+        if not dest.is_file() or info.st_size != size:
+            return False
+        try:
+            return abs(info.st_mtime - source.stat().st_mtime) <= 2.0
+        except OSError:
+            return False
+
+    @staticmethod
+    def _sweep_partials(target_dir: Path) -> int:
+        """清掉目标目录下上次中断留下的 `.partial`，返回清掉的个数。
+
+        只删**我们自己**的临时文件（`copy_file` / `write_stream` 的中间产物），
+        不碰任何真实数据 —— 这也是唯一允许在这里删除的东西。
+        """
+        if not target_dir.is_dir():
+            return 0
+        removed = 0
+        for leftover in target_dir.rglob("*.partial"):
+            try:
+                leftover.unlink()
+                removed += 1
+            except OSError as exc:
+                logger.debug(f"清理临时文件失败（不影响导出）：{leftover}（{exc}）")
+        return removed
+
+    @staticmethod
+    def _write_checksums(target_dir: Path, lines: List[str]) -> None:
+        """把逐文件摘要写成 `SHA256SUMS`（`sha256sum -c` 可直接复核）。
+
+        不再有"单个归档的 .sha256 边车"——磁盘侧已经没有归档了。逐文件清单更
+        有用：盘上任何一个文件坏了都能定位到名字，而不是"整包不一致"。
+        """
+        path = target_dir / "SHA256SUMS"
+        tmp = path.with_name(path.name + ".partial")
+        try:
+            tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            logger.warning(f"写 SHA256SUMS 失败（数据本身已写入并校验过）：{exc}")
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
     # ---------- 打包 + 上传（统一入口） ----------
     def _archive_name(self, folder: Path) -> str:
