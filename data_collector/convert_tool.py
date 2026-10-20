@@ -46,6 +46,33 @@ VENV_PYTHON_REL = Path(".venv") / "bin" / "python"
 #: 不做轮询（每秒 fork 一次只为问一句话不值得）。
 RUNNING_PATTERN = "tools/gui/run_gui.py"
 
+#: 对方界面的**已知故障**闸门（临时措施，2026-10-20 加）。
+#:
+#: `nerv_lerobot/tools/gui` 在 2026-10-20 实测段错误：worker 跑在裸
+#: `threading.Thread` 里却直接操作 QTextEdit，跨线程操作控件，Qt 连报
+#: 三行后 abort（`Cannot queue arguments of type 'QTextCursor'` →
+#: `Cannot set parent...` → 段错误）。该仓已修（加 Qt 桥接层），
+#: 但**现场机器上的那份未必已更新** —— 而我们无法替对方判断版本。
+#:
+#: 所以这里先**主动置灰**，而不是等现场点下去崩给他们看：崩在另一个
+#: 窗口里，现场多半会当成上位机的 bug 报上来。
+#:
+#: 解除方式（二选一）：
+#:   ① 对方仓更新到含修复的版本后，把下面这个常量改成 False；
+#:   ② 或在 `configs/app_config.yaml` 里设 `convert_tool_allow_broken: true`
+#:      临时放行（现场急用时）。
+#:
+#: **这是临时的**。等对方的修复确认落地、且现场都更新了，就该把这条撤掉 ——
+#: 留着会让"环境都好了但按钮一直灰着"，比崩溃更难解释。
+KNOWN_BROKEN_REASON = (
+    "对方界面（nerv_lerobot/tools/gui）当前会段错误："
+    "日志追加跨线程操作控件，已定位并在对方仓修复。"
+    "更新到修复版后即可使用；急用可设 convert_tool_allow_broken: true 临时放行。"
+)
+
+#: 闸门是否生效。置 True = 一律置灰（默认，保守）。
+KNOWN_BROKEN = True
+
 
 @dataclass(frozen=True)
 class ConvertToolTarget:
@@ -73,11 +100,14 @@ def _missing_repo(repo: Path) -> str:
             "若装在别处，在 configs/app_config.yaml 里填 convert_tool_root")
 
 
-def probe_convert_tool(repo: Path) -> ConvertToolTarget:
+def probe_convert_tool(repo: Path, allow_broken: bool = False) -> ConvertToolTarget:
     """探测数据转换工具是否可用。**只做只读 stat，不执行任何东西。**
 
-    判定顺序刻意是「先说最可能的原因」：没装 > 版本对不上 > 装了没同步依赖。
-    现场看到的第一句话就该指向最可能的那个原因。
+    判定顺序刻意是「先说最可能的原因」：没装 > 版本对不上 > 装了没同步依赖
+    > 对方界面已知崩溃。现场看到的第一句话就该指向最可能的那个原因。
+
+    `allow_broken=True` 时跳过"已知故障"闸门（配置
+    `convert_tool_allow_broken: true`）。闸门本身见 `KNOWN_BROKEN` 的说明。
     """
     repo = Path(repo).expanduser()
     launcher = repo / LAUNCHER_REL
@@ -108,6 +138,11 @@ def probe_convert_tool(repo: Path) -> ConvertToolTarget:
             f"{python} 不存在或不可执行"
             f"（在 {repo} 下执行一次 uv sync）")
 
+    # 四项都在，但对方界面本身可能崩（见 KNOWN_BROKEN）。
+    if KNOWN_BROKEN and not allow_broken:
+        return ConvertToolTarget(repo, launcher, entry, python, False,
+                                 KNOWN_BROKEN_REASON)
+
     return ConvertToolTarget(repo, launcher, entry, python, True, "")
 
 
@@ -119,6 +154,14 @@ def convert_tool_repo(config) -> Path:
     """
     raw = config.app_config.get("convert_tool_root") or "~/test_ws/nerv_lerobot"
     return Path(str(raw)).expanduser()
+
+
+def convert_tool_allow_broken(config) -> bool:
+    """是否放行"对方界面已知崩溃"这个状态（配置 `convert_tool_allow_broken`）。
+
+    默认 False = 保守（置灰）。急用时现场可显式设 true。
+    """
+    return bool(config.app_config.get("convert_tool_allow_broken"))
 
 
 def build_launch_cmd(target: ConvertToolTarget) -> list:

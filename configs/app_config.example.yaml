@@ -73,6 +73,12 @@ robot_monitor_script: robot_monitor.py   # 机器人状态监控（订阅电量/
 convert_tool_root: ~/test_ws/nerv_lerobot
 # 界面的 stdout/stderr 落这里（排障用；启动失败时启动自检会提到它）。
 # 留空取 <项目根>/logs/convert_gui.log。
+# 临时放行「对方界面已知崩溃」这个状态（默认 false = 保守置灰）。
+# 2026-10-20 实测：对方 GUI 的日志追加跨线程操作控件，会段错误。
+# 该仓已修，但现场机器上的那份未必已更新 —— 崩在另一个窗口里，
+# 现场多半会当成上位机的 bug 报上来，所以默认先置灰。
+# 更新到修复版后，这条配置就不用管了（代码里的闸门会撤）。
+convert_tool_allow_broken: false
 
 # ---------- 运行路径（可选，留空则使用下列默认值） ----------
 nerv_dir: /var/nerv              # 数据根目录（脚本按 NERV_DIR 读取）

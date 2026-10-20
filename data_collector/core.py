@@ -2002,7 +2002,9 @@ class ConfigManager:
         # 数据转换工具（nerv_lerobot，独立仓、不随交付包走）。标 warn 而不是 fail：
         # 它只影响"录完之后转成训练格式"这一步，缺了完全不影响采集与回传 ——
         # 写成 fail 会让没装它的机器在启动时弹一个"环境自检未通过"的红框。
-        target = convert_tool.probe_convert_tool(convert_tool.convert_tool_repo(self))
+        target = convert_tool.probe_convert_tool(
+            convert_tool.convert_tool_repo(self),
+            allow_broken=convert_tool.convert_tool_allow_broken(self))
         add("数据转换工具", target.available,
             target.reason or str(target.repo), level="warn")
 

@@ -1896,6 +1896,10 @@ def test_check_environment_all_ok_when_ready(tmp_path):
         "vision_calib_dir": str(calib),
         "product_file": str(tmp_path / "Product.json"),
         "remote_password": "test-secret",
+        # 放行「对方界面已知崩溃」闸门：这条用例测的是"环境就绪时自检全过"，
+        # 而闸门（临时的，见 convert_tool.KNOWN_BROKEN）会把转换工具判为
+        # 不可用。闸门本身另有用例钉住。
+        "convert_tool_allow_broken": True,
         **_DOCTOR_SCRIPTS,
     })
 

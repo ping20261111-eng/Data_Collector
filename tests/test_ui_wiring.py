@@ -7336,6 +7336,9 @@ def test_convert_button_explains_why_it_is_greyed(ui_env, tmp_path):
 def test_convert_button_is_enabled_when_everything_is_in_place(ui_env, tmp_path, monkeypatch):
     win, cm = ui_env
     cm.app_config["convert_tool_root"] = str(_convert_repo(tmp_path))
+    # 放行"对方界面已知崩溃"闸门：这条测的是**可用态下的行为**，
+    # 与那个闸门无关（闸门本身另有一条用例钉住）。
+    cm.app_config["convert_tool_allow_broken"] = True
     # 这台机器上不该真有转换界面在跑（否则按钮会进"运行中"态）
     monkeypatch.setattr(win.launcher, "convert_tool_running", lambda: False)
 
@@ -7349,6 +7352,7 @@ def test_convert_button_says_running_instead_of_allowing_a_second_launch(ui_env,
     """已在跑时按钮禁用并写明"运行中"：两个转换界面写同一个输出目录。"""
     win, cm = ui_env
     cm.app_config["convert_tool_root"] = str(_convert_repo(tmp_path))
+    cm.app_config["convert_tool_allow_broken"] = True
     win._sync_convert_button()
     monkeypatch.setattr(win.launcher, "convert_tool_running", lambda: True)
 
@@ -7362,6 +7366,7 @@ def test_clicking_convert_launches_exactly_one_process(ui_env, tmp_path, monkeyp
     """点一次只起一个 —— 拦截顺序：已在跑 → 不重复启动。"""
     win, cm = ui_env
     cm.app_config["convert_tool_root"] = str(_convert_repo(tmp_path))
+    cm.app_config["convert_tool_allow_broken"] = True
     win._sync_convert_button()
 
     calls = []
@@ -7418,6 +7423,7 @@ def test_closing_the_window_leaves_the_convert_gui_alone(ui_env, tmp_path, monke
     """
     win, cm = ui_env
     cm.app_config["convert_tool_root"] = str(_convert_repo(tmp_path))
+    cm.app_config["convert_tool_allow_broken"] = True
 
     class _FakeProc:
         pid = 4242
@@ -7434,3 +7440,35 @@ def test_closing_the_window_leaves_the_convert_gui_alone(ui_env, tmp_path, monke
     assert "未中断" in note or "仍在运行" in note
     # 关键：不许去 kill
     assert win._convert_proc.poll() is None
+
+
+def test_convert_button_is_greyed_out_while_the_tool_is_known_broken(ui_env, tmp_path,
+                                                                    monkeypatch):
+    """对方界面已知崩溃时，即便四项齐全也要置灰。
+
+    崩在**另一个窗口**里，现场多半会当成上位机的 bug 报上来 ——
+    与其让人点一下看段错误，不如主动说清"对方界面当前会崩"。
+    """
+    win, cm = ui_env
+    cm.app_config["convert_tool_root"] = str(_convert_repo(tmp_path))
+    monkeypatch.setattr(win.launcher, "convert_tool_running", lambda: False)
+
+    win._sync_convert_button()
+
+    assert win.btn_convert.isEnabled() is False
+    tip = win.btn_convert.toolTip()
+    assert "段错误" in tip
+    assert "convert_tool_allow_broken" in tip      # 给出放行办法
+
+
+def test_convert_button_works_when_the_broken_gate_is_lifted(ui_env, tmp_path,
+                                                              monkeypatch):
+    """配置放行后按钮恢复可用 —— 现场急用时的一条出路。"""
+    win, cm = ui_env
+    cm.app_config["convert_tool_root"] = str(_convert_repo(tmp_path))
+    cm.app_config["convert_tool_allow_broken"] = True
+    monkeypatch.setattr(win.launcher, "convert_tool_running", lambda: False)
+
+    win._sync_convert_button()
+
+    assert win.btn_convert.isEnabled() is True

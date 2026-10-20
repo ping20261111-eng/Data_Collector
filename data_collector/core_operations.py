@@ -3184,7 +3184,8 @@ class Launcher:
     def probe_convert_tool(self):
         """探测数据转换工具是否可用（只读 stat，不执行）。"""
         return convert_tool.probe_convert_tool(
-            convert_tool.convert_tool_repo(self.config))
+            convert_tool.convert_tool_repo(self.config),
+            allow_broken=convert_tool.convert_tool_allow_broken(self.config))
 
     def launch_convert_tool(self) -> subprocess.Popen:
         """起数据转换界面（独立进程组，独立窗口）。

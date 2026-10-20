@@ -57,7 +57,9 @@ def _write_launcher(repo: Path, body: str) -> Path:
 def test_probe_reports_available_when_everything_is_in_place(tmp_path):
     repo = _make_repo(tmp_path / "nerv_lerobot")
 
-    target = convert_tool.probe_convert_tool(repo)
+    # allow_broken=True：这条测的是"四项齐全"这个维度，
+    # 与"对方界面已知崩溃"闸门无关（那个另有一条用例钉住）。
+    target = convert_tool.probe_convert_tool(repo, allow_broken=True)
 
     assert target.available
     assert target.reason == ""
@@ -108,6 +110,49 @@ def test_probe_flags_a_repo_without_synced_dependencies(tmp_path):
     assert "uv sync" in target.reason
 
 
+def test_known_broken_gate_greys_out_a_complete_install(tmp_path):
+    """对方界面已知崩溃时，即便四项齐全也要置灰。
+
+    为什么要有这条：崩在**另一个窗口**里，现场多半会当成上位机的 bug 报上来。
+    与其让人点一下看段错误，不如主动说清"对方界面当前会崩"。
+    """
+    repo = _make_repo(tmp_path / "nerv_lerobot")
+
+    target = convert_tool.probe_convert_tool(repo)
+
+    assert not target.available
+    assert "段错误" in target.reason
+    assert "convert_tool_allow_broken" in target.reason   # 给出放行办法
+
+
+def test_known_broken_gate_can_be_lifted_by_config(tmp_path):
+    """现场急用时可显式放行（配置 convert_tool_allow_broken: true）。"""
+    repo = _make_repo(tmp_path / "nerv_lerobot")
+
+    target = convert_tool.probe_convert_tool(repo, allow_broken=True)
+
+    assert target.available
+    assert target.reason == ""
+
+
+def test_known_broken_gate_flag_is_togglable():
+    """闸门本身是一个显式常量，且默认是保守的那一侧。
+
+    钉住"默认关着闸门"（= 默认置灰）：这个决定是现场定的，
+    不该在某次改动里被无声地翻掉。
+    """
+    assert convert_tool.KNOWN_BROKEN is True
+    assert convert_tool.KNOWN_BROKEN_REASON.strip()
+
+
+def test_allow_broken_comes_from_config(tmp_path):
+    cfg = _cfg_with(tmp_path / "x")
+    assert convert_tool.convert_tool_allow_broken(cfg) is False
+
+    cfg.app_config["convert_tool_allow_broken"] = True
+    assert convert_tool.convert_tool_allow_broken(cfg) is True
+
+
 def test_probe_flags_a_non_executable_python(tmp_path):
     """文件在但没有执行位：判不可用，并说清怎么修。
     （`os.access(X_OK)` 这一层不能省 —— 目录在不代表能跑。）"""
@@ -128,13 +173,16 @@ def test_every_unavailable_reason_is_actionable(tmp_path):
     missing_repo = convert_tool.probe_convert_tool(tmp_path / "nope")
     no_gui = convert_tool.probe_convert_tool(_bare_repo(tmp_path / "a"))
     no_sync = convert_tool.probe_convert_tool(_make_repo(tmp_path / "b", python=False))
+    known_broken = convert_tool.probe_convert_tool(
+        _make_repo(tmp_path / "c"))       # 四项齐全，但对方界面已知崩溃
 
-    for target in (missing_repo, no_gui, no_sync):
+    for target in (missing_repo, no_gui, no_sync, known_broken):
         assert not target.available
         assert len(target.reason) > 10, f"理由太短，现场看不懂：{target.reason}"
         # 至少给一个"怎么办"的抓手
         assert any(hint in target.reason
-                   for hint in ("convert_tool_root", "uv sync", "版本", "目录")), \
+                   for hint in ("convert_tool_root", "uv sync", "版本", "目录",
+                                "convert_tool_allow_broken")), \
             f"理由没有下一步动作：{target.reason}"
 
 
@@ -147,7 +195,7 @@ def test_describe_is_readable_on_its_own(tmp_path):
     """describe() 的输出会直接进日志区/错误框，必须是完整人话。"""
     repo = _make_repo(tmp_path / "nerv_lerobot")
 
-    ok = convert_tool.probe_convert_tool(repo).describe()
+    ok = convert_tool.probe_convert_tool(repo, allow_broken=True).describe()
     bad = convert_tool.probe_convert_tool(tmp_path / "gone").describe()
 
     assert str(repo) in ok
@@ -177,7 +225,7 @@ def test_probe_does_not_execute_anything(tmp_path, monkeypatch):
     monkeypatch.setattr(subprocess, "Popen", _boom)
 
     repo = _make_repo(tmp_path / "nerv_lerobot")
-    assert convert_tool.probe_convert_tool(repo).available
+    assert convert_tool.probe_convert_tool(repo, allow_broken=True).available
 
 
 # ---------- ② 启动命令的形状 ----------
