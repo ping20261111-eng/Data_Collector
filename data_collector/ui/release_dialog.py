@@ -74,7 +74,7 @@ class ReleaseDialog(QDialog):
 
         self.setWindowTitle("版本管理")
         self.setModal(True)
-        self.resize(1000, 760)
+        self.resize(theme.px(1000), theme.px(760))
         self._build_ui()
         self._refresh_current()
         self.reload()
@@ -162,7 +162,7 @@ class ReleaseDialog(QDialog):
 
         self.cmb_kind = QComboBox()
         self.cmb_kind.addItem("全部类型")
-        self.cmb_kind.setMinimumWidth(120)
+        self.cmb_kind.setMinimumWidth(theme.px(120))
         self.cmb_kind.currentIndexChanged.connect(self.on_filter_changed)
         filters.addWidget(self.cmb_kind)
 

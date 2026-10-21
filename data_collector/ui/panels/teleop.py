@@ -100,7 +100,7 @@ class TeleopMixin:
     def _enter_teleop_starting_mode(self):
         """启动中：按钮变“停止遥操作”，显示不确定进度条。"""
         self._set_teleop_button("停止遥操作", self.on_stop_teleop, variant="danger")
-        self.teleop_status_label.setText("遥操作启动中…")
+        self.teleop_status_label.setText("遥操作 启动中…")
         theme.set_state(self.teleop_status_label, "warn")
         self.teleop_progress_bar.show()
 
@@ -113,7 +113,7 @@ class TeleopMixin:
         self.teleop_startup_timer.stop()
         self.teleop_progress_bar.hide()
         self._set_teleop_button("停止遥操作", self.on_stop_teleop, variant="danger")
-        self.teleop_status_label.setText(f"遥操作运行中 {self._teleop_elapsed_text()}{note}")
+        self.teleop_status_label.setText(f"遥操作 运行中 {self._teleop_elapsed_text()}{note}")
         theme.set_state(self.teleop_status_label, "ok")
 
     def _exit_teleop_mode(self, status="未启动"):
@@ -125,7 +125,9 @@ class TeleopMixin:
         self.teleop_startup_timer.stop()
         self.teleop_timer.stop()
         self.teleop_progress_bar.hide()
-        self.teleop_status_label.setText(status)
+        # `status` 只传状态词（未启动 / 已停止），名词在这里统一加 ——
+        # 否则退出遥操作后这一格只剩「已停止」，读不出是哪个东西停了。
+        self.teleop_status_label.setText(f"遥操作 {status}")
         theme.set_state(self.teleop_status_label, "none")
         self._set_teleop_button(f"遥操作 · {status}", self.on_teleop)
 
@@ -138,7 +140,7 @@ class TeleopMixin:
         """每秒刷新运行时长（与录制状态标签风格一致）。"""
         self.teleop_seconds += 1
         if self.teleop_running:
-            self.teleop_status_label.setText(f"遥操作运行中 {self._teleop_elapsed_text()}")
+            self.teleop_status_label.setText(f"遥操作 运行中 {self._teleop_elapsed_text()}")
 
     @guard_slot
     def on_teleop_started(self):
@@ -162,7 +164,7 @@ class TeleopMixin:
             return
         self.teleop_stopped_by_user = True
         self.append("正在停止遥操作…")
-        self.teleop_status_label.setText("遥操作停止中…")
+        self.teleop_status_label.setText("遥操作 停止中…")
         theme.set_state(self.teleop_status_label, "warn")
         self.btn_teleop.setEnabled(False)
         try:

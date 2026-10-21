@@ -55,7 +55,7 @@ class PostureCardsMixin:
         # 那里才是"这个状态决定我能不能点"的地方。
         self.monitor_badge = badge("监控 —")
         self.mode_badge = badge("非实时模式 —")
-        self.estop_badge = badge("急停 —")
+        self.estop_badge = badge("急停 未知")
         for widget in (self.monitor_badge, self.mode_badge, self.estop_badge):
             head_row.addWidget(widget)
 

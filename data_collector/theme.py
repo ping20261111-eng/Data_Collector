@@ -165,6 +165,24 @@ def configure_scale(scale: float) -> None:
         {k: max(1, round(v * SCALE)) for k, v in _BASE_CONTROL_HEIGHT.items()})
 
 
+def px(value: int) -> int:
+    """把**按 1.0 设计稿写的像素**换算成当前缩放下的像素（v6.7.1）。
+
+    ## 为什么需要它（现场 2026-10-21：「很多界面文字显示不全」）
+
+    `configure_scale()` 只放大了**字号与控件高度令牌**，而窗口最小宽度、固定列宽
+    仍然是写死的 860 / 26 / 12。1920 宽的屏上 `scale_for_screen()` 给 1.33：
+    字号大 33%，窗口却还是 860 —— 姿势页三列 20 行的「目标角度」输入被压到 0，
+    查看数据的 6 个按钮每个少 23px，夹爪的力矩框少一半。
+
+    所以**凡是"按设计稿量出来的横竖尺寸"都要过这里**；装饰性的 1px 分隔线、
+    12px 箭头这类不承载文字的（下面 `scaled()` 也在用的）可以自己决定要不要跟。
+
+    用例在 1.0 缩放上跑（未配置缩放），值不变 —— 既有尺寸守卫不受影响。
+    """
+    return max(1, round(value * SCALE))
+
+
 def ui_scale() -> float:
     """当前缩放系数（自绘/定高控件用它算自己的尺寸，见 `posture_widgets`）。"""
     return SCALE

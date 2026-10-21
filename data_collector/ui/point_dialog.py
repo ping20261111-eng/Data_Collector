@@ -237,7 +237,7 @@ class PointDialog(QDialog):
         self.reload_labels()
         self._refresh_records()
         self._refresh_where()
-        self.resize(496, self._preferred_height())
+        self.resize(theme.px(496), self._preferred_height())
 
     # ---------- 界面 ----------
     def _build_ui(self):
@@ -460,7 +460,7 @@ class PointDialog(QDialog):
     def _field_label(text: str) -> QLabel:
         label = QLabel(text)
         label.setObjectName("FieldLabel")
-        label.setFixedWidth(FIELD_LABEL_W)
+        label.setFixedWidth(theme.px(FIELD_LABEL_W))
         return label
 
     # ---------- 网格排版 ----------
@@ -917,7 +917,7 @@ class PointEditDialog(QDialog):
 
         self.setWindowTitle(f"修改打点 #{self.index}")
         self.setModal(True)
-        self.resize(460, 220)
+        self.resize(theme.px(460), theme.px(220))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP["sp4"], SP["sp4"], SP["sp4"], SP["sp4"])
@@ -936,7 +936,7 @@ class PointEditDialog(QDialog):
         row.setSpacing(SP["sp2"])
         label = QLabel("标签")
         label.setObjectName("FieldLabel")
-        label.setFixedWidth(FIELD_LABEL_W)
+        label.setFixedWidth(theme.px(FIELD_LABEL_W))
         row.addWidget(label)
         self.edit_label = QLineEdit(record.label)
         self.edit_label.returnPressed.connect(self.on_save)
@@ -947,7 +947,7 @@ class PointEditDialog(QDialog):
         note_row.setSpacing(SP["sp2"])
         note = QLabel("备注")
         note.setObjectName("FieldLabel")
-        note.setFixedWidth(FIELD_LABEL_W)
+        note.setFixedWidth(theme.px(FIELD_LABEL_W))
         note_row.addWidget(note)
         self.edit_note = QLineEdit(record.note)
         self.edit_note.returnPressed.connect(self.on_save)

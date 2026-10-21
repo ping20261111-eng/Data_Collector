@@ -466,7 +466,7 @@ class ExportTargetMixin(RemoteCredentialMixin):
     #:
     #: 异常态的文案更长（「✖ 该路径不是已挂载的设备目录（…）」单行要 444px），
     #: 那种情况**保持折行**——为了它把面板撑到 550px 宽并不划算。
-    PANEL_MIN_WIDTH = 380
+    PANEL_MIN_WIDTH = 380        # 设计稿像素；用的时候过 `theme.px()`
 
     #: 面板投影：外层留白 / 模糊半径 / 向下偏移 / 颜色（rgba）。
     #: 留白是必需的 —— 顶层窗口画不出自己 rect 之外，不留就被裁掉。

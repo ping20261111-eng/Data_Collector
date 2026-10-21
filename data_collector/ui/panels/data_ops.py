@@ -50,7 +50,7 @@ class DataOpsMixin:
         self.record_seconds += 1
         minutes = self.record_seconds // 60
         seconds = self.record_seconds % 60
-        self.record_status_label.setText(f"录制中 {minutes:02d}:{seconds:02d}")
+        self.record_status_label.setText(f"录制 进行中 {minutes:02d}:{seconds:02d}")
 
         # 看门狗：录制期间每秒确认数据确实在落盘。"进程还在"不等于"在录"——
         # 话题无数据、ROS 环境不完整、磁盘满都会让脚本空转或直接退出，那种情况下
@@ -67,7 +67,7 @@ class DataOpsMixin:
         # "要不要为同一件事再说一句"只是**话术**（可以有节制）。
         if not health["alive"]:
             self.record_timer.stop()
-            self.record_status_label.setText("录制已中断")
+            self.record_status_label.setText("录制 已中断")
             theme.set_state(self.record_status_label, "none")
             self._finish_points()
             self._set_record_button("idle")
@@ -167,7 +167,7 @@ class DataOpsMixin:
                 f"desc={settings['desc']}（任务标签 {tag} 已并入 desc）"
             )
             self.record_seconds = 0
-            self.record_status_label.setText("录制中 00:00")
+            self.record_status_label.setText("录制 进行中 00:00")
             theme.set_state(self.record_status_label, "danger")
             self.record_timer.start(1000)
             self.record_start_time = time.time()
@@ -267,7 +267,7 @@ class DataOpsMixin:
         if self.recorder.stop():
             self.append("录制已停止")
             self.record_timer.stop()
-            self.record_status_label.setText("已停止")
+            self.record_status_label.setText("录制 已停止")
             theme.set_state(self.record_status_label, "none")
             self._finish_points()
             self._set_record_button("idle")
@@ -290,7 +290,7 @@ class DataOpsMixin:
             # 进程自己没了，但这次录制确实开过：收尾打点、复位按钮，如实说明
             self.append("录制进程已自行退出，正在收尾")
             self.record_timer.stop()
-            self.record_status_label.setText("已停止")
+            self.record_status_label.setText("录制 已停止")
             theme.set_state(self.record_status_label, "none")
             self._finish_points()
             self._set_record_button("idle")

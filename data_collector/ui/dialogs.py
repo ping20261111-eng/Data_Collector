@@ -152,7 +152,7 @@ class TeleopDialog(QDialog):
         row.addWidget(self.btn_ok)
         layout.addLayout(row)
 
-        self.setMinimumWidth(self.MIN_WIDTH)
+        self.setMinimumWidth(theme.px(self.MIN_WIDTH))
         # 空着就没有可确定的东西：把"点确定 → 弹一句用户名不能为空"这条路直接关掉。
         # 输入后按钮才亮 —— 现场不必先撞一次错误框才知道要填。
         self.combo.editTextChanged.connect(self._sync_ok_enabled)
@@ -223,7 +223,7 @@ class CalibrationDialog(QDialog):
         row.addWidget(self.btn_ok)
         layout.addLayout(row)
 
-        self.setMinimumWidth(340)
+        self.setMinimumWidth(theme.px(340))
         self.combo.setFocus()
         # 兼容旧调用方（历史上这个属性叫 edit）
         self.edit = self.combo
@@ -264,7 +264,7 @@ class BagPickerDialog(QDialog):
         self.setModal(True)
         self.uploader = uploader
         self.root = Path(root) if root is not None else None
-        self.setMinimumWidth(self.MIN_WIDTH)
+        self.setMinimumWidth(theme.px(self.MIN_WIDTH))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP["sp4"], SP["sp4"], SP["sp4"], SP["sp4"])
@@ -521,7 +521,7 @@ class RecordDialog(QDialog):
         hbox.addWidget(cancel)
         hbox.addWidget(ok)
         layout.addLayout(hbox)
-        self.setMinimumWidth(self.MIN_WIDTH)
+        self.setMinimumWidth(theme.px(self.MIN_WIDTH))
 
     # ---------- 保存位置（本机数据盘 / 移动硬盘） ----------
 
@@ -744,7 +744,7 @@ class ActionLabelDialog(QDialog):
         self._copy = _LABEL_KIND_COPY.get(kind, _LABEL_KIND_COPY["采集任务"])
         self.setWindowTitle(f"管理{kind}")
         self.setModal(True)
-        self.resize(480, 470)
+        self.resize(theme.px(480), theme.px(470))
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(SP["sp4"], SP["sp4"], SP["sp4"], SP["sp4"])

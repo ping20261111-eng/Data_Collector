@@ -229,7 +229,7 @@ class PostureDialog(PostureModulesMixin, PostureCardsMixin, QDialog):
         layout.addWidget(self._build_result_card())
         layout.addLayout(self._build_button_row())
 
-        self.setMinimumWidth(self.MIN_WIDTH)
+        self.setMinimumWidth(theme.px(self.MIN_WIDTH))
         #: 是否已经按屏幕高度收过一次（只在首次显示时收 —— 用户手动拖过大小之后不该再动它）
         self._screen_fitted = False
         self.progress_line.connect(self._report)
@@ -333,7 +333,7 @@ class PostureDialog(PostureModulesMixin, PostureCardsMixin, QDialog):
             self.estop_badge.setText("急停 未触发")
             theme.set_state(self.estop_badge, "ok")
         else:
-            self.estop_badge.setText("急停 —")
+            self.estop_badge.setText("急停 未知")
             theme.set_state(self.estop_badge, "none")
 
         self.preset_card_tip()

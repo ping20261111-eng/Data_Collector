@@ -214,7 +214,7 @@ class GripperDialog(QDialog):
         row.addWidget(self.btn_close)
         layout.addLayout(row)
 
-        self.setMinimumWidth(self.MIN_WIDTH)
+        self.setMinimumWidth(theme.px(self.MIN_WIDTH))
         #: 是否已经按屏幕高度收过一次（只做一次；用户手动拖过大小之后不该再动它）
         self._screen_fitted = False
         self._tail_timer = QTimer(self)

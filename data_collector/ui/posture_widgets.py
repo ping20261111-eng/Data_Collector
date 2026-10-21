@@ -254,7 +254,7 @@ class AxisRow(QFrame):
 
         name = QLabel(self.key)
         name.setObjectName("AxisName")
-        name.setFixedWidth(26)
+        name.setFixedWidth(scaled(26))       # 轴名两三个字符，字号一放大就得跟着放
         name.setToolTip(f"{self.key}（{self.hint}），量程 {self.low:g}~{self.high:g}°")
         line.addWidget(name)
         # 富余宽度**分成对称的两段**（v6.3.2，现场截图里轴名右侧那块空白太大）：
@@ -280,7 +280,7 @@ class AxisRow(QFrame):
 
         arrow = QLabel("→")
         arrow.setObjectName("AxisUnit")
-        arrow.setFixedWidth(12)
+        arrow.setFixedWidth(scaled(12))
         arrow.setAlignment(Qt.AlignCenter)
         line.addWidget(arrow)
 

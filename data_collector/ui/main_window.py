@@ -139,7 +139,9 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         self.setGeometry(100, 100, 940, 860)
         # 最小宽度按"参数行 + 急停柱"的实际下限定：再窄下去布局只能裁字，
         # 所以这里拦住，而不是让用户缩到一个读不出参数的大小。
-        self.setMinimumSize(860, 660)
+        # 最短宽高按设计稿给，**必须过 px()**：1080P 上缩放 1.33，写死 860 会让
+        # 工具行与日志区挤在一起（文字被裁）。
+        self.setMinimumSize(theme.px(860), theme.px(660))
 
         #: F11 切换全屏（与「机器人控制 ▾」→「全屏显示」共用同一处实现）。
         #: 快捷键挂在窗口上，默认是 `Qt.WindowShortcut` 作用域 —— 子对话框拿到焦点时

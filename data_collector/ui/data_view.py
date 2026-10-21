@@ -48,8 +48,11 @@ class DataViewDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("查看数据")
         self.setModal(False)
-        self.resize(1040, 620)
-        self.setMinimumSize(780, 460)
+        # 宽度的下限定在**内容最小需要的宽度之上**：1.0 缩放下这一页的内容最小是
+        # 1049（左右两列各 432 + 间距），原来给 1040 —— 差 9px，Qt 就把「上传选中」
+        # 这类按钮各挤掉 4px（文字贴边）。留出余量，别让"刚好差一点"变成默认状态。
+        self.resize(theme.px(1100), theme.px(620))
+        self.setMinimumSize(theme.px(1060), theme.px(470))
         self.uploader = uploader
         self.log_fetcher = log_fetcher
         self.fetch_dir = log_fetcher.fetch_dir

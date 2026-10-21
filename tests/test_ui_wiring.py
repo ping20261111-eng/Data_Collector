@@ -427,7 +427,7 @@ def test_teleop_launch_echoes_script_log_and_shows_startup_progress(ui_env, qapp
 
     assert _pump_until(qapp, lambda: "process started" in win.log.toPlainText())
     assert _pump_until(qapp, lambda: win.teleop_progress_bar.isHidden())
-    assert "遥操作运行中" in win.teleop_status_label.text()
+    assert "遥操作 运行中" in win.teleop_status_label.text()
     assert "\x1b[" not in win.log.toPlainText()        # ANSI 颜色码已清理
 
     # 点“停止遥操作”：调用 TeleopManager.stop_teleop，进程退出后按钮复原
@@ -440,7 +440,8 @@ def test_teleop_launch_echoes_script_log_and_shows_startup_progress(ui_env, qapp
     proc.returncode = -2                               # 被 SIGINT 终止
     assert _pump_until(qapp, lambda: win.btn_teleop.text() == "遥操作 · 已停止")
     assert win.teleop_running is False
-    assert win.teleop_status_label.text() == "已停止"
+    # 状态词必须带名词：只写「已停止」读不出是哪个东西停了
+    assert win.teleop_status_label.text() == "遥操作 已停止"
     assert win.teleop_progress_bar.isHidden()
     assert "遥操作已停止" in win.log.toPlainText()
 
@@ -492,7 +493,7 @@ def test_main_window_adopts_teleop_from_previous_session(ui_env, qapp):
         try:
             assert reopened.teleop_running is True
             assert reopened.btn_teleop.text() == "停止遥操作"
-            assert "遥操作运行中" in reopened.teleop_status_label.text()
+            assert "遥操作 运行中" in reopened.teleop_status_label.text()
             assert reopened.teleop_seconds >= 89      # 按 started_at 恢复计时
             assert "仍在运行" in reopened.log.toPlainText()
             assert _pump_until(
@@ -4159,7 +4160,8 @@ def test_stop_teleop_with_nothing_left_resets_the_ui(ui_env, qapp):
 
     assert win.teleop_running is False
     assert win.btn_teleop.text() == "遥操作 · 未启动"
-    assert win.teleop_status_label.text() == "未启动"
+    # 状态词带名词（v6.7.1）：空态也不能只剩「未启动」
+    assert win.teleop_status_label.text() == "遥操作 未启动"
     assert "已经不在了" in win.log.toPlainText()
 
 
@@ -6334,6 +6336,58 @@ def test_batch_verify_is_wired_in_the_data_view(status_env):
     assert "self.btn_verify_selected.setText(\"批量验证\")" in finished, "收尾要复原按钮"
     assert "QMessageBox.information" in finished and "QMessageBox.warning" in finished, \
         "收尾只弹一次汇总（成功/有失败两种）"
+
+
+def test_window_sizes_are_scaled_with_theme_px():
+    """窗口尺寸/固定列宽必须走 `theme.px()`（v6.7.1，文字显示不全的根因）。
+
+    为什么钉源码：`configure_scale()` 只放大字号，写死的 860 / 26 / 12 不跟 ——
+    1080P 上（1.33）于是"字大了、格子没大"，姿势页每行的目标角度输入被压成一条缝。
+    这类缺陷只有"每个尺寸都过 px()"才能根治，而**漏一处就复发**，所以用源码判据。
+
+    这条不实例化窗口：要验的是"写法"，不是"某个页面现在长什么样"。
+    """
+    import inspect
+    import re
+
+    from data_collector.ui import data_view, dialogs, end_effector, gripper, point_dialog
+    from data_collector.ui import posture, release_dialog
+    from data_collector.ui import main_window
+
+    sources = {
+        "main_window": inspect.getsource(main_window),
+        "posture": inspect.getsource(posture),
+        "gripper": inspect.getsource(gripper),
+        "end_effector": inspect.getsource(end_effector),
+        "data_view": inspect.getsource(data_view),
+        "dialogs": inspect.getsource(dialogs),
+        "point_dialog": inspect.getsource(point_dialog),
+        "release_dialog": inspect.getsource(release_dialog),
+    }
+    # 裸数字的尺寸调用 → 一定不跟缩放
+    bare = re.compile(r"(setMinimumSize|setMinimumWidth|resize)\(\s*\d")
+    offenders = [name for name, src in sources.items() if bare.search(src)]
+    assert not offenders, f"这些文件里还有写死的窗口尺寸：{offenders}"
+    # 每个文件至少有一处 px()（防止"整段删掉"也算通过）
+    for name in ("main_window", "posture", "gripper", "end_effector", "data_view"):
+        assert "theme.px(" in sources[name], f"{name} 没有用 theme.px() 换算尺寸"
+
+
+def test_status_texts_carry_their_subject(status_env):
+    """状态词必须带主语：`遥操作 未启动` / `录制 未开始`（v6.7.1）。
+
+    现场看到的是「遥操作 未启动   未录制」—— 后一格没有主语；而退出遥操作之后
+    那一格又只剩「已停止」，读不出是哪个东西停了。所以判据是**前缀恒为名词**。
+    """
+    win, _config, _status = status_env
+
+    assert win.teleop_status_label.text().startswith("遥操作 "), win.teleop_status_label.text()
+    assert win.record_status_label.text().startswith("录制 "), win.record_status_label.text()
+
+    # 退出遥操作：状态词换成"已停止"，名词不能丢
+    win.on_teleop_exit("已停止") if hasattr(win, "on_teleop_exit") else None
+    text = win.teleop_status_label.text()
+    assert text.startswith("遥操作 "), f"退出后也要带名词：{text!r}"
 
 
 def test_record_dialog_prefills_the_last_choices(status_env, tmp_path):

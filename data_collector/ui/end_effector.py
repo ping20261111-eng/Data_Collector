@@ -104,7 +104,7 @@ class EndEffectorDialog(QDialog):
         layout.addWidget(self._build_result_card())
         layout.addLayout(self._build_button_row())
 
-        self.setMinimumWidth(self.MIN_WIDTH)
+        self.setMinimumWidth(theme.px(self.MIN_WIDTH))
         #: 是否已经按屏幕高度收过一次（只做一次；用户手动拖过大小之后不该再动它）
         self._screen_fitted = False
         self.refresh()
@@ -139,7 +139,7 @@ class EndEffectorDialog(QDialog):
         row.addWidget(field_label("末端类型"))
         self.type_combo = QComboBox()
         self.type_combo.setInsertPolicy(QComboBox.NoInsert)
-        self.type_combo.setMinimumWidth(190)
+        self.type_combo.setMinimumWidth(theme.px(190))
         for section in END_EFFECTOR_SECTIONS:
             self.type_combo.addItem(end_effector_label(section), section)
             if section not in END_EFFECTOR_EDITABLE:
@@ -188,7 +188,7 @@ class EndEffectorDialog(QDialog):
         for cmd_index, cmd in enumerate(END_EFFECTOR_CMDS):
             label = QLabel(END_EFFECTOR_CMD_TEXT[cmd])
             label.setObjectName("Hint")
-            label.setFixedWidth(self.CMD_WIDTH)
+            label.setFixedWidth(theme.px(self.CMD_WIDTH))
             cmd_labels[cmd] = label
             spins = []
             for group_index in (0, 1):
@@ -200,13 +200,13 @@ class EndEffectorDialog(QDialog):
                 tag.setFont(theme.mono_font(theme.TYPE_SCALE["fs_micro"]))
                 # 用最小宽度而不是固定宽度：宇树的组名「速度 · 位置 · 力矩」比别的长，
                 # 定死 84px 会被裁成「速度 · 位置 ·」（截图里实测过）
-                tag.setMinimumWidth(self.GROUP_WIDTH)
+                tag.setMinimumWidth(theme.px(self.GROUP_WIDTH))
                 grid.addWidget(tag, row, 1)
                 tags[(cmd, group_index)] = tag
                 for offset in range(6):
                     spin = QSpinBox()
                     spin.setButtonSymbols(QAbstractSpinBox.NoButtons)
-                    spin.setFixedWidth(self.SLOT_WIDTH)
+                    spin.setFixedWidth(theme.px(self.SLOT_WIDTH))
                     spin.setRange(0, 1000)
                     spin.setAlignment(Qt.AlignCenter)
                     spin.valueChanged.connect(
@@ -218,7 +218,7 @@ class EndEffectorDialog(QDialog):
         unit = QLabel("")
         unit.setObjectName("Hint")
         unit.setFont(theme.mono_font(theme.TYPE_SCALE["fs_micro"]))
-        unit.setContentsMargins(self.CMD_WIDTH + SP["sp2"] + self.GROUP_WIDTH
+        unit.setContentsMargins(theme.px(self.CMD_WIDTH) + SP["sp2"] + theme.px(self.GROUP_WIDTH)
                                 + SP["sp2"], 0, 0, 0)
         self.unit_labels[side] = unit
         grid.setColumnStretch(8, 1)

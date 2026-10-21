@@ -1006,7 +1006,7 @@ class _RecordHarness(QWidget, DataOpsMixin):
         self.btn_record = QPushButton("数据录制")
         self.btn_point = QPushButton("打点")
         self.btn_point.setVisible(False)
-        self.record_status_label = QLabel("未录制")
+        self.record_status_label = QLabel("录制 未开始")
         self.record_timer = QTimer(self)
         self.record_seconds = 0
         self.record_start_time = None
@@ -1107,7 +1107,7 @@ def test_watchdog_resets_ui_even_after_warning_latched(qapp, point_env, monkeypa
                                       "message": "录制进程已退出"}
     harness.update_record_time()
 
-    assert harness.record_status_label.text() == "录制已中断"
+    assert harness.record_status_label.text() == "录制 已中断"
     assert harness.btn_record.text() == "数据录制"
     assert harness.record_timer.isActive() is False
     assert any("录制进程已退出" in m for m in harness.messages)
@@ -1206,7 +1206,7 @@ def test_watchdog_exit_message_carries_disk_reason(qapp, point_env):
                                       "message": "录制进程已退出"}
     harness.update_record_time()
 
-    assert harness.record_status_label.text() == "录制已中断"
+    assert harness.record_status_label.text() == "录制 已中断"
     assert any("录制盘已满" in m for m in harness.messages)
 
 

@@ -546,3 +546,37 @@ def test_the_default_scale_keeps_the_design_numbers(restore_scale):
     assert theme.CONTROL_HEIGHT == {"ch_main": 22, "ch_start": 26, "ch_input": 20}
     assert theme.TYPE_SCALE["fs_base"] == 14
     assert PresetCard.height_scaled() == PresetCard.HEIGHT, "预设卡基准高不该变"
+
+
+# ============ 缩放：设计稿像素 → 实际像素（v6.7.1） ============
+
+def test_px_follows_the_global_scale():
+    """`theme.px()` 必须跟着 `configure_scale()` 走，并在 1.0 时原样返回。
+
+    这是"1080P 上文字显示不全"那条缺陷的地基：字号放大 33% 而窗口宽度不动，
+    文字就没地方放。所有"按设计稿量出来的尺寸"都要经过它。
+    """
+    from data_collector import theme
+
+    try:
+        theme.configure_scale(1.0)
+        assert theme.px(860) == 860, "1.0 缩放下必须原样返回（既有尺寸守卫靠这个）"
+        theme.configure_scale(1.33)
+        assert theme.px(860) == round(860 * 1.33), theme.px(860)
+        assert theme.px(26) > 26, "小尺寸也要跟着放大，否则轴名会被裁"
+        theme.configure_scale(1.5)
+        assert theme.px(1000) == 1500
+        # 下限：任何值都不为 0（0 宽控件在布局里等于没放）
+        theme.configure_scale(1.0)
+        assert theme.px(0) >= 1
+    finally:
+        theme.configure_scale(1.0)
+
+
+def test_scale_for_screen_matches_the_field_machine():
+    """1920 宽的屏 → 1.33（现场 1080P 就是这么放大的）。"""
+    from data_collector import theme
+
+    assert theme.scale_for_screen(1440) == 1.0
+    assert abs(theme.scale_for_screen(1920) - 1.33) < 0.01
+    assert theme.scale_for_screen(3840) == 1.5, "4K 封顶 1.5（再大版面会散架）"

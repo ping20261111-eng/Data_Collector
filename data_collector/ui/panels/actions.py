@@ -134,7 +134,9 @@ class ActionsMixin(ExportTargetMixin):
         self.teleop_status_label.setObjectName("FactValue")
         self.teleop_status_label.setFont(theme.mono_font(theme.TYPE_SCALE["fs_sm"]))
 
-        self.record_status_label = QLabel("未录制")
+        # 与「遥操作 未启动」同一套写法：**状态词前面必须有名词**，
+        # 否则这一行读起来是「遥操作 未启动   未录制」—— 后一个"未录制"没有主语。
+        self.record_status_label = QLabel("录制 未开始")
         self.record_status_label.setObjectName("FactValue")
         self.record_status_label.setFont(theme.mono_font(theme.TYPE_SCALE["fs_sm"]))
 
