@@ -6373,6 +6373,28 @@ def test_window_sizes_are_scaled_with_theme_px():
         assert "theme.px(" in sources[name], f"{name} 没有用 theme.px() 换算尺寸"
 
 
+def test_launch_parameter_checkboxes_are_touch_sized(status_env):
+    """4 个启动参数勾选框必须有 32px 高（v6.7.2，触摸屏「点了没反应」的根因之一）。
+
+    为什么单独钉它们：`QCheckBox` 的命中区**就是整个控件矩形**，而默认只有 18px 高。
+    实测这 4 个是 46~85 × 18 —— 指尖约 40px 宽，垂直偏 10px 就落到框外，
+    现场看到的就是「偶发点不中，再点一下才行」。
+
+    其余 32px 的按钮没有一刀切加高：姿势页 20 行 × 3 列的目标输入框只有 25px、
+    行高 27px，加高会把页面撑出 1080 屏幕。那一类靠 `ui/touch.py` 的抬手容错兜。
+    """
+    from data_collector import theme
+
+    win, _config, _status = status_env
+    boxes = (win.cb_joy, win.cb_rviz, win.cb_sim, win.cb_rgb_only)
+
+    for box in boxes:
+        assert box.minimumHeight() >= theme.px(32), (
+            f"{box.text()} 的触摸高度下限只有 {box.minimumHeight()}px")
+        assert box.height() >= theme.px(32), (
+            f"{box.text()} 实际高度只有 {box.height()}px（布局把它压回去了？）")
+
+
 def test_status_texts_carry_their_subject(status_env):
     """状态词必须带主语：`遥操作 未启动` / `录制 未开始`（v6.7.1）。
 

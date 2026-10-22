@@ -16,6 +16,14 @@ from ..threads import LocalTaskThread
 from .export_target import ExportTargetMixin
 
 
+#: 触摸屏上勾选框的最小高度（**设计稿像素**，运行时过 `theme.px()`）。
+#:
+#: 依据：默认 `QCheckBox` 只有 18px 高，而它的命中区就是整个控件矩形 ——
+#: 指尖约 40px 宽，垂直偏 10px 就落到框外。实测主窗口 4 个启动参数勾选框
+#: （joy / rviz / use_sim / rgb_only）全是 46~85 × **18**，也就是点得中才怪。
+#: 取 32（Android 的触摸目标下限）而不是 44：这一行还有微型标签，44 会让
+#: 「启动参数」这行比相邻行明显更松，视觉上不齐。
+TOUCH_BOX_HEIGHT = 32
 
 
 class ActionsMixin(ExportTargetMixin):
@@ -151,6 +159,12 @@ class ActionsMixin(ExportTargetMixin):
         for box in (self.cb_joy, self.cb_rviz, self.cb_sim, self.cb_rgb_only):
             # 勾选框固定为自身尺寸：宁可让窗口撑开，也不要把「rgb_only」裁成「rgb_o」
             box.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            # **触摸屏上这 4 个必须有 32px 高**（v6.7.2 实测）：默认只有 18px，
+            # 而 QCheckBox 的命中区就是整个控件矩形 —— 指尖（约 40px 宽）按上去，
+            # 垂直偏 10px 就落到框外，现场表现是「点了没反应、再点一下才行」。
+            # 32 是 Android 的最小触摸目标；这一行还有微型标签（18px），
+            # 加到 32 只会让这一行高 14px，主窗口操作区高度够，不会破版面。
+            box.setMinimumHeight(theme.px(TOUCH_BOX_HEIGHT))
             param_row.addWidget(box)
         param_row.addStretch()
         body.addLayout(param_row)

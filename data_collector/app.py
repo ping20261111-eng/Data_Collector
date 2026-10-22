@@ -15,6 +15,7 @@ from .core import ConfigManager, logger, PROJECT_ROOT
 from .core_operations import read_self_cgroup, runs_under_service
 from .ui import MainWindow
 from .ui.safety import append_note, install_excepthook, install_signal_handlers
+from .ui.touch import install_touch_taps
 
 WINDOW_TITLE = "NERV ROBOT ASSISTANT"
 
@@ -51,6 +52,10 @@ def main():
     # 兜底护栏：未捕获异常留堆栈（logs/ui_error.log），别让界面"静默退出"
     install_excepthook()
     _configure_ui_scale(app, cfg_mgr)
+    # 触摸屏点按容错（v6.7.2）：**必须在建窗之前装** —— 装的是 app 级过滤器，
+    # 之后创建的每个控件都自动享受；建窗之后再装也不晚，但先装省掉"为什么某个
+    # 早期控件不生效"这种迷惑。见 `ui/touch.py` 的说明（现场"偶发点不动"的根因）。
+    install_touch_taps(app)
     win = MainWindow(cfg_mgr)
     # 外部信号（systemctl stop / pkill / 会话结束）默认会**静默杀掉**进程，
     # 现场表现就是"界面忽然没了、日志一个字没有"。这里让它变成可留证据的干净退出。
