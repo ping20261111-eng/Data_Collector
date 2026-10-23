@@ -1075,8 +1075,11 @@ QGroupBox::title {
     color: ${muted};
 }
 
-/* ================= 日志控制台 ================= */
-QTextEdit#Console {
+/* ================= 日志控制台 =================
+   两个类名都列上：v6.7.4 把日志区从 QTextEdit 换成 QPlainTextEdit（内存封顶，
+   见 widgets.LogView 的说明）。只写 QTextEdit 的话换成 QPlainTextEdit 后
+   背景、等宽字体、内边距会一起失效 —— 界面看着像"样式没加载"。 */
+QTextEdit#Console, QPlainTextEdit#Console {
     background-color: ${surface};
     border: none;
     color: ${text};

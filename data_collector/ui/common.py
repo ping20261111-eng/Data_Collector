@@ -9,6 +9,7 @@ import subprocess
 from typing import Optional
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QCheckBox, QMessageBox, QTextEdit,
+                             QPlainTextEdit,
                              QGroupBox, QLabel, QDialog, QLineEdit, QComboBox,
                              QInputDialog, QListWidget, QListWidgetItem,
                              QAbstractItemView, QProgressBar, QFileDialog, QMenu,
@@ -463,16 +464,44 @@ def fit_console(console, min_rows: int = 3, max_rows: int = 9) -> int:
 
     按**文档实际高度**算而不是"块数 × 行高"：日志里有很长的行（工作空间路径、数组值），
     它们会自动折行，按块数估会算少、把内容裁掉。
+
+    ## 两种控件取高度的方法不一样（v6.7.4）
+
+    主日志区从 `QTextEdit` 换成了 `QPlainTextEdit`（见 `widgets.LogView`：前者加行数上限
+    也封不住内存）。而结果区（末端执行器 / 姿势页 / 夹爪）复用的是同一个 `LogView`，
+    它们的"高度跟着内容走"就落到了这里 —— 两种控件的文档布局**单位不同**：
+
+    | 控件 | `document.size().height()` 的含义 |
+    | --- | --- |
+    | `QTextEdit` | 像素（实测 3 行 = 68.0） |
+    | `QPlainTextEdit` | **块数**（实测 3 行 = 3.0）—— 照用会把内容算成 3px |
+
+    `QPlainTextEdit` 用的是 `QPlainTextDocumentLayout`，要逐块累加
+    `blockBoundingRect().height()` 才是像素，而且它**把长行折行也算进去了**
+    （实测 3 个长行 = 244px，30 个短行 = 604px）。结果区只有几十行，遍历成本可忽略。
     """
     width = max(1, console.viewport().width())
-    document = console.document()
-    document.setTextWidth(width)
     row = console.fontMetrics().lineSpacing()
     chrome = 2 * console.frameWidth() + 20          # 边框 + QSS 的 8px 上下内距 + 余量
     low, high = min_rows * row + chrome, max_rows * row + chrome
-    height = int(max(low, min(document.size().height() + chrome, high)))
+    height = int(max(low, min(_document_height(console, width) + chrome, high)))
     console.setFixedHeight(height)
     return height
+
+
+def _document_height(console, width: int) -> float:
+    """文档内容高度（像素）。两种控件取值方式不同，理由见 `fit_console` 的说明。"""
+    document = console.document()
+    if isinstance(console, QPlainTextEdit):
+        layout = document.documentLayout()
+        total = 0.0
+        block = document.begin()
+        while block.isValid():
+            total += layout.blockBoundingRect(block).height()
+            block = block.next()
+        return total
+    document.setTextWidth(width)      # QTextEdit 必须显式给宽度才能算折行
+    return document.size().height()
 
 
 #: 屏幕可用高度低于这个值就不再压缩：压到这个份上，内容已经挤得没法读，

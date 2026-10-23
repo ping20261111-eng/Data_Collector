@@ -3,7 +3,7 @@ import os
 import re
 import subprocess
 from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QPushButton, QCheckBox, QMessageBox, QTextEdit,
+                             QPushButton, QCheckBox, QMessageBox, QPlainTextEdit,
                              QGroupBox, QLabel, QDialog, QLineEdit, QComboBox,
                              QInputDialog, QListWidget, QListWidgetItem,
                              QAbstractItemView, QProgressBar, QFileDialog, QMenu,
@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt5.QtCore import (Qt, QThread, pyqtSignal, QTimer, QUrl, QPoint, QRect,
                           QRectF, QPointF)
 from PyQt5.QtGui import (QColor, QFont, QPainter, QPalette, QPen, QPolygon,
-                           QPolygonF)
+                           QPolygonF, QTextCursor)
 from PyQt5.Qt import QDesktopServices
 import time
 import traceback
@@ -98,12 +98,142 @@ class ClickableLabel(QLabel):
         super().mousePressEvent(event)
 
 
-class LogView(QTextEdit):
-    """只读日志区，额外支持点击其中的链接（用于"打开产物目录"这类快捷入口）。
+class LogView(QPlainTextEdit):
+    """只读日志区：封顶行数、支持可点击链接、以及「回到最新」。
 
-    QTextEdit 不像 QTextBrowser 会发 anchorClicked，所以自己处理按下事件：
-    命中锚点就交给系统默认程序打开，未命中则不拦截（保留正常选中/复制行为）。
+    ## 为什么是 `QPlainTextEdit` 而不是 `QTextEdit`（v6.7.4）
+
+    先按"在 `QTextEdit` 上加行数上限"做过一版，实测**封不住**：
+    自己 `QTextCursor.removeSelectedText()` 裁掉旧 block 之后，内存仍随**累计写入量**
+    线性涨 —— 3 万行 +18.8 MB、6 万行 +22.8 MB、12 万行 +34.9 MB
+    （`QTextDocument` 的 fragment / layout / 格式表不随删除回收）。
+    连 Qt 自己的 `setMaximumBlockCount` 在 `QTextEdit` 上也是 +32.5 MB。
+
+    `QPlainTextEdit` 是 Qt 为"大量纯文本"设计的容器，同一份实测（20 万行）：
+
+    | 上限 | 写 20 万行后的增量 |
+    | --- | --- |
+    | 5000 行 | **+8.8 MB（恒定，写 6 万行也是它）** |
+    | 20000 行 | +32.2 MB |
+    | 50000 行 | +71.8 MB |
+
+    也就是说：**上限一设，内存就封住了**，不再随写入量增长；而且快得多
+    （20 万行几秒 vs `QTextEdit` 6 万行两分钟）。
+
+    ## 三条行为都是 Qt 原生的，不用自己写
+
+    1. **追加不会把翻历史的视图拽走**：`appendPlainText()` 只在视图本来就在底部时
+       跟随（实测：翻到 value=99 再追加，value 才 99→101）。`QTextEdit.append()`
+       反而会 `ensureCursorVisible()` 把人拽回底部 —— 那正是现场抱怨的行为。
+    2. **裁剪时视图不跳**：停在中间时裁剪，视口首行不变（实测 `line 200` → `line 200`）。
+    3. **链接仍可点**：`anchorAt()` 在 `QPlainTextEdit` 上可用（实测返回
+       `file:///tmp`），`document().toHtml()` 也保留 `href`。
+
+    唯一要自己做的：追加时按 `Qt.mightBeRichText` 分流（`append_link()` 传的是 HTML），
+    以及那个「↓ 回到最新」的浮层按钮。
+
+    ## 上限为什么只留一档
+
+    上限 20000 会让内存常驻 32 MB，而收益只是"往上翻能看到更早的 1.5 万行"。
+    完整日志一直在磁盘上（遥操作那行会给文件名），界面只需要最近这一段 ——
+    所以固定 5000 行（≈8.8 MB），不做动态放宽。
     """
+
+    #: 保留的最大行数。`QPlainTextEdit` 原生裁剪，内存恒定 ≈8.8 MB（实测 20 万行）
+    MAX_BLOCKS = 5000
+    #: 判定"停在底部"的像素容差
+    AT_BOTTOM_EPS = 2
+    #: 浮层按钮距右下角的边距（设计稿像素，会过 theme.px）
+    JUMP_MARGIN = 12
+    #: 浮层按钮文案：箭头在前，一眼看出是"往下走"
+    JUMP_TEXT = "↓ 回到最新"
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        #: **撤销栈必须关掉**：只读控件默认仍记录撤销步骤（实测写 3 万行攒 14 万步），
+        #: 且被裁掉的文本仍被 undo 记录引用着，等于白占内存。日志区不需要撤销。
+        self.document().setUndoRedoEnabled(False)
+        self.setMaximumBlockCount(self.MAX_BLOCKS)
+        # 浮层按钮挂在 viewport 上：viewport 自己不滚（滚的是里面的内容），
+        # 所以贴右下角它就"浮"在日志上方，不会跟着内容跑。
+        self._jump_btn = QPushButton(self.JUMP_TEXT, self.viewport())
+        self._jump_btn.setProperty("variant", "primary")
+        self._jump_btn.setToolTip("跳到最新一条日志；新日志不会再把你从历史里拽走")
+        self._jump_btn.setMinimumHeight(theme.px(32))   # 触摸可点：短边 ≥32
+        self._jump_btn.clicked.connect(self.jump_to_latest)
+        self._jump_btn.hide()
+        self.verticalScrollBar().valueChanged.connect(self._on_scroll)
+
+    # ---------- 滚动 / 跟随 ----------
+
+    def is_at_bottom(self) -> bool:
+        """视图是否停在最新一条（容差内的像素差不算"翻走了"）。"""
+        bar = self.verticalScrollBar()
+        return bar.maximum() - bar.value() <= self.AT_BOTTOM_EPS
+
+    def _on_scroll(self, _value):
+        self._update_jump_button()
+
+    def jump_to_latest(self):
+        """滚到最新一条。滚到底之后 Qt 会自动恢复"跟随最新"。"""
+        bar = self.verticalScrollBar()
+        bar.setValue(bar.maximum())
+        self._update_jump_button()
+
+    # ---------- 追加 ----------
+
+    def append(self, text):
+        """追加一行：HTML（目录链接）走富文本，其余按纯文本插入。
+
+        `append_link()` 传的是 `<a href=...>`，而日志里也可能出现 `<workspace>`
+        这类尖括号 —— 用 `Qt.mightBeRichText` 分流（实测：链接 = True，
+        `读取 <workspace>/install 失败` = False），纯文本就不会被 HTML 解析吃掉。
+        """
+        if Qt.mightBeRichText(text):
+            self._append_rich(str(text))
+        else:
+            self.appendPlainText(str(text))
+        self._update_jump_button()
+
+    def _append_rich(self, html: str):
+        """追加一段富文本。优先用 `appendHtml`（Qt 5.14+），否则自己插到末尾。"""
+        append_html = getattr(self, "appendHtml", None)
+        if callable(append_html):
+            append_html(html)
+            return
+        cursor = QTextCursor(self.document())
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertBlock()
+        cursor.insertHtml(html)
+
+    def clear(self):
+        """清空（「清空」按钮走这里）：清完浮层按钮要跟着消失。"""
+        super().clear()
+        self._update_jump_button()
+
+    # ---------- 浮层按钮 ----------
+
+    def _update_jump_button(self):
+        bar = self.verticalScrollBar()
+        need = bar.maximum() > 0 and (bar.maximum() - bar.value() > self.AT_BOTTOM_EPS)
+        if not need:
+            self._jump_btn.hide()
+            return
+        self._jump_btn.adjustSize()
+        self._place_jump_button()
+        self._jump_btn.show()
+        self._jump_btn.raise_()      # 日志重绘后要重新压在最上层
+
+    def _place_jump_button(self):
+        btn = self._jump_btn
+        viewport = self.viewport()
+        margin = theme.px(self.JUMP_MARGIN)
+        btn.move(max(0, viewport.width() - btn.width() - margin),
+                 max(0, viewport.height() - btn.height() - margin))
+
+    def resizeEvent(self, event):        # noqa: N802 (Qt 命名)
+        super().resizeEvent(event)
+        self._place_jump_button()
 
     def mousePressEvent(self, event):
         anchor = self.anchorAt(event.pos())

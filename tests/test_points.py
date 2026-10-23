@@ -1043,8 +1043,14 @@ def _patch_record_dialog(monkeypatch, name="布草挂架", label="布草挂架")
     monkeypatch.setattr(module, "RecordDialog", FakeDialog)
 
 
-def test_point_entry_and_panel_appear_when_recording_starts(qapp, point_env, monkeypatch):
-    """起录后：入口按钮出现 + 面板自动弹出（现场 bug 的回归）。"""
+def test_point_entry_appears_but_panel_does_not_pop_up(qapp, point_env, monkeypatch):
+    """起录后：入口按钮出现，**但面板不自动弹出**（v6.7.4 现场要求）。
+
+    现场 2026-10-23：「打点功能不需要在开启遥操作之后主动弹出」。
+    原先起录就会 show 一个面板盖在界面上 —— 多数场次是先让机器人动起来、
+    只在需要时打几个点。这条同时钉住两件事：入口必须在（否则功能就没了），
+    面板必须不在（否则这次改动等于没做）。
+    """
     _patch_record_dialog(monkeypatch)
     config, _bag = point_env
     harness = _RecordHarness(config)
@@ -1053,10 +1059,24 @@ def test_point_entry_and_panel_appear_when_recording_starts(qapp, point_env, mon
 
     assert harness.point_recorder is not None
     assert not harness.btn_point.isHidden()                  # 入口出现
-    assert harness.point_panel is not None                   # 面板自动弹出
+    assert harness.point_panel is None, "起录不该自动弹出打点面板"
+    assert any("需要打点时点操作区的「打点」按钮" in message
+               for message in harness.messages)
+
+
+def test_point_panel_opens_only_from_the_entry_button(qapp, point_env, monkeypatch):
+    """入口按钮是**唯一**的打开途径：点它才弹，且弹出来的就是本场会话的面板。"""
+    _patch_record_dialog(monkeypatch)
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+    harness.on_record()
+    assert harness.point_panel is None
+
+    harness.on_point()
+
+    assert harness.point_panel is not None
     assert harness.point_panel.isVisible()
     assert harness.point_panel.recorder is harness.point_recorder
-    assert any("打点面板已弹出" in message for message in harness.messages)
     harness.point_panel.close()
 
 
@@ -1066,6 +1086,7 @@ def test_panel_closes_and_entry_hides_when_recording_stops(qapp, point_env, monk
     config, _bag = point_env
     harness = _RecordHarness(config)
     harness.on_record()
+    harness.on_point()                    # 面板得先真的打开，才测得到"收尾会关掉它"
     assert harness.point_panel is not None
 
     harness.on_stop_record()
@@ -1093,7 +1114,7 @@ def test_watchdog_resets_ui_even_after_warning_latched(qapp, point_env, monkeypa
 
     harness.on_record()                               # 正常起录
     assert harness.btn_record.text() == "停止录制"
-    harness.point_panel.close()
+    harness._close_point_panel()          # 幂等：起录不再自动建面板，这里可能本来就是 None
 
     # 第 1 秒：进程还在，但没有新文件落盘（磁盘满的典型表现）→ 报一次
     harness.recorder.health_result = {"alive": True, "producing": False,
@@ -1140,7 +1161,7 @@ def test_watchdog_resets_latch_when_recording_restarts(qapp, point_env, monkeypa
 
     harness.on_record()
     assert harness._record_health_warned is False
-    harness.point_panel.close()
+    harness._close_point_panel()          # 幂等（v6.7.4 起录不再自动建面板）
 
 
 def test_record_toggle_dispatches_to_stop_when_session_remains(qapp, point_env, monkeypatch):
@@ -1216,6 +1237,7 @@ def test_entry_reopens_the_same_panel_with_count_intact(qapp, point_env, monkeyp
     config, _bag = point_env
     harness = _RecordHarness(config)
     harness.on_record()
+    harness.on_point()
     panel = harness.point_panel
 
     _pick_label(panel, "开始任务")
@@ -1237,6 +1259,7 @@ def test_stale_panel_is_replaced_when_the_session_changes(qapp, point_env, monke
     config, _bag = point_env
     harness = _RecordHarness(config)
     harness.on_record()
+    harness.on_point()
     stale = harness.point_panel
 
     harness.point_recorder = PointRecorder(config.get_bag_dir(), "另一场",

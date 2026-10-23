@@ -185,11 +185,11 @@ class DataOpsMixin:
                 started_at=self.recorder.started_at,
                 task=settings["label"])
             self._set_record_button("recording")
-            # 自动弹出打点面板（现场要求）：录制一开始手是忙的，等回过头再去操作区找
-            # 「打点」按钮，要标的那一刻早就过去了。原来的模态提示框在这里一并去掉 ——
-            # 它会挡在面板前面白要一次点击，而录制已启动这件事按钮、状态行和日志都在说
-            self._show_point_panel()
-            self.append("录制已后台启动；打点面板已弹出（点标签即以那一刻记一个点）")
+            # **不自动弹出打点面板**（现场 2026-10-23）：「打点功能不需要在开启遥操作
+            # 之后主动弹出」。原先这里会自动 show 一个面板，起录后立刻盖在界面上 ——
+            # 而多数场次是先看机器人动起来、只在需要时才打几个点。入口仍然保留：
+            # 操作区的「打点 (N)」按钮（`_sync_point_button` 保证录制中可见）。
+            self.append("录制已后台启动；需要打点时点操作区的「打点」按钮")
         else:
             # 带上具体原因与归属：脚本秒退时"请检查配置"这种话对现场毫无帮助，
             # 而"这是机器人侧的问题"能立刻把排查方向指对
@@ -320,10 +320,12 @@ class DataOpsMixin:
     # ---------- 打点面板 ----------
     @guard_slot
     def on_point(self):
-        """操作区的「打点」按钮：打开/前置打点面板。
+        """操作区的「打点」按钮：**唯一的**打开入口（v6.7.4 起不再自动弹出）。
 
-        面板在录制开始时已自动弹出（`_show_point_panel`），这个按钮是"收起之后
-        再打开"的入口 —— 能自己找到入口这件事仍然要保证，不能只靠自动弹。
+        现场 2026-10-23：「打点功能不需要在开启遥操作之后主动弹出」。
+        起录时自动 show 一个面板会盖住界面，而多数场次是先让机器人动起来、
+        只在需要时打几个点 —— 所以改成按需打开：录制中这个按钮一直可见，
+        并带上本次已打的点数（`_sync_point_button`）。
         """
         recorder = getattr(self, "point_recorder", None)
         if recorder is None or not self.recorder.is_active():
@@ -337,7 +339,10 @@ class DataOpsMixin:
         self._show_point_panel()
 
     def _show_point_panel(self):
-        """建（首次）并前置打点面板。面板非模态，绝不挡住「停止录制」与急停。"""
+        """建（首次）并前置打点面板。面板非模态，绝不挡住「停止录制」与急停。
+
+        只在用户点「打点」时调用 —— 起录时不再自动调用（v6.7.4）。
+        """
         recorder = getattr(self, "point_recorder", None)
         if recorder is None:
             return
