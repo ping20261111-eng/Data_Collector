@@ -2587,8 +2587,14 @@ def test_startup_doctor_logs_pass(ui_env, monkeypatch):
     assert "启动自检通过" in win.log.toPlainText()
 
 
-def test_startup_doctor_lists_problems_and_warns_on_fail(ui_env, monkeypatch):
-    """有 fail 项：逐条写日志，并弹一次提示。"""
+def test_startup_doctor_lists_problems_and_never_pops_up(ui_env, monkeypatch):
+    """有 fail 项：逐条写日志 + 一条汇总，**但不弹模态框**（v6.7.3 改的行为）。
+
+    原来这里 fail 会 `QMessageBox.critical` 弹一次。现场 2026-10-23「第一次启动 UI
+    不显示」就是它造成的：它被叠在启动时另一个模态框（产品未配置的询问框）的嵌套
+    事件循环里，框不可见 → 界面出不来 → 强杀 → 段错误。
+    配置问题在日志区已经逐项列全，模态框只会挡住启动。
+    """
     from PyQt5.QtWidgets import QMessageBox
 
     win, _cm = ui_env
@@ -2596,16 +2602,17 @@ def test_startup_doctor_lists_problems_and_warns_on_fail(ui_env, monkeypatch):
         {"name": "工作空间", "ok": False, "level": "fail", "detail": "/bad"},
         {"name": "远端 SFTP 凭据", "ok": False, "level": "warn", "detail": "未配置"},
     ])
-    errors = []
     monkeypatch.setattr(QMessageBox, "critical",
-                        staticmethod(lambda *a, **k: errors.append(a)))
+                        staticmethod(lambda *a, **k: pytest.fail("fail 项也不许弹框")))
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: pytest.fail("fail 项也不许弹框")))
 
     win._run_startup_doctor()
 
     text = win.log.toPlainText()
     assert "[错误]" in text and "工作空间" in text
     assert "[提醒]" in text and "远端 SFTP 凭据" in text
-    assert len(errors) == 1          # 只有 fail 才弹
+    assert "必需配置有问题" in text, "要有那条一行汇总，现场一眼看到"
 
 
 def test_startup_doctor_warn_only_does_not_popup(ui_env, monkeypatch):
@@ -6371,6 +6378,88 @@ def test_window_sizes_are_scaled_with_theme_px():
     # 每个文件至少有一处 px()（防止"整段删掉"也算通过）
     for name in ("main_window", "posture", "gripper", "end_effector", "data_view"):
         assert "theme.px(" in sources[name], f"{name} 没有用 theme.px() 换算尺寸"
+
+
+def test_startup_doctor_never_opens_a_modal_dialog(status_env, monkeypatch):
+    """启动自检失败时**只写日志，不弹模态框**（v6.7.3，现场「第一次启动 UI 不显示」）。
+
+    现场时间线（2026-10-23）：启动 1.5s 后报「1 项必需配置有问题：工作空间」，
+    紧接着 shell 报段错误。1.5s 正是 `schedule_once(self, 1500, _run_startup_doctor)`
+    的定时器；而它失败时原来会 `show_error(...)`，也就是一个 `QMessageBox.critical`。
+
+    为什么弹框会把界面"吃掉"：`_maybe_setup_product`（0ms）先弹「产品未配置」的
+    询问框，它一 `exec_()` 就进了嵌套事件循环；1.5s 的定时器正好在这个循环里触发，
+    于是又叠一个 critical 框。实测（离屏）：`QMessageBox.critical` 一旦弹出就阻塞在
+    嵌套循环里，**没有代码能让它自己返回** —— 框若因显示环境不可见，用户看到的就是
+    「界面没出来」，随后强杀 → 段错误。
+
+    所以判据是"一个都不许弹"，而不是"弹的文案对不对"。
+    """
+    from pathlib import Path
+
+    win, config, _status = status_env
+    config.workspace = Path(config.workspace) / "does-not-exist"
+    assert not config.workspace.is_dir()
+
+    opened = []
+    monkeypatch.setattr(win, "show_error", lambda *a, **k: opened.append(("show_error", a)))
+    monkeypatch.setattr("data_collector.ui.panels.launch.QMessageBox.critical",
+                        lambda *a, **k: opened.append(("critical", a)))
+    monkeypatch.setattr("data_collector.ui.panels.launch.QMessageBox.question",
+                        lambda *a, **k: opened.append(("question", a)))
+
+    win._run_startup_doctor()
+
+    assert opened == [], f"启动自检不许弹任何模态框，实际：{opened}"
+    log = win.log.toPlainText()
+    assert "必需配置有问题" in log, f"要把问题写进日志区：{log[-300:]}"
+    assert "工作空间" in log
+    assert str(config.workspace) in log, "日志里要带上**具体路径**，现场才知道去改哪个"
+
+
+def test_product_prompt_is_skipped_when_the_workspace_is_missing(status_env, monkeypatch):
+    """工作空间不存在时，不弹「要不要跑产品向导」—— 向导用的就是工作空间里的东西。
+
+    这条同时是"首启不叠两个模态框"的一半：那个 question 框是第一个。
+    """
+    from pathlib import Path
+
+    win, config, _status = status_env
+    config.workspace = Path(config.workspace) / "does-not-exist"
+    # 显式置为"未配置"：夹具里的产品状态取决于候选路径，别让它影响这条断言
+    monkeypatch.setattr(config, "is_product_configured", lambda: False)
+
+    asked = []
+    monkeypatch.setattr("data_collector.ui.panels.launch.QMessageBox.question",
+                        lambda *a, **k: asked.append(a) or 0)
+    win._product_setup_prompted = False
+
+    win._maybe_setup_product()
+
+    assert asked == [], "工作空间不存在时不该问产品向导"
+    log = win.log.toPlainText()
+    assert "工作空间不存在" in log
+    assert "workspace_root" in log, "要直接告诉现场改哪个配置项"
+
+
+def test_product_prompt_still_appears_when_the_workspace_exists(status_env, monkeypatch):
+    """反面：工作空间正常且产品未配置 → **仍然要问一次**（别把正常路径也砍掉）。
+
+    这一条防的是"为了修首启崩，把产品向导入口整体删掉" —— 那样正常机器永远不会
+    被提示去配手型，属于修一个坏两个。
+    """
+    win, config, _status = status_env
+    assert config.workspace.is_dir()
+    monkeypatch.setattr(config, "is_product_configured", lambda: False)
+
+    asked = []
+    monkeypatch.setattr("data_collector.ui.panels.launch.QMessageBox.question",
+                        lambda *a, **k: asked.append(a) or 0)
+    win._product_setup_prompted = False
+
+    win._maybe_setup_product()
+
+    assert len(asked) == 1, f"工作空间存在时应当问一次产品向导：{asked}"
 
 
 def test_launch_parameter_checkboxes_are_touch_sized(status_env):

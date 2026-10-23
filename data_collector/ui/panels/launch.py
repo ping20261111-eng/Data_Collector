@@ -45,7 +45,25 @@ class LaunchMixin:
     def _run_startup_doctor(self):
         """启动自检：把配置/脚本问题在打开界面时就报出来，而不是等到点下去才失败。
 
-        只读探测，不阻塞启动；结果进日志区，存在 fail 项时额外弹一次提示。
+        只读探测，不阻塞启动；结果**只进日志区**。
+
+        ## 为什么不弹模态框（2026-10-23，现场「第一次启动 UI 不显示」）
+
+        原来这里失败时会 `show_error(...)`，也就是一个 `QMessageBox.critical`。
+        问题在于**它会被叠在另一个模态框的嵌套事件循环里**：
+
+        1. 启动时 `_maybe_setup_product`（0ms）先弹「产品未配置」的询问框；
+        2. 1.5s 后本自检触发 —— 此时上面那个框还开着，`exec_()` 的嵌套循环
+           正好在跑定时器；
+        3. 于是又弹一个 critical 框，**两个模态框叠加**。
+
+        实测（离屏）：`QMessageBox.critical` 一旦弹出就进入阻塞的嵌套循环，
+        没有代码能让它自己返回。如果那个框因为窗口管理器/显示环境的原因
+        不可见（现场是 GNOME Wayland 会话，Qt 走的是 XWayland），
+        用户看到的就是「界面没出来」，随后强杀 → shell 报段错误。
+
+        所以启动阶段**一个模态框都不弹**：配置问题在日志区逐项写清楚了
+        （`[错误] 工作空间：<路径>`），界面照常可用，改完配置点「启动程序」即可。
         """
         try:
             results = self.config.check_environment()
@@ -65,10 +83,15 @@ class LaunchMixin:
 
         failures = [r for r in problems if r["level"] == "fail"]
         if failures:
-            self.show_error(
-                "环境自检未通过",
-                f"{len(failures)} 项必需配置有问题（详见日志区）：\n    "
-                + "\n    ".join(r["name"] for r in failures))
+            # 汇总成**一行醒目日志**，不弹框（理由见 docstring）。
+            # 现场第一眼要能看出"是哪一项、怎么改"，所以把第一项的 detail 也带上。
+            names = "、".join(r["name"] for r in failures)
+            first = failures[0]
+            self.append(f"⚠ 必需配置有问题（{len(failures)} 项）：{names}"
+                        f" —— 界面可以用，但相关功能会失败")
+            self.append(f"    先看这一项：{first['name']} → {first['detail']}")
+            self.append("    改好 configs/app_config.yaml 后点「启动程序」重试，"
+                        "或重启本工具让自检重新跑一遍")
 
     @guard_slot
     def _maybe_setup_product(self):
@@ -82,6 +105,16 @@ class LaunchMixin:
         self._product_setup_prompted = True
 
         if self.config.is_product_configured():
+            return
+
+        # 工作空间都不存在时**不弹向导询问**（2026-10-23）：向导要读的就是工作空间里的
+        # 产品与脚本，路径都不对时问「要不要跑向导」只会多一个挡住首启的模态框。
+        # 这时真正要处理的是 workspace_root（启动自检会在日志区指出它）。
+        workspace = self.config.workspace
+        if not workspace.is_dir():
+            self.append(f"⚠ 产品未配置，但工作空间不存在：{workspace}")
+            self.append("    先把 configs/app_config.yaml 的 workspace_root 改成这台机器上的"
+                        "真实路径，再运行产品配置向导（setup_product.sh）")
             return
 
         ret = QMessageBox.question(
