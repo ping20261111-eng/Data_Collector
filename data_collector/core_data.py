@@ -1609,16 +1609,22 @@ class DataUploader:
         bytes_done = 0
         checksums = []
 
-        #: 进度信号的最小间隔（秒）。`copy_file` 每 4MB 回调一次，40GB 就是 1 万次
-        #: —— 每次都要跨线程 emit 一个信号、让主线程醒一次重绘进度条。这些唤醒
-        #: 不会让盘变快，只会让界面在和 IO 抢时间片。按时间节流后信号量与数据量
-        #: 脱钩：慢盘上每 100ms 一条，进度照样连续，唤醒次数降到 1/30。
+        #: 百分比信号的**最小间隔（秒）**。`copy_file` 每 4 MB 回调一次，40 GB 就是
+        #: 1 万次 —— 每次都跨线程 emit 一个信号、让主线程醒一次重绘进度条。这些唤醒
+        #: 不会让盘变快，只会让界面和 IO 抢时间片。按时间节流后信号量与数据量脱钩：
+        #: 慢盘上每 100 ms 一条，进度照样连续，唤醒次数降到约 1/30。
         PROGRESS_MIN_INTERVAL = 0.1
         last_emit = [0.0]
 
         def tick(count: int) -> None:
             nonlocal bytes_done
             bytes_done += count
+            # 文本进度（日志区）与百分比是**两条独立通道**，间隔也各自保持原值：
+            # 文本每 64 MB 一条。刻意不把这条塞进下面按时间节流的百分比分支里 ——
+            # 只在传了 progress_cb、没传 progress_percent 的调用方（手工脚本、
+            # 部分测试）会因此**一条进度都看不到**，而那条路本来是好用的。
+            if progress_cb and bytes_done % (64 * 1024 * 1024) < count:
+                progress_cb(f"正在复制到移动硬盘：{_human_size(bytes_done)}")
             if not progress_percent or not total_size:
                 return
             now = time.monotonic()
@@ -1628,8 +1634,6 @@ class DataUploader:
             last_emit[0] = now
             # 卡在 99：最后一个字节落盘并 rename 之后才算完（同 `write_stream`）
             progress_percent(percent)
-            if progress_cb and bytes_done % (256 * 1024 * 1024) < count:
-                progress_cb(f"正在复制到移动硬盘：{_human_size(bytes_done)}")
 
         # 上次被拔盘 / 被强杀留下的 `.partial` 先清掉：这些是**我们自己的**临时文件
         # （不是用户数据），留着既占空间，也让"盘上到底有什么"说不清。

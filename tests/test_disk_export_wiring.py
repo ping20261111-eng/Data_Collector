@@ -483,6 +483,88 @@ def test_verify_mode_off_writes_no_checksums(tmp_path, monkeypatch):
     assert readbacks == []
 
 
+@pytest.mark.parametrize("mode", ["off", "digest", "readback"])
+def test_media_bytes_are_identical_in_every_verify_mode(mode, tmp_path, monkeypatch):
+    """**三个档位落到盘上的字节必须完全一样**。
+
+    现场问"改成 digest 对数据有什么影响"，最直接的回答就是这条：档位只决定
+    "要不要多读一遍来核对"，**不参与写入**。所以无论是 off / digest / readback，
+    盘上每个文件的 SHA-256 都必须与源文件逐字节相同。
+
+    这条故意用多个文件 + 内含 \0 与随机字节的内容（不是 `b"x" * n`）：
+    全同字节的内容在"拷贝逻辑把块写串了"时也能碰巧一致，测不出真实差异。
+    """
+    import hashlib
+    import os as _os
+
+    mount = tmp_path / f"mnt_{mode}"
+    mount.mkdir()
+    (mount / ".nerv_volume").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr("os.path.ismount", lambda p: True)
+
+    folder = tmp_path / f"bag_{mode}"
+    folder.mkdir()
+    payloads = {
+        "a.mcap": _os.urandom(300_000),
+        "b.mcap": b"\x00" * 1000 + _os.urandom(50_000),
+        "metadata.yaml": b"rosbag2_bagfile_information: {}\n",
+    }
+    for name, data in payloads.items():
+        (folder / name).write_bytes(data)
+
+    up = _uploader(tmp_path,
+                   "export_target: disk\n"
+                   "disk_export:\n"
+                   f"  mount_point: {mount}\n"
+                   f"  verify_mode: {mode}\n")
+    assert up.upload_bag_folder(folder) is True
+
+    # 排除两类非数据文件：我们自己造的盘标识 `.nerv_volume`，以及摘要清单本身。
+    # （不加这层过滤会把标识文件也算成"落地的数据"，断言就变成数错个数。）
+    landed = sorted(p for p in mount.rglob("*")
+                    if p.is_file()
+                    and not p.name.startswith(".")
+                    and p.name != "SHA256SUMS")
+    assert len(landed) == len(payloads), [str(p) for p in landed]
+    for path in landed:
+        assert path.read_bytes() == payloads[path.name], (
+            f"{mode} 档写出的 {path.name} 与源文件不一致")
+        assert hashlib.sha256(path.read_bytes()).hexdigest() == \
+            hashlib.sha256(payloads[path.name]).hexdigest()
+
+
+def test_text_progress_survives_without_a_percentage_callback(tmp_path, monkeypatch):
+    """只传文本回调、不传百分比时，文本进度**还得有**（v6.8.1 修掉的一处退化）。
+
+    按时间给百分比节流时，很容易顺手把文本进度一起塞进那个分支的 `return` 后面 ——
+    于是"传了 progress_cb、没传 progress_percent"的调用方（手工脚本、外部集成）
+    一条进度都看不到。这两条通道是独立的：百分比按时间节流，文本按 64 MB 一条。
+
+    用 130 MB 稀疏文件造出至少两条文本进度，而不必真写 130 MB 的随机数据。
+    """
+    mount = tmp_path / "mnt_progress"
+    mount.mkdir()
+    (mount / ".nerv_volume").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr("os.path.ismount", lambda p: True)
+
+    folder = tmp_path / "bag_progress"
+    folder.mkdir()
+    big = folder / "big.mcap"
+    with open(big, "wb") as handle:
+        handle.truncate(130 * 1024 * 1024)          # 稀疏文件：读得快，不占实际块
+
+    up = _uploader(tmp_path,
+                   "export_target: disk\n"
+                   "disk_export:\n"
+                   f"  mount_point: {mount}\n"
+                   "  verify_mode: off\n")
+    messages = []
+    assert up.upload_bag_folder(folder, progress_cb=messages.append) is True
+
+    progress = [m for m in messages if "正在复制到移动硬盘" in m]
+    assert len(progress) >= 2, f"只传文本回调时丢了进度输出：{messages}"
+
+
 def test_second_export_skips_files_already_on_the_disk(tmp_path, monkeypatch):
     """同一份数据再导一次 → **不重复拷**，并在日志里如实报"跳过"（v6.7.0）。
 
