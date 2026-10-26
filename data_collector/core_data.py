@@ -1598,7 +1598,9 @@ class DataUploader:
 
         # 校验档位（`disk_export.verify_mode`）：
         #   off      = 只搬数据
-        #   digest   = 复制时顺带算 SHA-256 并写 `SHA256SUMS`，**不回读**（≈1× 耗时）
+        #   digest   = 复制时顺带算 SHA-256 并写 `SHA256SUMS`，**不回读**
+        #              耗时 ≈ off + 数据量/1784MB/s（实测 SHA-256 单核吞吐）：
+        #              100 MB/s 的盘上只多约 6%，400 MB/s 的盘上约 22%
         #   readback = 再回读整份比对（≈2× 耗时，移动硬盘的读和写是分别计费的）
         verify_mode = str(getattr(disk, "verify_mode", "") or "off")
         want_digest = verify_mode in ("digest", "readback")
@@ -1612,7 +1614,10 @@ class DataUploader:
         #: 百分比信号的**最小间隔（秒）**。`copy_file` 每 4 MB 回调一次，40 GB 就是
         #: 1 万次 —— 每次都跨线程 emit 一个信号、让主线程醒一次重绘进度条。这些唤醒
         #: 不会让盘变快，只会让界面和 IO 抢时间片。按时间节流后信号量与数据量脱钩：
-        #: 慢盘上每 100 ms 一条，进度照样连续，唤醒次数降到约 1/30。
+        #: 慢盘上每 100 ms 一条，进度照样连续。实际降幅取决于盘速：60 GB 在
+        #: 100 MB/s 的盘上从 1.5 万次降到 6 千次（2.5×），400 MB/s 降到 1.5 千次
+        #: （10×）；40 MB/s 以下回调本来就不足 10 Hz，等于没变。
+        #: 折成时间只占 0.1~0.5% —— 它不是提速手段，是去掉无谓唤醒。
         PROGRESS_MIN_INTERVAL = 0.1
         last_emit = [0.0]
 

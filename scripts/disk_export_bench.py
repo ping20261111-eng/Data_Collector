@@ -385,7 +385,7 @@ def main() -> int:
                       "复制时顺带算 SHA-256 并写 `SHA256SUMS`，不回读，速度回来一倍。")
     elif mode == "off":
         advice.append("③ 现在不做校验。若想留数据指纹（以后能 `sha256sum -c` 核对）"
-                      "又不牺牲速度，设 `disk_export.verify_mode: digest` —— 只多约 9% CPU，"
+                      "又不牺牲速度，设 `disk_export.verify_mode: digest` —— 只多算一遍摘要，"
                       "不额外读盘。")
     if write_mbps >= 150:
         advice.append("④ 盘本身不慢，软件侧也已经到位（拷贝循环实测 2.2 GB/s，远高于盘速）。"
