@@ -1,5 +1,6 @@
 import os
 import posixpath
+import re
 import shlex
 import shutil
 import tarfile
@@ -13,6 +14,7 @@ from pathlib import Path
 from typing import Optional, List, Callable, Tuple
 
 import paramiko
+import yaml
 
 from .core import (logger, DEFAULT_BAG_DIR, DEFAULT_LOG_DIR, DEFAULT_REMOTE_HOST,
                    DEFAULT_REMOTE_PORT, DEFAULT_REMOTE_USER, DEFAULT_REMOTE_BASE,
@@ -472,10 +474,50 @@ class RecorderManager:
         给实时帧率用：它需要知道"现在往哪个目录写"，而不是"历史上最新的目录"。
         所以这里先判 `is_active()` —— 录制已经停了还去读最新目录，会把上一场
         的数据当成这一场显示。
+
+        ## 为什么还要往下找一层（v6.7.7）
+
+        `_latest_bag_dir()` 取的是 `bag_root` 的**直接子目录**，但录制的产物层级
+        取决于 `ros2 bag record -o <名字>` 落在哪一层：多数情况就是那一层，
+        可一旦上层目录本身也是按日期/序列号分的（`<根>/<日期>/<名字>/`），
+        db3 就会在**更深一层**，而这一层的 glob 找不到任何 `*.db3` ——
+        实时帧率于是永远停在"等待文件落盘"。
+
+        这里只在**当前目录里没有 db3** 时才往下找一层，`_latest_bag_dir()` 的
+        通用语义（给录制清单用）保持不动 —— 那个路径一旦改错，清单会写到别处。
         """
         if not self.is_active():
             return None
-        return self._latest_bag_dir()
+        latest = self._latest_bag_dir()
+        if latest is None:
+            return None
+        if self._has_bag_db3(latest):
+            return latest
+        try:
+            deeper = [d for d in latest.iterdir()
+                      if d.is_dir() and self._has_bag_db3(d)]
+        except OSError:
+            return latest
+        if not deeper:
+            return latest                     # 保持原语义：让调用方报"还没有 db3"
+        try:
+            return max(deeper, key=lambda d: d.stat().st_mtime)
+        except OSError:
+            return deeper[0]
+
+    @staticmethod
+    def _has_bag_db3(folder: Path) -> bool:
+        """目录里有没有 rosbag2 的数据文件（`.db3` / `.mcap`）。
+
+        只 stat 一层：bag 的数据文件永远在 bag 目录的顶层（分片也在这层）。
+        """
+        try:
+            for entry in Path(folder).iterdir():
+                if entry.is_file() and entry.suffix in (".db3", ".mcap"):
+                    return True
+        except OSError:
+            return False
+        return False
 
     def _latest_bag_dir(self) -> Optional[Path]:
         try:
@@ -672,6 +714,11 @@ class BagCandidate:
     #: 目录名里 `_时间戳` 之前的部分就是"这次采集叫什么"。取不到就用目录名。
     name: str = ""
 
+    #: `captured_at` 是从哪儿来的：`metadata` / `name` / `mtime` / `now`。
+    #: 留着它是为了自查 —— 现场看到时间不对时，一眼能知道是元数据缺失、
+    #: 名字里没有时间戳、还是退化到了目录修改时间。
+    time_source: str = ""
+
     def size_text(self) -> str:
         # 用局部变量逐级折算，**不要就地改 self.size_bytes** —— 这个类是
         # frozen dataclass，改字段会抛 FrozenInstanceError，而且即使不 frozen
@@ -694,8 +741,128 @@ class BagCandidate:
             return self.captured_at.strftime("昨天 %H:%M")
         return self.captured_at.strftime("%m-%d %H:%M")
 
+    def stamp_text(self) -> str:
+        """带秒的完整时间（列表里显示用）。
+
+        为什么不复用 `time_text()`：那个是给「数据验证」窄列表按 10 字符对齐的
+        （"今天 14:30"），加秒会挤掉后面的体积列。这里给「查看数据」用，
+        要能分辨同一分钟内的两次录制，所以必须带秒。
+        """
+        return self.captured_at.strftime("%m-%d %H:%M:%S")
+
     def kind_text(self) -> str:
         return self.kind or "bag"
+
+
+#: 目录名里的录制时间戳。**两种写法都要认**，现场两类目录都有：
+#: - 录制脚本拼的：`vla_20261026143025`、`labeltest3_20261026…`（14 位连续数字）
+#: - rosbag2 默认的：`rosbag2_2026_10_26-14_30_25`（带分隔符）
+#: 顺序有意义：先试连续 14 位，再试带分隔符的写法。
+_CAPTURE_NAME_PATTERNS = (
+    re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})[-_T ]?(\d{2})(\d{2})(\d{2})(?!\d)"),
+    re.compile(r"(?<!\d)(20\d{2})[-_](\d{2})[-_](\d{2})[-_ T]"
+               r"(\d{2})[-_:](\d{2})[-_:](\d{2})(?!\d)"),
+)
+
+
+def parse_capture_time_from_name(name: str) -> Optional[datetime]:
+    """从目录名里解析录制开始时间；解析不到或数值非法返回 None。
+
+    纯函数（不碰文件系统），所以"名字解析"这件事可以单测 —— 它决定列表里
+    显示的时间与顺序，写错了会让人按错误时间去选数据。
+    """
+    for pattern in _CAPTURE_NAME_PATTERNS:
+        for match in pattern.finditer(name):
+            parts = [int(group) for group in match.groups()]
+            try:
+                return datetime(*parts)
+            except ValueError:
+                continue          # 2026 99 99 这种非法值 → 试下一个匹配
+    return None
+
+
+def _capture_time_from_metadata(folder: Path) -> Optional[datetime]:
+    """读 rosbag2 的 `metadata.yaml` 取**真实开始时间**（纳秒时间戳）。
+
+    这是 rosbag2 自己写的权威值。两种历史写法都要认：
+    - 新版：`starting_time: {nanoseconds_since_epoch: 1761177000123456789}`
+    - 老版：`starting_time: 1761177000.123456789`（浮点秒）
+    """
+    meta = Path(folder) / "metadata.yaml"
+    if not meta.is_file():
+        return None
+    try:
+        data = yaml.safe_load(meta.read_text(encoding="utf-8")) or {}
+        info = data.get("rosbag2_bagfile_information") or {}
+        start = info.get("starting_time")
+        if isinstance(start, dict):
+            start = start.get("nanoseconds_since_epoch")
+        if not isinstance(start, (int, float)):
+            return None
+        value = float(start)
+        # 秒 vs 纳秒：纳秒值在 1e18 量级，秒在 1e9 量级，用 1e12 分开足够安全
+        seconds = value / 1e9 if value > 1e12 else value
+        return datetime.fromtimestamp(seconds)
+    except (OSError, yaml.YAMLError, ValueError, TypeError, OverflowError):
+        return None
+
+
+def resolve_capture_time(folder: Path) -> Tuple[datetime, str]:
+    """这条采集数据的**录制时间**，以及它是从哪儿来的。
+
+    ## 为什么不能只用目录 mtime（v6.7.7 现场反馈"数据时间有时候会错误"）
+
+    `mtime` 是"目录最后被改动的时间"，与"录制开始时间"是两件事：
+
+    | 场景 | mtime 变成什么 |
+    | --- | --- |
+    | 录制 20 分钟 | ≈ **结束**时间（差一整个时长） |
+    | 录完又补写 metadata / 删了临时文件 | 录完之后的时间 |
+    | 从别的机器拷过来（rsync/scp） | 拷贝时间（或源文件的 mtime） |
+    | 上传后再清理 | 清理那一下的时间 |
+
+    所以"有时候"会错 —— 短录制差得少看不出来，长录制或拷贝过的就明显偏。
+
+    优先级（从权威到兜底）：
+
+    1. `metadata.yaml` 的 `starting_time` —— rosbag2 自己写的真实开始时间，
+       纳秒精度，录制结束就有；
+    2. 目录名里的时间戳 —— 录制脚本起录时用 `date` 拼的，秒级，录制中就存在；
+    3. 目录 mtime —— 前两者都没有时的兜底（不是权威值，但比没有强）。
+
+    纯读取，不修改任何内容；单个目录最多一次 metadata 读（几 KB）。
+    """
+    path = Path(folder)
+    stamp = _capture_time_from_metadata(path)
+    if stamp is not None:
+        return stamp, "metadata"
+    stamp = parse_capture_time_from_name(path.name)
+    if stamp is not None:
+        return stamp, "name"
+    try:
+        return datetime.fromtimestamp(path.stat().st_mtime), "mtime"
+    except OSError:
+        return datetime.now(), "now"
+
+
+def sort_bags_by_capture_time(folders) -> List[Tuple[datetime, Path]]:
+    """把一批 bag 目录按**录制时间倒序**排好（最新的在前）。
+
+    纯函数（只读文件系统，不碰 Qt），所以"顺序对不对"可以单测 —— 顺序错了会让人
+    在「查看数据」里按错误的时间去选/删数据，比显示错时间更危险。
+
+    为什么排序键必须是 `resolve_capture_time()` 而不是 mtime：
+    mtime 是"目录最后改动时间"，长录制时≈**结束**时间、从别的机器拷过来会变成
+    拷贝时间 —— 于是"较晚录的"会被排到下面（现场就是这么发现"时间有时候会错"的）。
+
+    同一秒内录两次时按目录名兜底，保证顺序稳定（不随文件系统遍历顺序变化）。
+    """
+    pairs = []
+    for folder in folders:
+        captured, _source = resolve_capture_time(Path(folder))
+        pairs.append((captured, Path(folder)))
+    pairs.sort(key=lambda pair: (pair[0], pair[1].name), reverse=True)
+    return pairs
 
 
 def describe_bag(folder: Path) -> BagCandidate:
@@ -705,10 +872,7 @@ def describe_bag(folder: Path) -> BagCandidate:
     这条交互路径上跑的，一个坏目录不该让整个列表打不开。列表里显示"—"即可。
     """
     path = Path(folder)
-    try:
-        captured = datetime.fromtimestamp(path.stat().st_mtime)
-    except OSError:
-        captured = datetime.now()
+    captured, time_source = resolve_capture_time(path)
     size, topic_files = 0, 0
     try:
         for entry in path.iterdir():
@@ -729,7 +893,8 @@ def describe_bag(folder: Path) -> BagCandidate:
             name, kind = path.name[len(candidate) + 1:], candidate
             break
     return BagCandidate(path=path, captured_at=captured, size_bytes=size,
-                        topic_files=topic_files, kind=kind, name=name)
+                        topic_files=topic_files, kind=kind, name=name,
+                        time_source=time_source)
 
 
 class DataUploader:

@@ -2708,13 +2708,19 @@ def _sync_background(dlg, monkeypatch):
 def _select_by_names(list_widget, names):
     """按名字勾选列表项。
 
-    不能用下标：列表是按 mtime 倒序排的（`get_bag_folders` 的语义），
-    跟创建顺序不一致 —— 按下标选会选中另外几个。
+    不能用下标：列表是按**录制时间**倒序排的，跟创建顺序不一致 —— 按下标选会
+    选中另外几个。
+
+    也**不能按 `item.text()` 全等**：v6.7.7 起条目里带上了时间
+    （`vla_xxx    10-26 14:00:00`），全等比较永远匹配不上，会静默选中 0 个。
+    按 `data(1)` 里存的路径取 basename 比对才是稳的。
     """
     wanted = set(names)
     for i in range(list_widget.count()):
         item = list_widget.item(i)
-        item.setSelected(item.text() in wanted)
+        raw = item.data(1)
+        label = Path(raw).name if raw else item.text()
+        item.setSelected(label in wanted)
 
 
 def test_batch_delete_removes_all_selected_bags(ui_env, qapp, tmp_path, monkeypatch):
@@ -4265,6 +4271,83 @@ def test_live_rate_closing_the_window_releases_the_sampler(ui_env, tmp_path):
 
     assert win.live_rate_timer.isActive() is False
     assert sampler._files == {}, "关窗口时要释放 sqlite 连接"
+
+
+def test_live_rate_says_waiting_when_the_fragment_is_not_ready(ui_env, tmp_path):
+    """分片还没就绪时显示"等待文件落盘"，**不是**"正在测量"（v6.7.7）。
+
+    两者的读数都是空的，靠"结果是不是空"分不出来 —— 现场 2026-10-26 就因此
+    一直看着"正在测量…"而实际卡在分片没建表，日志里也没有任何线索。
+    """
+    win, _cm = ui_env
+    bag = tmp_path / "bag" / "demo"
+    bag.mkdir(parents=True)
+    (bag / "demo_0.db3").write_bytes(b"")          # 空文件：表还没建
+
+    win.recorder = _fake_recorder(bag_dir=bag, active=True)
+    win.btn_live_rate.setChecked(True)
+    win.on_toggle_live_rate()
+
+    text = win.live_rate_label.text()
+    assert "等待文件落盘" in text, text
+    assert "正在测量" not in text, f"分片没就绪不该说正在测量：{text}"
+
+
+def test_live_rate_writes_the_reason_once_when_it_stays_stuck(ui_env, tmp_path):
+    """连续拿不到读数时，把**原因与目录**写进日志区，且只写一次。
+
+    没有这一步，现场只能看到一行停住的"正在测量…" —— 到底是路径指错、
+    分片没写进来、还是库被锁住，全凭猜，而这三件事的处理方式完全不同。
+    """
+    win, _cm = ui_env
+    bag = tmp_path / "bag" / "demo"
+    bag.mkdir(parents=True)
+    (bag / "demo_0.db3").write_bytes(b"")
+
+    win.recorder = _fake_recorder(bag_dir=bag, active=True)
+    win.btn_live_rate.setChecked(True)
+    win.on_toggle_live_rate()
+
+    for _ in range(5):                              # 每 2 秒一次，这里手动跑 5 轮
+        win._sample_live_rate()
+
+    log = win.log.toPlainText()
+    assert log.count("没取到读数") == 1, f"只该提示一次，实际：{log.count('没取到读数')}"
+    assert "分片尚未就绪" in log
+    assert str(bag) in log, "日志里要带上具体目录，现场才知道去看哪个路径"
+
+
+def test_data_view_lists_bags_newest_first_and_shows_the_time(ui_env, tmp_path):
+    """「查看数据」的数据列表：**最新在最上面**，并且每条都带录制时间（v6.7.7）。
+
+    排序不能用目录 mtime：长录制时它≈结束时间，从别的机器拷来的会变成拷贝时间。
+    这里故意把 mtime 与目录名里的时间反过来，若仍按 mtime 排就会拿到相反的顺序。
+    """
+    import os
+
+    from data_collector.ui import DataViewDialog
+
+    win, _cm = ui_env
+    root = tmp_path / "bags"
+    root.mkdir()
+    plan = (("vla_20261026090000", 1793009000),     # 名字 09:00，mtime 最晚
+            ("vla_20261026110000", 1793000000),
+            ("vla_20261026140000", 1792990000))     # 名字 14:00，mtime 最早
+    for name, mtime in plan:
+        folder = root / name
+        folder.mkdir()
+        (folder / "a_0.db3").write_bytes(b"x")
+        os.utime(folder, (mtime, mtime))
+
+    win.uploader.bag_dir = root
+    dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
+    dlg.refresh_lists()
+
+    texts = [dlg.bag_list.item(i).text() for i in range(dlg.bag_list.count())]
+    ordered = [text.split("    ")[0] for text in texts]
+    assert ordered == ["vla_20261026140000", "vla_20261026110000", "vla_20261026090000"], (
+        f"应当按录制时间倒序，而不是 mtime：{texts}")
+    assert texts[0].endswith("10-26 14:00:00"), f"条目里要显示到秒：{texts[0]}"
 
 
 def test_closing_the_window_releases_the_point_panel(ui_env):
@@ -6934,8 +7017,13 @@ def test_posture_disable_button_disabled_while_action_busy(status_env, tmp_path,
     assert dialog.module_rows["arms"].btn_disable.isEnabled() is False
 
 
-def test_arm_diagram_shows_front_and_side_views_side_by_side():
+def test_arm_diagram_shows_front_and_side_views_side_by_side(qapp):
     """手臂示意图是**正视 + 侧视两块**（现场要求"正视图 + 侧视图，看得更清楚"）。
+
+    ⚠️ 必须声明 `qapp`：这条最后会 `ArmDiagram()` 造一个 QWidget，
+    而没有 QApplication 时 Qt 会直接 `qFatal` 把整个进程 abort（不是抛异常）。
+    单跑这一条时尤其明显 —— 表现为 `Fatal Python error: Aborted`，
+    崩点落在 `QWidget.__init__`，很容易被误读成「绘制代码坏了」。
 
     两块必须等宽、不重叠、各有自己的方向轴 —— 否则现场看到的是"两个姿势挤在一起"，
     比只看一个还难判断。方向轴也得跟着投影走：正视是左右（画面左＝机器人右臂），

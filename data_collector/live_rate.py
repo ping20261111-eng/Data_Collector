@@ -163,6 +163,18 @@ def rate_from_delta(count: int, seconds: float) -> Optional[float]:
     return count / seconds
 
 
+# ---------- 采样状态 ----------
+
+#: 还没绑定目标（没开开关 / 已经关掉）
+STATE_IDLE = "idle"
+#: 绑定了目录，但**还没有可读的 db3**（文件没落盘，或分片刚创建、表还没建）
+STATE_WAITING = "waiting"
+#: 有可读的 db3，但还没凑够两次采样（没有时间基准）
+STATE_MEASURING = "measuring"
+#: 有读数
+STATE_OK = "ok"
+
+
 # ---------- 采样器 ----------
 
 
@@ -189,31 +201,48 @@ class LiveRateSampler:
         self._last_at: Optional[float] = None
         #: 最近一次成功算出的读数：分组标签 → Hz
         self._rates: Dict[str, Optional[float]] = {}
+        #: 当前状态（见 `STATE_*`）。界面据此区分"等待落盘"与"正在测量"，
+        #: 不能靠"读数是不是空的"去猜 —— 两种情况的空白完全一样，但处理方式不同。
+        self.state: str = STATE_IDLE
+        #: 一句人话的当前情况（分片未就绪 / 读失败 / 目录里没有 db3），给日志区用
+        self.last_note: str = ""
         if path is not None:
             self.attach(path)
 
     # ---------- 绑定 / 释放 ----------
 
     def attach(self, path) -> bool:
-        """绑定一个 bag 目录或 db3 文件。**换了目标就重置所有基准**。
+        """绑定一个 bag 目录或 db3 文件。**只有真的换了目标才重置基准**。
 
-        返回 False 表示当前没有可读的文件（录制刚开始时很常见）。
+        返回 False 表示当前没有可读的文件（录制刚开始、或分片还没就绪）。
+
+        ## 判据必须是"绑定的路径"，不能是"已打开的文件集合"（v6.7.7 现场 bug）
+
+        原来写的是 `if found != sorted(self._files): self.close()` ——
+        而 `_files` 只装**成功打开**的文件。于是只要目录里有一个 db3 打不开
+        （rosbag2 刚创建分片时表还没建，这是常态），`found` 与 `_files` 永远不等，
+        **每一轮 attach 都把基准清掉**：`_last_at` 恒为 None → 永远走"第一次只取基准"
+        的分支 → 界面一直停在"正在测量…"，一个数字都出不来。
+
+        实测复现：目录里放 1 个正常 db3 + 1 个空文件，连续四次 sample 全部 0 项；
+        删掉空文件后第 2 次就出数。
         """
         target = Path(path)
-        if target.is_file():
-            found = [target]
-        elif target.is_dir():
-            found = sorted(p for p in target.glob("*.db3") if p.is_file())
-        else:
-            found = []
-        if not found:
-            if self._path != target:
-                self.close()
+        if target != self._path:
+            self.close()                       # 换了目标：旧的时间基准不能用在新的上
             self._path = target
+        if target.is_file():
+            self.state = STATE_MEASURING if self._last_at is not None else STATE_WAITING
+            return True
+        if not target.is_dir():
+            self.state = STATE_WAITING
+            self.last_note = f"目录不存在：{target}"
             return False
-        if found != sorted(self._files):
-            self.close()                       # 换库了：旧的时间基准不能用在新的上
-        self._path = target
+        found = self._collect_files()
+        if not found:
+            self.state = STATE_WAITING
+            self.last_note = f"目录里还没有 db3 文件：{target}"
+            return False
         return True
 
     def close(self) -> None:
@@ -227,6 +256,8 @@ class LiveRateSampler:
         self._topic_ids.clear()
         self._last_at = None
         self._rates = {}
+        self._path = None
+        self.state = STATE_IDLE
 
     # ---------- 采样 ----------
 
@@ -241,17 +272,35 @@ class LiveRateSampler:
         stamp = time.monotonic() if now is None else float(now)
         files = self._collect_files()
         if not files:
+            self.state = STATE_WAITING
+            if not self.last_note:
+                self.last_note = "目录里还没有 db3 文件"
             return dict(self._rates)
 
         deltas: Dict[str, int] = {}
         failed = False
+        ready = 0
+        pending = []
         for db3 in files:
-            got = self._drain_one(db3)
+            opened, got = self._drain_one(db3)
+            if not opened:
+                # **未就绪**不算失败：rosbag2 刚创建分片时表还没建，下一轮自然能读。
+                # 把它当失败会让"有一个分片刚出现"变成"整块看板停摆"（v6.7.7 现场 bug）。
+                pending.append(db3.name)
+                continue
+            ready += 1
             if got is None:
-                failed = True
+                failed = True              # 打得开但这次查询失败（被锁/损坏）
                 continue
             for label, count in got.items():
                 deltas[label] = deltas.get(label, 0) + count
+
+        if ready == 0:
+            # 一个能读的都没有（全是刚创建的分片，或目录里只有空文件）。
+            # **绝不输出 0** —— 那会被读成"相机全没出图"，而此时只是还没写进来。
+            self.state = STATE_WAITING
+            self.last_note = ("分片尚未就绪：" + "、".join(pending)) if pending else self.last_note
+            return dict(self._rates)
         if failed:
             # 任一文件读不到，这一轮就是不完整的（分片少算一片会让帧率直接腰斩）。
             # 保留上一次读数，绝不输出偏小的值，更不输出 0 ——
@@ -260,6 +309,8 @@ class LiveRateSampler:
 
         if self._last_at is None:
             self._last_at = stamp              # 第一次只取基准，这一轮不产出读数
+            self.state = STATE_MEASURING
+            self.last_note = ""
             return {}
 
         seconds = stamp - self._last_at
@@ -278,6 +329,8 @@ class LiveRateSampler:
         for label in self._rates:
             rates.setdefault(label, blank)
         self._rates = rates
+        self.state = STATE_OK
+        self.last_note = ""
         return dict(rates)
 
     # ---------- 内部 ----------
@@ -304,13 +357,23 @@ class LiveRateSampler:
                     pass
         return found
 
-    def _drain_one(self, db3: Path) -> Optional[Dict[str, int]]:
-        """对一个 db3 取「自上次上界之后」的增量，按验证分组计数。读不到返回 None。"""
+    def _drain_one(self, db3: Path) -> Tuple[bool, Optional[Dict[str, int]]]:
+        """对一个 db3 取「自上次上界之后」的增量，按验证分组计数。
+
+        返回 `(该文件现在是否可读, 计数)`：
+
+        | 返回 | 含义 | 调用方怎么处理 |
+        | --- | --- | --- |
+        | `(False, None)` | 打不开（分片刚创建、表还没建） | **跳过**，不算失败，下一轮再试 |
+        | `(True, {})` | 能读，但这一轮没有新数据（空库） | 计入"可读"，不累加 |
+        | `(True, {...})` | 有数据 | 累加 |
+        | `(True, None)` | 能读，但这次查询失败（被锁/连接已失效） | 本轮数字不完整，保留上次读数 |
+        """
         entry = self._files.get(db3)
         if entry is None:
             opened = self._open(db3)
             if opened is None:
-                return None
+                return False, None
             entry = opened
             self._files[db3] = entry
         conn, last_ts = entry
@@ -320,7 +383,7 @@ class LiveRateSampler:
             upper_ts = int(upper[0]) if upper and upper[0] is not None else 0
             if upper_ts == 0:
                 self._files[db3] = (conn, upper_ts)
-                return {}                     # 空库（刚开始录）
+                return True, {}               # 能读，但空库（刚开始录）
 
             counter: Dict[str, int] = {}
             # 图像等话题：只要帧数，不读 data（省 IO）
@@ -343,11 +406,21 @@ class LiveRateSampler:
                     label = joint_group_label(joint_names(blob))
                     counter[label] = counter.get(label, 0) + 1
             self._files[db3] = (conn, upper_ts)
-            return counter
+            return True, counter
         except sqlite3.Error:
             # 录制中库在被写：偶发 "database is locked" 很正常，这一轮跳过
             # （保留上次读数），不要把它当错误刷到日志区。
-            return None
+            #
+            # 但**连接要收掉**：分片轮转/被重建后旧连接会一直失败，
+            # 不收掉就会永久停在"保留上次读数"上；收掉下一轮会重开并自愈。
+            conn, _ts = self._files.pop(db3, (None, 0))       # type: ignore[assignment]
+            self._topic_ids.pop(db3, None)
+            if conn is not None:
+                try:
+                    conn.close()
+                except sqlite3.Error:
+                    pass
+            return True, None
 
     def _open(self, db3: Path) -> Optional[Tuple[sqlite3.Connection, int]]:
         """打开一个 db3 并读话题表。读不到返回 None。"""

@@ -18,6 +18,9 @@ import pytest
 from data_collector.live_rate import (
     IMAGE_LABELS,
     JOINT_TOPIC,
+    STATE_MEASURING,
+    STATE_OK,
+    STATE_WAITING,
     LiveRateSampler,
     format_rates,
     group_sort_key,
@@ -197,6 +200,116 @@ def _insert(conn, topic_id: int, count: int, start_ns: int, step_ns: int = 33_00
                      (topic_id, start_ns + i * step_ns, payload))
     conn.commit()
     return start_ns + count * step_ns
+
+
+# ---------- 分片尚未就绪（v6.7.7 现场「一直正在测量」） ----------
+
+def test_pending_fragment_does_not_stop_the_whole_board(tmp_path):
+    """一个还没就绪的分片，**不许**让整块看板停在"正在测量"。
+
+    现场 2026-10-26：录制中界面一直显示"正在测量…"，一个数字都没有。
+    根因是 `attach()` 用"已成功打开的文件"判换库 —— rosbag2 刚创建分片时表还没建，
+    这个文件打不开，于是 `found != 已打开集合` 恒成立，**每轮都 close() 重置基准**，
+    `_last_at` 永远是 None，永远走"第一次只取基准"的分支。
+
+    实测：1 个正常 db3 + 1 个空文件，连跑四次全是 0 项；改成按路径判换库后
+    第二次就出 30 Hz。
+    """
+    db3 = tmp_path / "a_0.db3"
+    conn = _make_bag(db3)
+    rgb = _topic_id(conn, "/vision/rgb")
+    conn.close()
+    (tmp_path / "a_1.db3").write_bytes(b"")        # 刚创建的分片：表还没建
+
+    sampler = LiveRateSampler(tmp_path)
+    # **按界面的真实序列**：每 2 秒先 attach 再 sample。少了这一步就复现不出
+    # 现场 bug —— "每轮 attach 都重置基准"正是发生在第二次及以后的 attach 上。
+    sampler.attach(tmp_path)
+    sampler.sample(now=10.0)                       # 只取基准
+    conn = sqlite3.connect(db3)
+    _insert(conn, rgb, 60, 9_000_000_000)
+    conn.close()
+
+    sampler.attach(tmp_path)                       # 2 秒后的下一轮
+    rates = sampler.sample(now=12.0)
+
+    assert rates["面部·彩"] == pytest.approx(30.0, abs=0.7), (
+        f"未就绪分片不该影响其余分片的读数：{rates}")
+    assert sampler.state == STATE_OK
+
+
+def test_all_fragments_pending_is_waiting_and_never_a_fake_zero(tmp_path):
+    """所有分片都还没就绪 → 说"等待"，**绝不输出 0**。
+
+    0 在现场的含义是"这一路一帧都没出"（要去查相机）。把"还没写进来"报成 0，
+    会让人白拆一次相机 —— 这个区分是这一版专门加的状态机。
+    """
+    (tmp_path / "a_0.db3").write_bytes(b"")
+
+    sampler = LiveRateSampler(tmp_path)
+    for index in range(3):
+        rates = sampler.sample(now=10.0 + index * 2)
+
+    assert rates == {}, f"未就绪时不许产出读数（更不能是 0）：{rates}"
+    assert sampler.state == STATE_WAITING
+    assert "尚未就绪" in sampler.last_note, sampler.last_note
+
+
+def test_attach_does_not_reset_the_baseline_for_the_same_path(tmp_path):
+    """同一个目录再 attach 一次，**不许**重置时间基准（否则永远出不了读数）。
+
+    目录里还放一个**打不开的分片**：现场就是这样 —— rosbag2 刚创建 `_1.db3` 时
+    表还没建。旧实现拿"已成功打开的文件集合"判换库，于是每轮 attach 都把基准
+    清掉，界面永远停在"正在测量"。
+    """
+    db3 = tmp_path / "a_0.db3"
+    conn = _make_bag(db3)
+    rgb = _topic_id(conn, "/vision/rgb")
+    conn.close()
+    (tmp_path / "a_1.db3").write_bytes(b"")
+
+    sampler = LiveRateSampler(tmp_path)
+    assert sampler.attach(tmp_path) is True
+    sampler.sample(now=10.0)
+    baseline = sampler._last_at
+    assert baseline == 10.0
+
+    assert sampler.attach(tmp_path) is True          # 每 2 秒都会调一次
+    assert sampler._last_at == baseline, "同路径重复 attach 重置了基准 → 永远出不了数"
+
+    conn = sqlite3.connect(db3)
+    _insert(conn, rgb, 60, 9_000_000_000)
+    conn.close()
+    assert sampler.sample(now=12.0)["面部·彩"] == pytest.approx(30.0, abs=0.7)
+
+
+def test_state_reports_measuring_then_ok(tmp_path):
+    """状态要能区分"已有基准但还没读数"和"已有读数" —— 界面靠它选文案。"""
+    db3 = tmp_path / "a_0.db3"
+    conn = _make_bag(db3)
+    rgb = _topic_id(conn, "/vision/rgb")
+    conn.close()
+
+    sampler = LiveRateSampler(tmp_path)
+    sampler.sample(now=10.0)
+    assert sampler.state == STATE_MEASURING
+
+    conn = sqlite3.connect(db3)
+    _insert(conn, rgb, 60, 9_000_000_000)
+    conn.close()
+    sampler.sample(now=12.0)
+    assert sampler.state == STATE_OK
+
+
+def test_a_file_that_cannot_be_read_is_not_counted_as_data(tmp_path):
+    """目录里一个 db3 都不能读时，不能因为"文件存在"就当作有数据。"""
+    (tmp_path / "a_0.db3").write_bytes(b"not a database at all")
+
+    sampler = LiveRateSampler(tmp_path)
+    rates = sampler.sample(now=10.0)
+
+    assert rates == {}
+    assert sampler.state == STATE_WAITING
 
 
 def test_second_sample_splits_joint_states_into_groups(tmp_path):

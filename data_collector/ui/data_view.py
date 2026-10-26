@@ -25,7 +25,8 @@ from ..core_operations import (Launcher, TeleopManager, SdkServiceManager,
                               read_robot_status, EMERGENCY_STOP_TARGETS,
                               EMERGENCY_STOP_PART_NAMES)
 from ..core_data import RecorderManager, DataUploader, LogFetcher
-from ..core_data import UploadBatchQueue, UploadCancelledError
+from ..core_data import (UploadBatchQueue, UploadCancelledError,
+                         sort_bags_by_capture_time)
 
 
 from .common import (SP, describe_export_target, ensure_remote_password,
@@ -238,17 +239,36 @@ class DataViewDialog(QDialog):
         dlg.exec_()
 
     def refresh_lists(self):
+        """重扫两个列表：**最新在最上面**，并且每条都带时间（v6.7.7）。
+
+        ## 为什么排序不能沿用"目录枚举顺序"
+
+        `get_bag_folders()` 是按 **mtime** 倒序的。而 mtime 是"目录最后被改动的
+        时间"，与录制开始时间不是一回事：长录制时它≈结束时间，从别的机器拷来的
+        会被改成拷贝时间 —— 于是列表顺序会把"较晚录的"排到下面，时间也显示错的。
+
+        现在统一按 `resolve_capture_time()` 得到的**录制时间**排序（metadata 的
+        `starting_time` → 目录名时间戳 → mtime 兜底），并把时间直接写在条目里，
+        操作员不用再靠目录名猜。
+
+        日志列表同理：文件名的修改时间就是它的写入时间，直接显示即可。
+        """
         self.log_list.clear()
         for f in self.log_fetcher.get_log_files():
-            item = QListWidgetItem(f.name)
+            try:
+                stamp = datetime.fromtimestamp(f.stat().st_mtime).strftime("%m-%d %H:%M:%S")
+            except OSError:
+                stamp = "—"
+            item = QListWidgetItem(f"{f.name}    {stamp}")
             item.setData(1, str(f))
             # 颜色/字体交给主题 QSS：这里写死 Qt.blue 会顶掉主题色（遗留问题）
             self.log_list.addItem(item)
 
         self.bag_list.clear()
-        for d in self.uploader.get_bag_folders():
-            item = QListWidgetItem(d.name)
-            item.setData(1, str(d))
+        # 按录制时间倒序：最新的在最上面（排序逻辑在 core_data 里，可单测）
+        for captured, folder in sort_bags_by_capture_time(self.uploader.get_bag_folders()):
+            item = QListWidgetItem(f"{folder.name}    {captured:%m-%d %H:%M:%S}")
+            item.setData(1, str(folder))
             self.bag_list.addItem(item)
 
         self._refresh_local_space()

@@ -31,7 +31,8 @@ from ...core_data import RecorderManager, DataUploader, LogFetcher
 from ...verify import verification_report_path
 from ...core_data import UploadCancelledError
 from ...core_points import PointRecorder
-from ...live_rate import LiveRateSampler, SAMPLE_INTERVAL, format_rates
+from ...live_rate import (LiveRateSampler, SAMPLE_INTERVAL, format_rates,
+                          STATE_WAITING)
 from ...errors import describe
 
 from ..safety import guard_slot
@@ -220,6 +221,11 @@ class DataOpsMixin:
             self.live_rate_sampler = LiveRateSampler()
             self.live_rate_label.show()
             self.btn_live_rate.setText("隐藏帧率")
+            #: 已经写进日志区的绑定目录（只在换目录时再写，避免每 2 秒刷屏）
+            self._rate_bound_dir = None
+            #: 连续拿不到读数时只提示一次；恢复后清掉，下次出问题再说
+            self._rate_stuck_count = 0
+            self._rate_stuck_warned = False
             self._sample_live_rate()          # 先跑一次，把基准时间取到手
             self.live_rate_timer.start(int(SAMPLE_INTERVAL * 1000))
             self.append(f"实时帧率已开启：每 {SAMPLE_INTERVAL:g} 秒刷新一次，"
@@ -239,8 +245,15 @@ class DataOpsMixin:
 
         三种"还没有数字"的情况要分开说，混成一句"暂无数据"会让现场以为功能坏了：
           · 没在录制 → 帧率无从统计（打点与验证都以 bag 为准）；
-          · 在录制但 db3 还没落盘 → 再等一两秒；
+          · 在录制但 db3 还没落盘/分片还没就绪 → 等；
           · 采到基准、还没凑够两次 → 正在测量。
+
+        ## 为什么按采样器的 `state` 而不是"读数是不是空的"分辨（v6.7.7）
+
+        这两种情况的**读数都是空的**，靠返回值猜不出来。现场 2026-10-26 就是因此
+        一直显示"正在测量…"而实际卡在"分片还没就绪"，日志里没有任何线索。
+        现在 `state` 由采样器明确给出，并且连续 6 秒拿不到读数时把**原因与目录**
+        写进日志区（只写一次）—— 现场据此就能判断是路径不对还是分片没写进来。
         """
         sampler = getattr(self, "live_rate_sampler", None)
         if sampler is None:
@@ -248,20 +261,46 @@ class DataOpsMixin:
         if not self.recorder.is_active():
             sampler.close()
             self.live_rate_label.setText("帧率  未在录制（开始录制后显示）")
+            self._rate_stuck_count = 0
             return
         bag_dir = self.recorder.current_bag_dir()
         if bag_dir is None:
             self.live_rate_label.setText("帧率  等待第一个文件落盘…")
             return
+        if getattr(self, "_rate_bound_dir", None) != str(bag_dir):
+            self._rate_bound_dir = str(bag_dir)
+            self.append(f"帧率：已绑定录制目录 {bag_dir}")
         sampler.attach(bag_dir)
         text = format_rates(sampler.sample())
         if not text:
-            self.live_rate_label.setText("帧率  正在测量…")
+            waiting = sampler.state == STATE_WAITING
+            self.live_rate_label.setText(
+                "帧率  等待文件落盘…" if waiting else "帧率  正在测量…")
+            self._note_rate_stuck(sampler, bag_dir, waiting)
             return
+        self._rate_stuck_count = 0
+        self._rate_stuck_warned = False
         # 分组可能到 11 个（6 相机 + 5 关节），一行放不下 → `format_rates` 已经折好行，
         # 这里只把"帧率"标签放在首行，后续行用空格对齐（等宽字体下才对得齐）。
         lines = text.splitlines()
         self.live_rate_label.setText("帧率  " + "\n      ".join(lines))
+
+    def _note_rate_stuck(self, sampler, bag_dir, waiting: bool):
+        """连续拿不到读数时，把**原因**写进日志区（只写一次，避免刷屏）。
+
+        没有这一步，现场只能看到一行"正在测量…"停在原处 —— 到底是目录指错了、
+        分片没写进来、还是库被锁住，全凭猜。而这三件事的处理方式完全不同。
+        """
+        self._rate_stuck_count = getattr(self, "_rate_stuck_count", 0) + 1
+        if self._rate_stuck_count < 3 or getattr(self, "_rate_stuck_warned", False):
+            return
+        self._rate_stuck_warned = True
+        reason = sampler.last_note or ("分片还没写进来" if waiting else "还没有基准")
+        self.append(f"⚠ 帧率：连续 {self._rate_stuck_count} 次没取到读数 —— {reason}")
+        self.append(f"    目录：{bag_dir}")
+        if waiting:
+            self.append("    若这个目录不对，或录制还在写元数据，稍等即可；"
+                        "若一直如此，把上面这个目录发我看一下。")
 
     # ---------- 保存位置（本机数据盘 / 移动硬盘） ----------
 

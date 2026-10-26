@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from datetime import datetime  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -37,7 +38,8 @@ from PyQt5.QtWidgets import QApplication, QWidget  # noqa: E402
 
 from data_collector import disk_export as de                      # noqa: E402
 from data_collector.core_data import (BagCandidate, DataUploader,   # noqa: E402
-                                      describe_bag)
+                                      describe_bag, parse_capture_time_from_name,
+                                      resolve_capture_time, sort_bags_by_capture_time)
 
 MARKER = ".nerv_volume"
 ROOT_DEV = os.stat("/").st_dev
@@ -567,6 +569,140 @@ def test_a_missing_root_is_not_an_error(tmp_path):
     up = DataUploader()
     up.bag_dir = tmp_path / "nope"
     assert up.scan_bag_candidates() == []
+
+
+# ---------- 录制时间（v6.7.7：不能再拿目录 mtime 当录制时间） ----------
+
+def test_capture_time_comes_from_metadata_first(tmp_path):
+    """有 `metadata.yaml` 时以它的 `starting_time` 为准（rosbag2 自己写的权威值）。
+
+    这条要防的是"用目录 mtime 当录制时间"：mtime 是**最后一次改动**的时间，
+    长录制时它≈结束时间，差一整个时长。下面把 mtime 故意设成晚 2 小时。
+    """
+    from datetime import datetime
+
+    bag = tmp_path / "vla_20261026090000"          # 名字说 09:00
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text(
+        "rosbag2_bagfile_information:\n"
+        "  version: 5\n"
+        "  starting_time:\n"
+        "    nanoseconds_since_epoch: 1792996800000000000\n",
+        encoding="utf-8")
+    os.utime(bag, (1793004000, 1793004000))        # mtime = 11:00
+
+    stamp, source = resolve_capture_time(bag)
+
+    assert source == "metadata"
+    assert stamp == datetime.fromtimestamp(1792996800), (
+        f"应当采用 metadata 的 09:00，而不是 mtime 的 11:00：{stamp}")
+
+
+def test_capture_time_falls_back_to_the_dirname_without_metadata(tmp_path):
+    """录制中 metadata 还没写（rosbag2 停止时才写）→ 用目录名里的时间戳。"""
+    from datetime import datetime
+
+    bag = tmp_path / "vla_20261026090000"
+    bag.mkdir()
+    os.utime(bag, (1793004000, 1793004000))        # mtime 又是 11:00
+
+    stamp, source = resolve_capture_time(bag)
+
+    assert source == "name"
+    assert stamp == datetime(2026, 10, 26, 9, 0, 0)
+
+
+def test_capture_time_supports_legacy_float_seconds_metadata(tmp_path):
+    """老版 rosbag2 的 `starting_time` 是浮点秒，不是纳秒 dict —— 也要认。"""
+    from datetime import datetime
+
+    bag = tmp_path / "whatever"
+    bag.mkdir()
+    (bag / "metadata.yaml").write_text(
+        "rosbag2_bagfile_information:\n"
+        "  version: 4\n"
+        "  starting_time: 1792996800.5\n",
+        encoding="utf-8")
+
+    stamp, source = resolve_capture_time(bag)
+
+    assert source == "metadata"
+    assert stamp == datetime.fromtimestamp(1792996800.5)
+
+
+def test_capture_time_ignores_an_illegal_stamp_in_the_name(tmp_path):
+    """名字里的时间戳非法（13 月 99 日）→ 不许当成时间，退回 mtime。"""
+    bag = tmp_path / "vla_20261399999999"
+    bag.mkdir()
+    os.utime(bag, (1793000000, 1793000000))
+
+    _stamp, source = resolve_capture_time(bag)
+
+    assert source == "mtime", "非法日期不能被解析成一个「看起来对」的时间"
+
+
+def test_capture_time_parses_both_naming_styles():
+    """两种目录名都要认：录制脚本拼的 14 位数字，和 rosbag2 默认的带分隔符写法。"""
+    from datetime import datetime
+
+    assert parse_capture_time_from_name("vla_20261026143025") == \
+        datetime(2026, 10, 26, 14, 30, 25)
+    assert parse_capture_time_from_name("rosbag2_2026_10_26-14_30_25") == \
+        datetime(2026, 10, 26, 14, 30, 25)
+    assert parse_capture_time_from_name("labeltest3") is None, "没有时间戳就不要硬解析"
+
+
+def test_bag_candidate_records_where_the_time_came_from(tmp_path):
+    """`time_source` 要如实记下来源 —— 现场看到时间不对时，一眼知道差在哪一级。"""
+    bags = tmp_path / "bags"
+    bags.mkdir()
+    bag = _make_bag(bags, "vla_20261015103000")     # metadata 是空 dict，无 starting_time
+
+    cand = describe_bag(bag)
+
+    assert cand.time_source == "name"
+    assert cand.captured_at == datetime(2026, 10, 15, 10, 30, 0)
+
+
+def test_bag_candidate_has_a_second_resolution_stamp(tmp_path):
+    """列表里要显示到秒：`time_text()` 只到分钟，同一分钟录两次分不出来。"""
+    bags = tmp_path / "bags"
+    bags.mkdir()
+    bag = _make_bag(bags, "vla_20261015103045")
+
+    cand = describe_bag(bag)
+
+    assert cand.stamp_text() == "10-15 10:30:45"
+    assert cand.time_text().endswith("10:30"), "窄列表用的那个保持不变"
+
+
+def test_sort_bags_newest_first_uses_capture_time_not_mtime(tmp_path):
+    """列表排序必须用**录制时间**，不是目录 mtime。
+
+    这里故意把 mtime 与目录名里的时间反过来：按 mtime 排会得到 09/11/14（正序），
+    按录制时间排才是 14/11/09。排序抽成纯函数就是为了能这样直接测 ——
+    走 Qt 对话框的话，跑多了会踩到本环境既有的收尾段错误。
+    """
+    bags = tmp_path / "bags"
+    bags.mkdir()
+    plan = (("vla_20261026090000", 1793009000),     # 名字 09:00，mtime 最晚
+            ("vla_20261026110000", 1793000000),
+            ("vla_20261026140000", 1792990000))     # 名字 14:00，mtime 最早
+    folders = []
+    for name, mtime in plan:
+        folder = bags / name
+        folder.mkdir()
+        (folder / "a_0.db3").write_bytes(b"x")
+        os.utime(folder, (mtime, mtime))
+        folders.append(folder)
+
+    # 输入故意按**名字正序**给（09/11/14），与期望顺序完全相反 ——
+    # 这样"忘了排序"会立刻暴露（按输入原样返回就是正序）。
+    ordered = [path.name for _stamp, path in
+               sort_bags_by_capture_time(sorted(folders, key=lambda p: p.name))]
+
+    assert ordered == ["vla_20261026140000", "vla_20261026110000", "vla_20261026090000"], (
+        f"应当按录制时间倒序；按 mtime 排会得到相反的顺序：{ordered}")
 
 
 def test_bag_candidate_is_frozen():
