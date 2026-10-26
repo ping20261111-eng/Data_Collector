@@ -1,123 +1,173 @@
-"""实时帧率：增量计数、算帧率、以及"清单必须与验证脚本一致"。
+"""实时帧率：按「数据验证」的分组算，以及不依赖 ROS 的关节名解析。
 
-## 为什么这个功能要单独测
+## 为什么要测这一层
 
-它读的是**别人正在写的数据库**，而且算出来的数字会直接影响现场判断
-（"相机是不是掉帧了"）。两个坑必须钉住：
-
-1. bag 的 `messages.id` 是**全表共享自增**，拿 `MAX(id)` 的差值当帧数是错的
-   （实测 340 MB 的真实 bag 上，`MAX(id)` 分组查询还要 371 ms、结果也对不上）。
-   所以这里按 `timestamp > 上次上界` 做增量 —— 用例里专门造"多话题交替插入"的库来验。
-2. `0.0 Hz` 与 `—`（算不出来）含义完全不同：前者是"相机没出图"（要查），
-   后者是"还没采够两次"（等一下就好）。混掉会让现场白折腾。
+1. **分组口径**必须与验证报告/图一致：`/joint_states` 在那边是按**完整关节名集合**
+   拆开的（左臂/右臂约 999 Hz、左手/右手 100 Hz、躯干 30 Hz，差一个数量级）。
+   只看话题总数会把这种差异完全掩盖 —— 所以这里逐条解析关节名。
+2. **关节名解析不能依赖 ROS**：上位机是 Qt 进程，不装 rclpy。手工解析 CDR 的
+   正确性必须钉住（与 `deserialize_message` 逐条对照过 3000/3000 一致）。
+3. `0.0` 与 `—` 含义不同：前者是"这一路一帧没出"（要查），后者是"还没采够两次"。
 """
 import sqlite3
+import struct
 from pathlib import Path
 
 import pytest
 
 from data_collector.live_rate import (
-    TARGET_TOPICS,
+    IMAGE_LABELS,
+    JOINT_TOPIC,
     LiveRateSampler,
     format_rates,
-    label_of,
+    group_sort_key,
+    joint_group_label,
+    joint_names,
     rate_from_delta,
 )
 
 
-# ---------- 纯函数：帧率怎么算 ----------
+# ---------- 造一条 JointState 的 CDR 字节（只到 name 列表，够解析即可） ----------
+
+
+def build_joint_state(names, frame_id="base_link", sec=0, nanosec=0) -> bytes:
+    """按 rosbag2 存的 CDR 布局造前缀：
+
+    4 字节封装头 → int32 sec → uint32 nanosec → uint32 frame_id 长度 + 字节
+    → 对齐 → uint32 name 个数 → 每个 name = uint32 长度 + 字节（含 `\\0`），各自对齐。
+    """
+    out = bytearray(b"\x00\x01\x00\x00")
+    out += struct.pack("<iI", sec, nanosec)
+    frame = frame_id.encode() + b"\x00"
+    out += struct.pack("<I", len(frame)) + frame
+    while len(out) % 4:
+        out += b"\x00"
+    out += struct.pack("<I", len(names))
+    for name in names:
+        raw = name.encode() + b"\x00"
+        out += struct.pack("<I", len(raw)) + raw
+        while len(out) % 4:
+            out += b"\x00"
+    return bytes(out)
+
+
+# ---------- 关节名解析（纯函数） ----------
+
+
+def test_joint_names_reads_the_name_list():
+    names = ("AR5_Ljoint_1", "AR5_Ljoint_2", "AR5_Ljoint_3")
+    assert joint_names(build_joint_state(names)) == names
+
+
+def test_joint_names_handles_variable_length_frames():
+    """frame_id 长度变化要能正确对齐（对齐是这里最容易算错的地方）。"""
+    assert joint_names(build_joint_state(("a",), frame_id="")) == ("a",)
+    assert joint_names(build_joint_state(("a",), frame_id="x" * 33)) == ("a",)
+
+
+def test_joint_names_returns_empty_on_garbage():
+    """脏数据不能抛异常：采样循环里一条坏消息不该打断整轮。"""
+    assert joint_names(b"") == ()
+    assert joint_names(b"\x00\x01\x00\x00") == ()
+    assert joint_names(b"\xff" * 40) == ()
+
+
+def test_joint_names_matches_rclpy_when_available():
+    """与 rclpy 的 `deserialize_message` 对照。
+
+    只在装了 ROS 的环境里跑（上位机本身不需要它，但**这条对照是手工解析的正确性来源**）。
+    """
+    rclpy_ser = pytest.importorskip("rclpy.serialization")
+    sensor = pytest.importorskip("sensor_msgs.msg")
+
+    msg = sensor.JointState()
+    msg.name = ["AR5_Ljoint_1", "AR5_Ljoint_2", "trunk_1"]
+    msg.position = [0.1, 0.2, 0.3]
+    blob = rclpy_ser.serialize_message(msg)     # 签名只收消息对象
+
+    assert joint_names(blob) == tuple(msg.name)
+
+
+# ---------- 分组标签 ----------
+
+
+def test_joint_group_label_maps_the_five_groups():
+    assert joint_group_label(["AR5_Ljoint_1", "AR5_Ljoint_2"]) == "左臂"
+    assert joint_group_label(["AR5_Rjoint_1", "AR5_Rjoint_2"]) == "右臂"
+    assert joint_group_label(["LJoint_1", "LJoint_2"]) == "左手"
+    assert joint_group_label(["RJoint_1", "RJoint_2"]) == "右手"
+    assert joint_group_label(["trunk_1", "head_1"]) == "躯干"
+
+
+def test_left_arm_is_not_mistaken_for_left_hand():
+    """**最容易错的一条**：`AR5_Ljoint` 与 `LJoint` 只差一个字母的大小写。
+
+    左臂是 999 Hz、左手是 100 Hz，判错的话现场会拿错数去看错机构。
+    这条同时钉住"别改成大小写不敏感比较"（把 token 与关节名都 `.lower()`
+    之后 `ljoint` 会命中 `ar5_ljoint`，左臂就被贴成左手了）。
+    """
+    assert joint_group_label(["AR5_Ljoint_7"]) == "左臂"
+    assert joint_group_label(["LJoint_7"]) == "左手"
+
+
+def test_joint_group_label_is_order_insensitive():
+    """关节名顺序不影响分组（与验证脚本的 `sorted(msg.name)` 同口径）。"""
+    a = joint_group_label(["AR5_Ljoint_2", "AR5_Ljoint_1"])
+    b = joint_group_label(["AR5_Ljoint_1", "AR5_Ljoint_2"])
+    assert a == b == "左臂"
+
+
+def test_unknown_joint_set_gets_a_fallback_label():
+    assert joint_group_label(["something_else"]) == "其它关节"
+    assert joint_group_label([]) == "其它关节"
+
+
+def test_group_sort_key_puts_cameras_first_then_joints():
+    ordered = sorted(["躯干", "右腕·彩", "左臂", "面部·彩"], key=group_sort_key)
+
+    assert ordered == ["面部·彩", "右腕·彩", "左臂", "躯干"]
+
+
+# ---------- 帧率与排版 ----------
 
 
 def test_rate_is_frames_over_seconds():
     assert rate_from_delta(60, 2.0) == pytest.approx(30.0)
-    assert rate_from_delta(3702, 2.0) == pytest.approx(1851.0)
+    assert rate_from_delta(1999, 2.0) == pytest.approx(999.5)
 
 
 def test_zero_frames_is_zero_not_unknown():
-    """**一帧都没有必须报 0.0，不能报"—"**：那正是"相机没出图"这个异常本身。"""
+    """一帧都没有必须报 0.0：那正是"这一路没出图"这个异常本身。"""
     assert rate_from_delta(0, 2.0) == 0.0
 
 
 def test_unusable_inputs_give_none_not_zero():
-    """时钟没走、或计数倒退（bag 换了）时算不出来 —— 返回 None，不要编一个 0。"""
     assert rate_from_delta(60, 0.0) is None
     assert rate_from_delta(60, -1.0) is None
     assert rate_from_delta(-5, 2.0) is None
 
 
-# ---------- 清单一致性 ----------
-
-
-def test_target_topics_match_the_verify_script():
-    """界面短标签表必须与 `scripts/bag_rate_stat.py` 的 `TOPICS` 完全一致。
-
-    那边是独立脚本（不 import 本包，要能单独在机器人上跑），所以清单各写一份 ——
-    改一边忘另一边，现场就会出现"验证报告里有的、实时看板上没有"。
-    """
-    import ast
-
-    source = Path("scripts/bag_rate_stat.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
-    # 直接执行与清单有关的那几条赋值（TOPIC_TYPES 引用了 TOPICS，只能一起跑），
-    # 避免把话题名手抄一遍 —— 抄错了守卫就失去意义。
-    def _touches_topics(node) -> bool:
-        """是否给 TOPICS / TOPIC_TYPES 赋值。
-
-        两种写法都要认：`TOPIC_TYPES = dict.fromkeys(...)`（Name 赋值）与
-        `TOPIC_TYPES['/joint_states'] = ...`（下标赋值）。漏掉后者时脚本端只有 6 个
-        话题，守卫会误报"本包多出 /joint_states"。
-        """
-        if not isinstance(node, ast.Assign):
-            return False
-        for target in node.targets:
-            if isinstance(target, ast.Name) and target.id in ("TOPICS", "TOPIC_TYPES"):
-                return True
-            if (isinstance(target, ast.Subscript)
-                    and isinstance(target.value, ast.Name)
-                    and target.value.id == "TOPIC_TYPES"):
-                return True
-        return False
-
-    assigns = [node for node in tree.body if _touches_topics(node)]
-    assert len(assigns) == 3, f"没能在 bag_rate_stat.py 里找全 TOPICS/TOPIC_TYPES 赋值：{len(assigns)}"
-    namespace = {}
-    exec(compile(ast.Module(body=assigns, type_ignores=[]), "<topics>", "exec"), namespace)
-
-    expected = set(namespace["TOPICS"]) | set(namespace["TOPIC_TYPES"])
-    assert expected == set(TARGET_TOPICS), (
-        f"清单不一致 —— 验证脚本多出 {expected - set(TARGET_TOPICS)}，"
-        f"实时看板多出 {set(TARGET_TOPICS) - expected}")
-
-
-def test_every_target_topic_has_a_short_label():
-    for topic, label in TARGET_TOPICS.items():
-        assert label and len(label) <= 4, f"{topic} 的短标签过长：{label}"
-    assert label_of("/joint_states") == "关节"
-    assert label_of("/unknown/topic") == "/unknown/topic"
-
-
-# ---------- 读数排版 ----------
-
-
 def test_format_rates_is_empty_without_data():
-    """没有读数 → 空串（界面据此显示"未在录制"，而不是一行破折号）。"""
     assert format_rates({}) == ""
 
 
 def test_format_rates_distinguishes_unknown_from_zero():
-    rates = {topic: None for topic in TARGET_TOPICS}
-    rates["/joint_states"] = 0.0
+    text = format_rates({"左臂": 999.4, "右手": 0.0, "躯干": None})
+
+    assert "左臂 999.4" in text
+    assert "右手 0.0" in text, "真的 0 帧要显示成 0.0"
+    assert "躯干 —" in text, "算不出来的要显示成 —"
+
+
+def test_format_rates_wraps_into_several_lines():
+    """分组多的时候要换行 —— 一行塞 11 个分组会被日志区右边裁掉。"""
+    rates = {label: 30.0 for label in
+             ("面部·彩", "面部·深", "左腕·彩", "左腕·深", "右腕·彩", "右腕·深",
+              "左臂", "右臂", "左手", "右手", "躯干")}
     text = format_rates(rates)
 
-    assert "关节 0.0" in text, "真的 0 帧要显示成 0.0"
-    assert "rgb —" in text, "算不出来的要显示成 —"
-
-
-def test_format_rates_keeps_one_decimal():
-    rates = {topic: 30.04 for topic in TARGET_TOPICS}
-    text = format_rates(rates)
-
-    assert "rgb 30.0" in text
+    assert text.count("\n") >= 2, f"11 个分组应该折成多行：{text}"
+    assert all(line.count(" · ") <= 3 for line in text.splitlines())
 
 
 # ---------- 采样器（模拟录制中的 rosbag2 库） ----------
@@ -127,153 +177,198 @@ def _make_bag(path: Path) -> sqlite3.Connection:
     """造一个与 rosbag2 sqlite3 插件同结构的库（含 timestamp 索引）。"""
     conn = sqlite3.connect(path)
     conn.execute("CREATE TABLE topics (id INTEGER PRIMARY KEY, name TEXT, type TEXT)")
-    conn.execute(
-        "CREATE TABLE messages (id INTEGER PRIMARY KEY, topic_id INTEGER, "
-        "timestamp INTEGER, data BLOB)")
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, topic_id INTEGER, "
+                 "timestamp INTEGER, data BLOB)")
     conn.execute("CREATE INDEX timestamp_idx ON messages (timestamp ASC)")
-    for index, topic in enumerate(TARGET_TOPICS, start=1):
+    for index, topic in enumerate(list(IMAGE_LABELS) + [JOINT_TOPIC, "/tf"], start=1):
         conn.execute("INSERT INTO topics VALUES (?,?,'x')", (index, topic))
     conn.commit()
     return conn
 
 
-def _insert(conn, topic_id: int, count: int, start_ns: int, step_ns: int = 33_000_000):
+def _topic_id(conn, name: str) -> int:
+    return conn.execute("SELECT id FROM topics WHERE name=?", (name,)).fetchone()[0]
+
+
+def _insert(conn, topic_id: int, count: int, start_ns: int, step_ns: int = 33_000_000,
+            payload: bytes = b""):
     for i in range(count):
         conn.execute("INSERT INTO messages (topic_id, timestamp, data) VALUES (?,?,?)",
-                     (topic_id, start_ns + i * step_ns, b""))
+                     (topic_id, start_ns + i * step_ns, payload))
     conn.commit()
+    return start_ns + count * step_ns
 
 
-def test_first_sample_only_takes_a_baseline(tmp_path):
-    """第一次采样只取基准（没有间隔就不能算帧率），返回空字典。"""
-    db3 = tmp_path / "a_0.db3"
-    _make_bag(db3).close()
+def test_second_sample_splits_joint_states_into_groups(tmp_path):
+    """**核心**：一个 `/joint_states` 话题要按关节名拆成多组，各自算帧率。
 
-    sampler = LiveRateSampler(db3)
-    assert sampler.sample(now=100.0) == {}
-
-
-def test_second_sample_reports_hz_for_all_targets(tmp_path):
+    真实情况就是这样：左臂/右臂 999 Hz、左手/右手 100 Hz、躯干 30 Hz，
+    合成一个总数会把"某一路掉帧"完全掩盖。
+    """
     db3 = tmp_path / "a_0.db3"
     conn = _make_bag(db3)
+    joint = _topic_id(conn, JOINT_TOPIC)
     conn.close()
 
     sampler = LiveRateSampler(db3)
     t0 = 1000.0
-    sampler.sample(now=t0)
+    sampler.sample(now=t0)                      # 只取基准
 
-    # 2 秒内每个话题 +60 帧 → 30 Hz。**交替插入**（模拟真实 bag 的共享自增 id），
-    # 这样才能证明我们不是拿 MAX(id) 差值当帧数。
     conn = sqlite3.connect(db3)
-    for i in range(60):
-        for topic_id in range(1, len(TARGET_TOPICS) + 1):
-            conn.execute("INSERT INTO messages (topic_id, timestamp, data) VALUES (?,?,?)",
-                         (topic_id, int((t0 + 0.5 + i * (2.0 / 60)) * 1e9), b""))
-    conn.commit()
+    left_arm = build_joint_state(("AR5_Ljoint_1", "AR5_Ljoint_2"))
+    left_hand = build_joint_state(("LJoint_1", "LJoint_2"))
+    trunk = build_joint_state(("trunk_1",))
+    base = int((t0 + 0.1) * 1e9)
+    _insert(conn, joint, 60, base, step_ns=33_000_000, payload=left_arm)     # 30 Hz
+    _insert(conn, joint, 20, base, step_ns=100_000_000, payload=left_hand)   # 10 Hz
+    _insert(conn, joint, 6, base, step_ns=333_000_000, payload=trunk)        # 3 Hz
     conn.close()
 
     rates = sampler.sample(now=t0 + 2.0)
 
-    assert set(rates) == set(TARGET_TOPICS), "每个目标话题都要有读数"
-    for topic, value in rates.items():
-        assert value == pytest.approx(30.0, abs=0.5), f"{topic} 帧率不对：{value}"
+    assert rates["左臂"] == pytest.approx(30.0, abs=0.7)
+    assert rates["左手"] == pytest.approx(10.0, abs=0.7)
+    assert rates["躯干"] == pytest.approx(3.0, abs=0.7)
 
 
-def test_no_new_frames_reports_zero(tmp_path):
-    """没有新帧 → 0.0（不是"—"）：这正是"相机停了"的信号。"""
+def test_camera_topics_are_counted_by_topic(tmp_path):
+    """图像话题不需要反序列化，按话题直接计数。"""
     db3 = tmp_path / "a_0.db3"
     conn = _make_bag(db3)
-    _insert(conn, 1, 10, 1_000_000_000)
+    rgb = _topic_id(conn, "/vision/rgb")
     conn.close()
 
     sampler = LiveRateSampler(db3)
     sampler.sample(now=10.0)
-    rates = sampler.sample(now=12.0)
-
-    assert rates["/vision/rgb"] == 0.0
-
-
-def test_only_new_frames_are_counted(tmp_path):
-    """第二批只数新增的那部分（不能把历史帧再算一遍）。"""
-    db3 = tmp_path / "a_0.db3"
-    conn = _make_bag(db3)
-    _insert(conn, 1, 100, 1_000_000_000)      # 历史 100 帧
-    conn.close()
-
-    sampler = LiveRateSampler(db3)
-    sampler.sample(now=10.0)
-
     conn = sqlite3.connect(db3)
-    _insert(conn, 1, 20, 5_000_000_000)       # 新增 20 帧
+    _insert(conn, rgb, 60, 9_000_000_000)       # 60 帧 / 2 秒 = 30 Hz
+    conn.close()
+
+    assert sampler.sample(now=12.0)["面部·彩"] == pytest.approx(30.0, abs=0.7)
+
+
+def test_groups_that_disappear_report_zero_not_missing(tmp_path):
+    """某个分组这一窗口没有帧 → 报 0.0 并且**仍在**（不能整行消失）。
+
+    整行消失会让人以为"这一路没录"，而实际是"录了但没数据" —— 含义不同。
+    """
+    db3 = tmp_path / "a_0.db3"
+    conn = _make_bag(db3)
+    joint = _topic_id(conn, JOINT_TOPIC)
+    conn.close()
+
+    sampler = LiveRateSampler(db3)
+    sampler.sample(now=10.0)
+    conn = sqlite3.connect(db3)
+    _insert(conn, joint, 30, 9_000_000_000, payload=build_joint_state(("LJoint_1",)))
+    conn.close()
+    first = sampler.sample(now=12.0)
+    assert first["左手"] > 0
+
+    second = sampler.sample(now=14.0)           # 下一个窗口一帧都没有
+    assert second["左手"] == 0.0, "消失的分组要报 0，不能从读数里去掉"
+
+
+def test_all_camera_groups_appear_even_without_frames(tmp_path):
+    """6 路相机分组**固定出现**，没帧就是 0.0。
+
+    这是验证最关心的一件事：某个 depth 话题压根没录进来（验证报告叫"缺失目标话题"）时，
+    界面上必须能一眼看到那条 0，而不是"少一行"就此消失。
+    """
+    db3 = tmp_path / "a_0.db3"
+    conn = _make_bag(db3)
+    rgb = _topic_id(conn, "/vision/rgb")
+    conn.close()
+
+    sampler = LiveRateSampler(db3)
+    sampler.sample(now=10.0)
+    conn = sqlite3.connect(db3)
+    _insert(conn, rgb, 60, 9_000_000_000)      # 只给 rgb，其余 5 路都没有
     conn.close()
 
     rates = sampler.sample(now=12.0)
-    assert rates["/vision/rgb"] == pytest.approx(10.0, abs=0.6), (
-        "只该数新增的 20 帧 / 2 秒 = 10 Hz，不是 120/2")
+
+    assert set(IMAGE_LABELS.values()) <= set(rates), "6 路相机分组都要在读数里"
+    assert rates["面部·彩"] == pytest.approx(30.0, abs=0.7)
+    assert rates["面部·深"] == 0.0, "没数据的分组要报 0，不能缺席"
+
+
+def test_non_target_topics_are_ignored(tmp_path):
+    """/tf、joint_cmds 这些不在验证口径里，不该出现在读数中。"""
+    db3 = tmp_path / "a_0.db3"
+    conn = _make_bag(db3)
+    tf = _topic_id(conn, "/tf")
+    conn.close()
+
+    sampler = LiveRateSampler(db3)
+    sampler.sample(now=10.0)
+    conn = sqlite3.connect(db3)
+    _insert(conn, tf, 500, 9_000_000_000)
+    conn.close()
+
+    rates = sampler.sample(now=12.0)
+
+    # 只剩"固定的 6 路相机分组"（都报 0），没有任何 /tf 的痕迹
+    assert set(rates) == set(IMAGE_LABELS.values()), rates
+    assert all(value == 0.0 for value in rates.values()), (
+        f"500 条 /tf 不该被算进任何分组：{rates}")
+
+
+def test_split_bag_files_are_summed(tmp_path):
+    """分片录制时两片的帧要加起来（新分片从 0 起算，不能被当历史丢掉）。"""
+    first = tmp_path / "a_0.db3"
+    conn = _make_bag(first)
+    rgb = _topic_id(conn, "/vision/rgb")
+    _insert(conn, rgb, 30, 1_000_000_000)       # 窗口之前的历史帧
+    conn.close()
+
+    sampler = LiveRateSampler(tmp_path)
+    sampler.sample(now=10.0)                    # 基准
+
+    conn = sqlite3.connect(first)
+    _insert(conn, rgb, 30, 9_000_000_000)
+    conn.close()
+    second = tmp_path / "a_1.db3"
+    conn = _make_bag(second)
+    _insert(conn, _topic_id(conn, "/vision/rgb"), 30, 9_000_000_000)
+    conn.close()
+
+    assert sampler.sample(now=12.0)["面部·彩"] == pytest.approx(30.0, abs=0.7)
 
 
 def test_missing_database_does_not_crash(tmp_path):
-    """录制刚开始、db3 还没落盘 → 不抛异常，返回空（界面显示"未在录制"）。"""
     sampler = LiveRateSampler(tmp_path)
 
     assert sampler.sample(now=1.0) == {}
     assert sampler.sample(now=2.0) == {}
 
 
-def test_read_failure_keeps_the_previous_reading(tmp_path, monkeypatch):
-    """偶发读不到（库被写锁住）时保留上一次读数，界面不要闪成空白。"""
+def test_read_failure_keeps_the_previous_reading(tmp_path):
+    """偶发读不到（库被写锁住）时保留上一次读数，不闪成空白也不跳成 0。"""
     db3 = tmp_path / "a_0.db3"
     conn = _make_bag(db3)
-    _insert(conn, 1, 60, 1_000_000_000)
+    rgb = _topic_id(conn, "/vision/rgb")
     conn.close()
 
     sampler = LiveRateSampler(db3)
-    sampler.sample(now=10.0)                   # 只取基准
+    sampler.sample(now=10.0)
     conn = sqlite3.connect(db3)
-    _insert(conn, 1, 60, 9_000_000_000)        # 基准之后才有新帧
+    _insert(conn, rgb, 60, 9_000_000_000)
     conn.close()
     good = sampler.sample(now=12.0)
-    assert good["/vision/rgb"] > 0
+    assert good["面部·彩"] > 0
 
-    # 真实地制造一次读失败：`sqlite3.Connection.execute` 是只读属性（不能 monkeypatch），
-    # 而把连接关掉之后 execute 会抛 `sqlite3.ProgrammingError`（`sqlite3.Error` 的子类），
-    # 与录制中偶发的 "database is locked" 走的是同一条兜底分支。
+    # 制造真实读失败：连接关掉后 execute 抛 sqlite3.ProgrammingError
     sampler._files[db3][0].close()
 
-    kept = sampler.sample(now=14.0)
-    assert kept == good, "读失败要沿用上一次的读数，而不是清空"
-
-
-def test_split_bag_files_are_summed(tmp_path):
-    """分片录制（_0.db3 / _1.db3）时两片的帧要加起来。"""
-    first = tmp_path / "a_0.db3"
-    conn = _make_bag(first)
-    _insert(conn, 1, 30, 1_000_000_000)       # 采样窗口之前的历史帧
-    conn.close()
-
-    sampler = LiveRateSampler(tmp_path)
-    sampler.sample(now=10.0)                  # 只取基准（历史帧丢掉）
-
-    # 采样窗口内：老分片继续写 30 帧，同时出现新分片并写入 30 帧
-    conn = sqlite3.connect(first)
-    _insert(conn, 1, 30, 9_000_000_000)
-    conn.close()
-    second = tmp_path / "a_1.db3"
-    conn = _make_bag(second)
-    _insert(conn, 1, 30, 9_000_000_000)
-    conn.close()
-
-    rates = sampler.sample(now=12.0)
-    assert rates["/vision/rgb"] == pytest.approx(30.0, abs=0.6), (
-        "两片各新增 30 帧 / 2 秒 = 30 Hz；漏算新分片会得到 15")
+    assert sampler.sample(now=14.0) == good
 
 
 def test_switching_bag_resets_the_baseline(tmp_path):
-    """换一场录制（新库）时基准必须重置，否则新库的帧会被算成 0 或负数。"""
     old = tmp_path / "old"
     old.mkdir()
     conn = _make_bag(old / "a_0.db3")
-    _insert(conn, 1, 50, 1_000_000_000)
+    _insert(conn, _topic_id(conn, "/vision/rgb"), 50, 1_000_000_000)
     conn.close()
 
     sampler = LiveRateSampler(old)
@@ -282,33 +377,7 @@ def test_switching_bag_resets_the_baseline(tmp_path):
 
     new = tmp_path / "new"
     new.mkdir()
-    conn = _make_bag(new / "a_0.db3")
-    _insert(conn, 1, 60, 1_000_000_000)
-    conn.close()
+    _make_bag(new / "a_0.db3").close()
 
     sampler.attach(new)
     assert sampler.sample(now=20.0) == {}, "换库后第一次只该取基准"
-    conn = sqlite3.connect(new / "a_0.db3")
-    _insert(conn, 1, 60, 9_000_000_000)
-    conn.close()
-    assert sampler.sample(now=22.0)["/vision/rgb"] == pytest.approx(30.0, abs=0.6)
-
-
-def test_unknown_topics_are_ignored(tmp_path):
-    """bag 里还有别的很多话题（tf / joint_cmds…），只统计目标清单里的。"""
-    db3 = tmp_path / "a_0.db3"
-    conn = _make_bag(db3)
-    conn.execute("INSERT INTO topics VALUES (99,'/tf','x')")
-    conn.commit()
-    conn.close()
-
-    sampler = LiveRateSampler(db3)
-    sampler.sample(now=10.0)
-
-    conn = sqlite3.connect(db3)
-    _insert(conn, 99, 200, 9_000_000_000)     # 大量 /tf 消息
-    conn.close()
-
-    rates = sampler.sample(now=12.0)
-    assert set(rates) == set(TARGET_TOPICS)
-    assert rates["/vision/rgb"] == 0.0, "非目标话题不该被算进来"

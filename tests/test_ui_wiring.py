@@ -4108,9 +4108,11 @@ def _fake_recorder(bag_dir=None, active=True):
     return _Rec()
 
 
-def _make_rate_bag(bag_dir, topics):
-    """造一个与 rosbag2 同结构的空 db3（只有话题表，还没落帧）。"""
+def _make_rate_bag(bag_dir):
+    """造一个与 rosbag2 同结构的空 db3（话题表按「数据验证」的分组口径铺好）。"""
     import sqlite3
+
+    from data_collector.live_rate import IMAGE_LABELS, JOINT_TOPIC
 
     bag_dir.mkdir(parents=True, exist_ok=True)
     db3 = bag_dir / f"{bag_dir.name}_0.db3"
@@ -4119,7 +4121,7 @@ def _make_rate_bag(bag_dir, topics):
     conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, topic_id INTEGER, "
                  "timestamp INTEGER, data BLOB)")
     conn.execute("CREATE INDEX timestamp_idx ON messages (timestamp ASC)")
-    for index, topic in enumerate(topics, start=1):
+    for index, topic in enumerate(list(IMAGE_LABELS) + [JOINT_TOPIC], start=1):
         conn.execute("INSERT INTO topics VALUES (?,?,'x')", (index, topic))
     conn.commit()
     conn.close()
@@ -4185,11 +4187,9 @@ def test_live_rate_measures_then_reports_numbers(ui_env, tmp_path):
     import sqlite3
     import time
 
-    from data_collector.live_rate import TARGET_TOPICS
-
     win, _cm = ui_env
     bag = tmp_path / "bag" / "20261026_demo"
-    db3 = _make_rate_bag(bag, TARGET_TOPICS)
+    db3 = _make_rate_bag(bag)
     win.recorder = _fake_recorder(bag_dir=bag, active=True)
     win.btn_live_rate.setChecked(True)
     win.on_toggle_live_rate()
@@ -4198,27 +4198,24 @@ def test_live_rate_measures_then_reports_numbers(ui_env, tmp_path):
 
     time.sleep(0.3)
     conn = sqlite3.connect(db3)
-    for i in range(9):                        # 9 帧 / 0.3 s ≈ 30 Hz
-        for topic_id in range(1, len(TARGET_TOPICS) + 1):
-            conn.execute("INSERT INTO messages (topic_id, timestamp, data) VALUES (?,?,?)",
-                         (topic_id, int(time.time() * 1e9) + i, b""))
+    for i in range(9):                        # 第一路相机 9 帧 / 0.3 s ≈ 30 Hz
+        conn.execute("INSERT INTO messages (topic_id, timestamp, data) VALUES (1,?,?)",
+                     (int(time.time() * 1e9) + i, b""))
     conn.commit()
     conn.close()
     win._sample_live_rate()
 
     text = win.live_rate_label.text()
     assert text.startswith("帧率  "), text
-    assert "rgb" in text and "关节" in text, f"七个目标话题都要出现：{text}"
+    assert "面部·彩" in text, f"相机分组要出现（与验证图同口径）：{text}"
     assert "—" not in text, f"第二次采样应当有数字：{text}"
 
 
 def test_live_rate_toggle_off_hides_and_releases(ui_env, tmp_path):
     """关闭：读数行隐藏、定时器停、sqlite 连接释放（别留着占页缓存）。"""
-    from data_collector.live_rate import TARGET_TOPICS
-
     win, _cm = ui_env
     bag = tmp_path / "bag" / "demo"
-    _make_rate_bag(bag, TARGET_TOPICS)
+    _make_rate_bag(bag)
     win.recorder = _fake_recorder(bag_dir=bag, active=True)
     win.btn_live_rate.setChecked(True)
     win.on_toggle_live_rate()
@@ -4236,11 +4233,9 @@ def test_live_rate_toggle_off_hides_and_releases(ui_env, tmp_path):
 
 def test_live_rate_stopping_recording_drops_the_connection(ui_env, tmp_path):
     """录制停止后：读数改回"未在录制"，并释放连接（避免长时间占着页缓存）。"""
-    from data_collector.live_rate import TARGET_TOPICS
-
     win, _cm = ui_env
     bag = tmp_path / "bag" / "demo"
-    _make_rate_bag(bag, TARGET_TOPICS)
+    _make_rate_bag(bag)
     recorder = _fake_recorder(bag_dir=bag, active=True)
     win.recorder = recorder
     win.btn_live_rate.setChecked(True)
@@ -4257,11 +4252,9 @@ def test_live_rate_stopping_recording_drops_the_connection(ui_env, tmp_path):
 
 def test_live_rate_closing_the_window_releases_the_sampler(ui_env, tmp_path):
     """关窗口要释放 sqlite 连接 —— 与其它资源一起收，别留给进程退出时兜底。"""
-    from data_collector.live_rate import TARGET_TOPICS
-
     win, _cm = ui_env
     bag = tmp_path / "bag" / "demo"
-    _make_rate_bag(bag, TARGET_TOPICS)
+    _make_rate_bag(bag)
     win.recorder = _fake_recorder(bag_dir=bag, active=True)
     win.btn_live_rate.setChecked(True)
     win.on_toggle_live_rate()

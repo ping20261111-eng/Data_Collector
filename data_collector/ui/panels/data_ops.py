@@ -206,7 +206,11 @@ class DataOpsMixin:
 
         数据源是**录制中 bag 的索引计数**，不是订阅话题 —— 6 路相机订阅要每秒
         反序列化约 160 MB，而且发布端是 `reliable`/`depth:10`，处理不过来会背压
-        到相机与录制（详见 `live_rate` 模块说明）。这里读库实测 0.0~0.1 ms/次。
+        到相机与录制（详见 `live_rate` 模块说明）。
+
+        **分组口径与「数据验证」一致**：`/joint_states` 按完整关节名集合拆成
+        左臂/右臂/左手/右手/躯干 五组，各自算帧率（它们的帧率差一个数量级，
+        合成一个总数会把"某一路掉帧"掩盖掉）。
 
         信号参数不参与判断（`QPushButton.clicked` 自带 checked，但以控件状态为准，
         避免"信号说 A、控件显示 B"时两边打架）。
@@ -251,7 +255,13 @@ class DataOpsMixin:
             return
         sampler.attach(bag_dir)
         text = format_rates(sampler.sample())
-        self.live_rate_label.setText(f"帧率  {text}" if text else "帧率  正在测量…")
+        if not text:
+            self.live_rate_label.setText("帧率  正在测量…")
+            return
+        # 分组可能到 11 个（6 相机 + 5 关节），一行放不下 → `format_rates` 已经折好行，
+        # 这里只把"帧率"标签放在首行，后续行用空格对齐（等宽字体下才对得齐）。
+        lines = text.splitlines()
+        self.live_rate_label.setText("帧率  " + "\n      ".join(lines))
 
     # ---------- 保存位置（本机数据盘 / 移动硬盘） ----------
 

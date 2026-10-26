@@ -212,12 +212,15 @@ class LayoutMixin:
                                                self.btn_clear_log])
         outer.addWidget(head)
 
-        # 帧率读数行：只在开关打开时出现，占用一行（等宽，方便对齐比较）
+        # 帧率读数行：只在开关打开时出现。等宽字体方便逐列比较；
+        # 分组最多 11 个（6 相机 + 5 关节），会折成最多 3 行 ——
+        # 所以这里**不设固定高度**，让 QLabel 按文本行数自己长。
         self.live_rate_label = QLabel("")
         self.live_rate_label.setObjectName("Hint")
         self.live_rate_label.setFont(theme.mono_font(theme.TYPE_SCALE["fs_sm"]))
         self.live_rate_label.setContentsMargins(theme.px(10), theme.px(2),
                                                 theme.px(10), theme.px(2))
+        self.live_rate_label.setWordWrap(False)
         self.live_rate_label.hide()
         outer.addWidget(self.live_rate_label)
 
