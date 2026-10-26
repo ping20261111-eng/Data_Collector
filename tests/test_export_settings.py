@@ -45,6 +45,48 @@ def test_verify_content_opt_in(tmp_path):
     assert _mgr(tmp_path, "verify_content: true\n").get_upload_settings()["verify_content"] is True
 
 
+# ---------- 移动硬盘的校验档位（v6.8.1） ----------
+
+def test_disk_verify_mode_defaults_from_the_legacy_flag(tmp_path):
+    """没写 `verify_mode` 时**按旧字段推导** —— 两种取值都要对上。
+
+    这条守的是"数据完整性不许静默降级"。`upload.verify_content: true` 在旧版本
+    里的含义就是「写完回读比对」，如果新档位把它推导成 `off`（不校验），
+    一份**明确要求校验**的配置就会在没人察觉的情况下变成不校验 ——
+    这种降级比慢严重得多，所以它必须映射到 `readback`。
+    """
+    assert _mgr(tmp_path).get_export_settings()["verify_mode"] == "off"
+    assert _mgr(tmp_path, "verify_content: true\n").get_export_settings()["verify_mode"] \
+        == "readback", "旧配置开了校验，不许降级成不校验"
+
+
+def test_disk_verify_mode_can_be_switched_to_digest_for_speed(tmp_path):
+    """显式写 `verify_mode: digest` → 照它执行（这是现场提速的开关）。
+
+    `digest` 与 `readback` 都留下 `SHA256SUMS`、都不降低"有没有摘要"的保证，
+    区别只在**要不要额外读一遍盘**。所以从 `readback` 切到 `digest` 不是
+    "放弃校验"，而是"把当场比对改成以后可核"。
+    """
+    s = _mgr(tmp_path,
+             "verify_content: true\n"
+             "disk_export:\n"
+             "  verify_mode: digest\n").get_export_settings()
+    assert s["verify_mode"] == "digest", "显式配置必须优先于旧字段推导"
+
+
+def test_disk_verify_mode_is_case_insensitive_and_validated(tmp_path):
+    """大小写不敏感；写错的值**回落到推导**，不能变成"不校验"。"""
+    assert _mgr(tmp_path, "disk_export:\n  verify_mode: READBACK\n") \
+        .get_export_settings()["verify_mode"] == "readback"
+
+    s = _mgr(tmp_path,
+             "verify_content: true\n"
+             "disk_export:\n"
+             "  verify_mode: 快一点\n").get_export_settings()
+    assert s["verify_mode"] == "readback", \
+        f"非法值应回落到旧字段推导（而不是默认 off）：{s['verify_mode']}"
+
+
 # ---------- export_target ----------
 
 def test_invalid_target_falls_back_to_server(tmp_path):

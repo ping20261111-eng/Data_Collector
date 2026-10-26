@@ -353,11 +353,18 @@ def test_disk_copy_keeps_the_original_layout(tmp_path, monkeypatch):
 
 
 def test_content_verification_writes_checksums(tmp_path, monkeypatch):
-    """开了 `verify_content` → 盘上应写 `SHA256SUMS`（逐文件，`sha256sum -c` 可用）。
+    """开了校验 → 盘上应写 `SHA256SUMS`（逐文件，`sha256sum -c` 可用）。
 
     磁盘侧已经没有"单个归档"了，所以不再有 `<包名>.sha256` 边车；逐文件清单
     更有用：哪个文件坏了能直接定位到名字，而不是整包一个摘要。
     离线场景没有服务器来复核，这份清单是"数据没坏"的**唯一**外部凭据。
+
+    ## 为什么这里走**配置**而不是 `up.verify_content = True`（v6.8.1）
+
+    移动硬盘的校验档位现在由 `disk_export.verify_mode` 决定（`off/digest/readback`），
+    它是**唯一真源**。原先这条测试直接在实例上置 `verify_content`，与生产代码
+    唯一的读法（从配置推导）分叉 —— 于是"配置开了校验、盘上却没有摘要"这类
+    真实故障，它照样能绿。测试要盯的是现场那条路：改配置，然后看盘上有什么。
     """
     mount = tmp_path / "mnt5"
     mount.mkdir()
@@ -367,9 +374,9 @@ def test_content_verification_writes_checksums(tmp_path, monkeypatch):
     folder = _bag(tmp_path)
     up = _uploader(tmp_path,
                    "export_target: disk\n"
+                   "verify_content: true\n"          # 旧字段 → 推导成 readback
                    "disk_export:\n"
                    f"  mount_point: {mount}\n")
-    up.verify_content = True
 
     assert up.upload_bag_folder(folder) is True
     checklists = list(mount.rglob("SHA256SUMS"))
@@ -380,6 +387,100 @@ def test_content_verification_writes_checksums(tmp_path, monkeypatch):
     # 与真实内容对得上（不是随便写了一个串）
     import hashlib
     assert digest == hashlib.sha256(b"x" * 2048).hexdigest()
+
+
+# ---------- 校验档位：慢在哪、怎么变快（v6.8.1） ----------
+
+def _spy_readback(monkeypatch):
+    """数一数"回读目标文件"发生了几次 —— 那正是 `readback` 慢一倍的原因。
+
+    盯的是 `core_data.sha256_file`：`_export_to_disk` 在回读比对时用它读**目标**。
+    复制时算摘要走的是 `copy_file(digest=True)`，不经过它 —— 所以这个计数
+    恰好等于"额外读盘`文件数`遍"，不会把正常的摘要计算算进来。
+    """
+    calls = []
+    from data_collector import core_data as module
+    real = module.sha256_file
+
+    def spy(path, *args, **kwargs):
+        calls.append(str(path))
+        return real(path, *args, **kwargs)
+
+    monkeypatch.setattr(module, "sha256_file", spy)
+    return calls
+
+
+def test_verify_mode_digest_leaves_a_digest_but_never_reads_the_disk_back(tmp_path, monkeypatch):
+    """`digest` 档：**写 `SHA256SUMS`，但不回读** —— 这就是省下一半时间的那一刀。
+
+    为什么要专门钉住"没回读"：清单存在与否是看得见的，而"有没有多读一遍盘"
+    看不见。只断言 `SHA256SUMS` 存在的话，把档位实现成永远 `readback` 也能绿 ——
+    而那正是现场抱怨"传得太慢"的那个版本。
+    """
+    mount = tmp_path / "mnt7"
+    mount.mkdir()
+    (mount / ".nerv_volume").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr("os.path.ismount", lambda p: True)
+
+    folder = _bag(tmp_path)
+    up = _uploader(tmp_path,
+                   "export_target: disk\n"
+                   "disk_export:\n"
+                   f"  mount_point: {mount}\n"
+                   "  verify_mode: digest\n")
+    readbacks = _spy_readback(monkeypatch)
+
+    assert up.upload_bag_folder(folder) is True
+
+    assert list(mount.rglob("SHA256SUMS")), "digest 档也要留下逐文件摘要"
+    assert readbacks == [], f"digest 档不该回读目标文件，实际读了 {readbacks}"
+
+
+def test_verify_mode_readback_really_reads_every_file_back(tmp_path, monkeypatch):
+    """`readback` 档：每个文件都回读一遍（所以耗时接近翻倍）。
+
+    这条与上一条成对：同样的数据、同样的目录，只有档位不同 —— 差别必须
+    **恰好落在"回读次数"上**，否则那三个档位名就只是配置里的装饰。
+    """
+    mount = tmp_path / "mnt8"
+    mount.mkdir()
+    (mount / ".nerv_volume").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr("os.path.ismount", lambda p: True)
+
+    folder = _bag(tmp_path)
+    (folder / "b.mcap").write_bytes(b"y" * 1024)
+    up = _uploader(tmp_path,
+                   "export_target: disk\n"
+                   "disk_export:\n"
+                   f"  mount_point: {mount}\n"
+                   "  verify_mode: readback\n")
+    readbacks = _spy_readback(monkeypatch)
+
+    assert up.upload_bag_folder(folder) is True
+
+    assert len(readbacks) == 2, f"两个文件应各回读一次，实际 {readbacks}"
+    assert all("a.mcap" in p or "b.mcap" in p for p in readbacks), readbacks
+
+
+def test_verify_mode_off_writes_no_checksums(tmp_path, monkeypatch):
+    """`off` 档：盘上只有数据，没有 `SHA256SUMS`（也不回读）。"""
+    mount = tmp_path / "mnt9"
+    mount.mkdir()
+    (mount / ".nerv_volume").write_text("ok", encoding="utf-8")
+    monkeypatch.setattr("os.path.ismount", lambda p: True)
+
+    folder = _bag(tmp_path)
+    up = _uploader(tmp_path,
+                   "export_target: disk\n"
+                   "disk_export:\n"
+                   f"  mount_point: {mount}\n"
+                   "  verify_mode: off\n")
+    readbacks = _spy_readback(monkeypatch)
+
+    assert up.upload_bag_folder(folder) is True
+
+    assert list(mount.rglob("SHA256SUMS")) == []
+    assert readbacks == []
 
 
 def test_second_export_skips_files_already_on_the_disk(tmp_path, monkeypatch):

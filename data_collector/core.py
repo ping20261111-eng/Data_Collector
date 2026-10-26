@@ -1046,6 +1046,49 @@ class UserPrefsStore:
             return False
 
 
+#: 移动硬盘导出的校验档位（`disk_export.verify_mode`）。
+#:
+#: | 值 | 复制时算摘要 | 写完回读比对 | 相对耗时 | 用途 |
+#: | --- | --- | --- | --- | --- |
+#: | `off` | ✗ | ✗ | 1× | 只要把数据搬过去 |
+#: | `digest` | ✓ | ✗ | ≈1×（多约 9% CPU） | 留 `SHA256SUMS` 供以后核对 |
+#: | `readback` | ✓ | ✓ | **≈2×** | 要当场证明盘上这份没问题 |
+#:
+#: `readback` 慢一倍的账很直白：写完还要把整份文件读回来算一遍摘要，
+#: 而移动硬盘的读速和写速是**分别计费**的，不是重叠的。
+DISK_VERIFY_MODES = ("off", "digest", "readback")
+
+
+def resolve_disk_verify_mode(disk_config, legacy_verify_content: bool) -> str:
+    """移动硬盘导出的校验档位；未配置时**按旧字段推导，绝不静默降级**。
+
+    ## 为什么必须是模块级纯函数，而不是 `ConfigManager` 的一个方法
+
+    这套规则有**三个调用方**：配置解析（`ConfigManager`）、现场测速脚本
+    （`scripts/disk_export_bench.py` 要据此告诉现场"现在是哪一档、能不能提速"）、
+    以及测试。三处各写一遍"默认值怎么来"的话，迟早分叉 —— 而分叉的表现是
+    **脚本说在回读校验、实际导出却没读**，或反过来。规则只有一处实现，
+    脚本 import 它即可。
+
+    ## 为什么不给个干净的默认值了事
+
+    v6.6.0 起现场用的是 `upload.verify_content`（布尔），其中 `true` 的含义是
+    「写完回读比对」。如果这里给 `off` 当默认，一份**明确要求校验**的老配置会被
+    静默降级成「不校验」—— 现场以为有保障，实际没有。数据完整性上的静默降级
+    比"慢"严重得多，所以 `true` 必须映射到 `readback`。
+
+    反过来 `false` 映射到 `off` 是等价的（旧行为就是完全不校验）。
+    显式写了 `disk_export.verify_mode` 就以它为准 —— 这也是现场提速的开关。
+    """
+    raw = str((disk_config or {}).get("verify_mode") or "").strip().lower()
+    if raw in DISK_VERIFY_MODES:
+        return raw
+    if raw:
+        logger.warning(f"disk_export.verify_mode 取值无效（{raw}），"
+                       f"按 upload.verify_content 推导")
+    return "readback" if legacy_verify_content else "off"
+
+
 class ConfigManager:
     def __init__(self, config_path: Path):
         self.config_path = config_path
@@ -1888,6 +1931,9 @@ class ConfigManager:
 
     EXPORT_TARGETS = ("server", "disk", "both")
 
+    #: 见模块级 `DISK_VERIFY_MODES`（这里保留一个引用，历史调用点不必改）。
+    VERIFY_MODES = DISK_VERIFY_MODES
+
     def get_export_settings(self) -> dict:
         """导出目标（数据往哪儿送）。
 
@@ -1925,7 +1971,17 @@ class ConfigManager:
             "require_volume_id": bool(disk) if require_id is None else bool(require_id),
             "min_free_margin_mb": int(disk.get("min_free_margin_mb") or 2048),
             "warn_file_bytes": int(disk.get("warn_file_bytes") or 3_800_000_000),
+            "verify_mode": self._disk_verify_mode(disk),
         }
+
+    def _disk_verify_mode(self, disk: dict) -> str:
+        """委托给模块级 `resolve_disk_verify_mode` —— 规则只有一处实现。
+
+        旧字段的读法与 `DataUploader` 走**同一条通道**（`get_upload_settings`），
+        而不是自己再去 app_config 上取一次 —— 两处各写一遍迟早分叉。
+        """
+        legacy = bool(self.get_upload_settings().get("verify_content", False))
+        return resolve_disk_verify_mode(disk, legacy)
 
     def save_export_settings(self, target: str, mount_point: Optional[str] = None,
                              backup_dir: Optional[Path] = None) -> dict:

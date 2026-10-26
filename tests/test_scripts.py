@@ -2288,3 +2288,91 @@ def test_diagnose_trunk_honours_the_layout_offset_switch():
     assert "data_offset=0" in diag.TEST_TITLES["B"]
     assert "data_offset=1" in diag.TEST_TITLES["C"]
     assert set(diag.TESTS) == {"A", "B", "C", "D", "E"}
+
+# ==================== disk_export_bench.py（移动硬盘测速诊断，v6.8.1） ====================
+
+@pytest.fixture
+def bench():
+    return _load_module("disk_export_bench", "disk_export_bench.py")
+
+
+def test_bench_calls_out_usb2_explicitly(bench):
+    """USB 2.0 必须被**点名**：那是现场"太慢"最常见、也最便宜的成因。
+
+    480 Mbps 换算下来约 40 MB/s，只有 USB3 的 1/10 左右。把它显示成
+    "480 Mbps" 而不说人话，现场看不出问题在哪 —— 换个口就能好 4~8 倍的事，
+    会变成"去买块新硬盘"。
+    """
+    text = bench.describe_link("480")
+    assert "USB 2.0" in text, text
+    assert "40 MB/s" in text.replace("35~40", "40"), f"要给出实际能到多少：{text}"
+
+
+def test_bench_recognizes_usb3_and_newer(bench):
+    assert "USB 3.0" in bench.describe_link("5000")
+    assert "3.1/3.2" in bench.describe_link("10000")
+
+
+def test_bench_says_so_when_link_speed_is_unavailable(bench):
+    """读不到链路速率时**如实说**，不能静默显示成正常 —— 那会让诊断失去意义。"""
+    text = bench.describe_link("")
+    assert "读不到" in text
+    assert "lsusb -t" in text, "要给一条能自己动手查的命令"
+
+
+@pytest.mark.parametrize("mbps,expect", [
+    (400, "很快"), (260, "很快"), (200, "正常"), (160, "正常"),
+    (100, "偏慢"), (75, "偏慢"), (40, "很慢"), (5, "很慢"),
+])
+def test_bench_speed_verdict_boundaries(bench, mbps, expect):
+    """分档边界要逐点钉住 —— 边界漂一格，现场的结论就会从"换口"变成"换盘"。"""
+    assert bench.verdict_for(mbps)[0] == expect
+
+
+def test_bench_verdict_always_carries_a_reason(bench):
+    for mbps in (0, 30, 100, 200, 500):
+        label, note = bench.verdict_for(mbps)
+        assert label and note, f"{mbps} MB/s 没给出说明"
+
+
+def test_bench_estimate_doubles_under_readback(bench):
+    """回读校验在预估里必须体现成**接近一倍**，否则现场看不出改档位有什么用。
+
+    移动硬盘的读和写是分别计费的（不是重叠的），所以 `readback` 的时间
+    约等于 `off` 的两倍。这条钉的是"别把校验写成免费"。
+    """
+    import re
+
+    def minutes(mode):
+        # 用 60GB 而不是 10GB：100MB/s 下正好 10.0 分钟，乘 2 是 20.0，
+        # 不会被一位小数的舍入咬到（10GB 时 1.667→1.7，×2 就对不上了）。
+        # 这也更贴近现场 —— 一次采集就是这个量级。
+        text = bench.estimate(100.0, 60.0, mode)
+        return float(re.search(r"约 ([0-9.]+) 分钟", text).group(1))
+
+    off = minutes("off")
+    digest = minutes("digest")
+    readback = minutes("readback")
+
+    assert readback == pytest.approx(off * 2, rel=0.01), (off, readback)
+    assert digest == pytest.approx(off, rel=0.01), "digest 不该额外读盘，耗时与 off 同档"
+
+
+def test_bench_verify_mode_comes_from_the_production_rule(bench):
+    """档位判断必须与生产代码**同一套规则**，不许脚本自己再实现一遍。
+
+    诊断工具说错方向最麻烦：它让现场改一个本来不该改的配置项，改完耗时没变，
+    于是"程序有问题"的结论就落到错的地方。这里比对几种输入下两边是否一致。
+    """
+    from data_collector.core import resolve_disk_verify_mode
+
+    cases = (
+        ({"verify_mode": "", "verify_content": True}, True),
+        ({"verify_mode": "", "verify_content": False}, False),
+        ({"verify_mode": "digest", "verify_content": True}, True),
+        ({"verify_mode": "readback", "verify_content": False}, False),
+        ({"verify_mode": "快一点", "verify_content": True}, True),
+    )
+    for cfg, legacy in cases:
+        expected = resolve_disk_verify_mode({"verify_mode": cfg["verify_mode"]}, legacy)
+        assert bench.effective_verify_mode(cfg) == expected, cfg

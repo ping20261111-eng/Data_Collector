@@ -1479,6 +1479,7 @@ class DataUploader:
             require_volume_id=bool(settings.get("require_volume_id")),
             min_free_margin_mb=int(settings.get("min_free_margin_mb", 2048)),
             warn_file_bytes=int(settings.get("warn_file_bytes", 3_800_000_000)),
+            verify_mode=str(settings.get("verify_mode", "off") or "off"),
         )
         target.enumerated_mount = not configured
         return target
@@ -1595,18 +1596,39 @@ class DataUploader:
         def running() -> bool:
             return not self.upload_cancelled
 
+        # 校验档位（`disk_export.verify_mode`）：
+        #   off      = 只搬数据
+        #   digest   = 复制时顺带算 SHA-256 并写 `SHA256SUMS`，**不回读**（≈1× 耗时）
+        #   readback = 再回读整份比对（≈2× 耗时，移动硬盘的读和写是分别计费的）
+        verify_mode = str(getattr(disk, "verify_mode", "") or "off")
+        want_digest = verify_mode in ("digest", "readback")
+        want_readback = verify_mode == "readback"
+
         copied = 0
         skipped = 0
         bytes_done = 0
         checksums = []
 
+        #: 进度信号的最小间隔（秒）。`copy_file` 每 4MB 回调一次，40GB 就是 1 万次
+        #: —— 每次都要跨线程 emit 一个信号、让主线程醒一次重绘进度条。这些唤醒
+        #: 不会让盘变快，只会让界面在和 IO 抢时间片。按时间节流后信号量与数据量
+        #: 脱钩：慢盘上每 100ms 一条，进度照样连续，唤醒次数降到 1/30。
+        PROGRESS_MIN_INTERVAL = 0.1
+        last_emit = [0.0]
+
         def tick(count: int) -> None:
             nonlocal bytes_done
             bytes_done += count
-            if progress_percent and total_size:
-                # 卡在 99：最后一个字节落盘并 rename 之后才算完（同 `write_stream`）
-                progress_percent(min(99, int(bytes_done * 100 / total_size)))
-            if progress_cb and bytes_done % (64 * 1024 * 1024) < count:
+            if not progress_percent or not total_size:
+                return
+            now = time.monotonic()
+            percent = min(99, int(bytes_done * 100 / total_size))
+            if percent < 99 and now - last_emit[0] < PROGRESS_MIN_INTERVAL:
+                return
+            last_emit[0] = now
+            # 卡在 99：最后一个字节落盘并 rename 之后才算完（同 `write_stream`）
+            progress_percent(percent)
+            if progress_cb and bytes_done % (256 * 1024 * 1024) < count:
                 progress_cb(f"正在复制到移动硬盘：{_human_size(bytes_done)}")
 
         # 上次被拔盘 / 被强杀留下的 `.partial` 先清掉：这些是**我们自己的**临时文件
@@ -1627,19 +1649,22 @@ class DataUploader:
                     continue
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 result = disk.copy_file(path, dest, on_chunk=tick,
-                                        digest=self.verify_content)
+                                        digest=want_digest)
                 copied += 1
-                if self.verify_content:
+                if want_digest:
+                    checksums.append(f"{result['digest']}  {path.relative_to(folder).as_posix()}")
+                if want_readback:
                     # 复制时已经算过源文件摘要，这里**只回读目标**比对
                     # （少读一遍源文件：几 GB 的数据，一遍就是几十秒）。
+                    # 注意：这一步是**额外一次全量读盘**，有移动硬盘在场时
+                    # 它让导出耗时接近翻倍 —— 所以才做成可选的 readback。
                     actual = sha256_file(dest)
                     if actual != result["digest"]:
                         return self._fail(
                             ErrorCode.LOCAL_IO,
                             f"复制后校验不一致：{dest}\n"
                             f"源 {result['digest']} / 目标 {actual}")
-                    checksums.append(f"{actual}  {path.relative_to(folder).as_posix()}")
-            if self.verify_content and checksums:
+            if want_digest and checksums:
                 self._write_checksums(target_dir, checksums)
         except UploadCancelledError:
             # 取消保留已复制的文件：删掉它们等于"取消 = 白拷一遍"，而且盘上

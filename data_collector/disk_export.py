@@ -76,12 +76,17 @@ class DiskExportTarget:
     def __init__(self, mount_point: str, volume_id_file: str = "",
                  require_volume_id: bool = True,
                  min_free_margin_mb: int = 2048,
-                 warn_file_bytes: int = 3_800_000_000):
+                 warn_file_bytes: int = 3_800_000_000,
+                 verify_mode: str = "off"):
         self.mount_point = Path(mount_point)
         self.volume_id_file = volume_id_file
         self.require_volume_id = require_volume_id
         self.min_free_margin = min_free_margin_mb * 1024 * 1024
         self.warn_file_bytes = warn_file_bytes
+        #: 校验档位 `off` / `digest` / `readback`（见 `ConfigManager.VERIFY_MODES`）。
+        #: 放在这里而不是复制函数上：它是**配置的落点**，`copy_file` 只关心
+        #: "要不要算摘要"这一个布尔，不该知道档位的名字。
+        self.verify_mode = verify_mode
         #: 这个挂载点是**自动枚举**得来的（不是配置里手写的）。只影响报错措辞：
         #: 枚举来的路径"不存在"意思是"盘没插"，说成"路径写错、请改配置"会让人去改
         #: 一个他根本没填过、也填不该填的字段。
@@ -322,6 +327,13 @@ class DiskExportTarget:
         hasher = hashlib.sha256() if digest else None
         try:
             with open(source, "rb") as src, open(tmp, "wb") as out:
+                # 告诉内核这是**纯顺序读**：预读窗口会更积极。拷贝本身就是
+                # 从头到尾一遍，没有任何随机访问的意图。拿不到这个接口就跳过
+                # （它不是正确性所需，只是给内核的一条提示）。
+                try:
+                    os.posix_fadvise(src.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL)
+                except (AttributeError, OSError):
+                    pass
                 while True:
                     chunk = src.read(self.COPY_CHUNK)
                     if not chunk:
