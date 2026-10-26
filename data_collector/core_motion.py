@@ -145,35 +145,6 @@ ARM_STREAM_SEC = 1.6
 #: 躯干到位后按目标保持多久（秒）：p2-p3.py 是 3s，这里取"够控制器收敛"即可
 TRUNK_HOLD_SEC = 0.8
 
-# ============ 【采数专用】头部走到 -32°（现场 2026-10-15 要求） ============
-#: 专用脚本（项目 `scripts/` 下；由 `ConfigManager.resolve_script_path` 定位）。
-#:
-#: **为什么单独一份、而不是复用 `motion_stream.py`**：两者的**准备阶段间隔不同** ——
-#: 现场实测能用的那一份（用户提供的 `to-32.py`）是 `connect → 等 2s → motor_mode →
-#: 等 2s → connect → 等 2s`，而 `motion_stream.py` 每步只等 0.3s。
-#: `motor_mode` 改完会让控制节点重新连电机，**重连期间发出去的目标会被静默丢弃**
-#: （表现是"命令发了、订阅者也匹配、机构就是不动"）。
-#: **以现场实测过的时序为准** —— 那个时序是"能动"的直接证据。
-HEAD_STREAM_SCRIPT = "head_minus32.py"
-#: 要动的轴：**H6（颈 · 抬头）**，0 基下标 5。
-#: 与 `TRUNK_AXES` 的顺序一致（脚踝 / 膝 / 大腿 / 腰 / 颈转 / 颈抬）。
-HEAD_DATA_AXIS_INDEX = 5
-#: 目标角度（度）。**超出 SDK 文档写的 H6 量程下限 -30°** —— 这是现场采数要的位姿，
-#: 现场脚本（`to-32.py`，用户提供并实测能用）里就是 `-32.0`。
-#: ⚠️ 越界这件事**只发生在专用脚本内部**（它不做量程检查）；通用下发路径
-#: （轴表 / 预设 / 手动输入 / `motion_stream.py`）仍是文档量程，
-#: 「越界只拦下、不静默钳位」那条纪律不变。
-#: 与 `scripts/head_minus32.py::HEAD_TARGET_DEG` 必须一致（两处各一份：那个脚本是
-#: 独立进程、不 import 包），由 `tests/test_scripts.py` 的契约用例钉住。
-HEAD_DATA_TARGET_DEG = -32.0
-#: 下面三个**只用来给这个动作算等待上限**（脚本自己管时序，不读这三个数）。
-#: 数值与 `scripts/head_minus32.py` 的同名常量必须一致 —— 对不上会让"其实在跑"
-#: 被判成超时。契约同样由 `tests/test_scripts.py` 钉住。
-HEAD_DATA_DURATION_SEC = 5.0
-HEAD_DATA_RATE = 100
-HEAD_DATA_HOLD_SEC = 3.0
-#: 这个动作整体的等待上限（秒）：准备 6s + 插值 5s + 保持 3s，再给启动与 DDS 发现留余量。
-HEAD_DATA_STREAM_TIMEOUT = 60.0
 #: 等一条实时流结束的上限（秒）：时长 + 保持 + 脚本启动与 DDS 发现的开销
 STREAM_TIMEOUT_PAD = 25.0
 #: 手臂实时流（follow_position）话题：`_set` 是 Bool 开关，`_update` 是 7 弧度的
@@ -330,7 +301,7 @@ def stream_job_summary(job: dict) -> str:
 def stream_job_key(job: dict) -> str:
     """一条实时流任务的唯一标识（结果字典的键、日志里的名字）。
 
-    带 `label` 的任务用它（专用动作要让人一眼看出是哪一件事，例如"头部至 -32°"）；
+    带 `label` 的任务用它（专用动作要让人一眼看出是哪一件事）；
     否则按 kind/side 给通用名字。
     """
     if job.get("label"):
@@ -364,12 +335,12 @@ def stream_job_args(job: dict) -> List[str]:
     * `values`：完整目标（躯干 6 个度 / 手臂 7 个弧度）—— 既有用法，行为不变；
     * `set_axes`：``{轴下标: 值}``，**其余轴保持脚本自己读到的那一帧当前角度** ——
       调用方不必先读一遍角度再拼 6 个值，否则两次读数之间的差异会变成其余轴的一次
-      无谓运动。**通用能力，当前没有调用方**：头部那个现场动作走专用脚本
-      （`HEAD_STREAM_SCRIPT`），因为它的准备阶段间隔是现场实测过的 2s，
-      而本脚本是 0.3s（见 `HEAD_STREAM_SCRIPT` 那段）。
+      无谓运动。**通用能力，当前没有调用方**。
 
-    ``force=True`` 会带上 `--force` 跳过脚本的量程检查：**只有明确要越界时才给**
-    （当前只有"头部至 -32°"一处，见 `HEAD_DATA_TARGET_DEG`）。默认不带。
+    ``force=True`` 会带上 `--force` 跳过脚本的量程检查：**只有明确要越界时才给**。
+    **当前没有调用方** —— 此前唯一的用处（头部 H6 走到 -32°，文档量程 ±30°）
+    已移交机器侧维护（v6.8.0 从本程序移除）。能力保留：它是通用下发参数，
+    不属于那条功能。默认不带。
     """
     args = [job["kind"], "--duration", fmt_number(job["duration"]),
             "--rate", str(int(job["rate"]))]

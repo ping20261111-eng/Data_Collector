@@ -24,8 +24,7 @@ from html import escape as html_escape
 from pathlib import Path
 from ... import theme
 from ...core import ConfigManager, logger, ProcessManager, DEFAULT_ACTION_LABELS
-from ...core_motion import (HEAD_DATA_AXIS_INDEX, HEAD_DATA_TARGET_DEG,
-                            TRUNK_LOCK_AXES_TEXT)
+from ...core_motion import TRUNK_LOCK_AXES_TEXT
 from ...core_operations import (Launcher, TeleopManager, SdkServiceManager,
                               read_robot_status, EMERGENCY_STOP_TARGETS,
                               EMERGENCY_STOP_PART_NAMES)
@@ -386,66 +385,6 @@ class StatusMixin:
         if self._trunk_lock_pending:
             self._trunk_lock_pending = False
             self._start_trunk_lock(report, resend=True)
-
-    # ---------- 头部至 -32°（采数，与自锁同构） ----------
-    @guard_slot
-    def on_head_minus32(self):
-        """菜单「头部至 -32°（采数）」：读当前角度 → 只把 H6 改成目标 → 平滑到位。
-
-        **动机构的动作一律先二次确认**（与自锁 / 预设 / 整组下发同一条纪律）。确认框里
-        把三件事说清：
-
-        1. 只动 H6，其余 5 轴保持当前角度 —— 做法是**让脚本用它自己读到的当前角度当基准**
-           （`motion_stream.py --set`）。所以这里不先读一遍角度：那会变成两次读数，
-           两次之间的差异会变成其余轴的一次无谓运动。
-        2. 目标**超出 SDK 文档量程**（文档写 H6 为 ±30°）—— 这是现场采数要的位姿
-           （依据见 `core_motion.HEAD_DATA_TARGET_DEG`）。
-        3. **遥操作还开着时会被手柄覆盖** —— 让现场先停止遥操作再点，避免"点了没反应"。
-        """
-        ask = (f"将把头部 H{HEAD_DATA_AXIS_INDEX + 1}（颈 · 抬头）走到 "
-               f"{HEAD_DATA_TARGET_DEG:g}°：\n"
-               f"· 只动这一个轴，其余 5 轴保持当前角度"
-               f"（脚本先读一次当前角度，读不到就整个不动）；\n"
-               f"· 该角度超出 SDK 文档的量程（文档写 H{HEAD_DATA_AXIS_INDEX + 1} 为 ±30°）"
-               f"—— 这是采数要的位姿；\n"
-               f"· 遥操作还开着时躯干由手柄控制，这一下会被覆盖 —— 先停止遥操作再点。\n\n"
-               f"是否继续？")
-        if QMessageBox.question(self, "确认头部到采数位姿", ask,
-                                QMessageBox.Yes | QMessageBox.No,
-                                QMessageBox.No) != QMessageBox.Yes:
-            self.append("已取消：头部至采数位姿")
-            return
-        self.append(f"头部至 {HEAD_DATA_TARGET_DEG:g}°：正在下发"
-                    f"（先读当前角度，再只改 H{HEAD_DATA_AXIS_INDEX + 1}）…")
-        # 线程引用自己留着：`LocalTaskThread` 刻意不接收 parent（挂到窗口上当子对象，
-        # 会让 Qt 在销毁窗口时连带销毁还在收尾的线程 —— 那就是 C 层段错误）。
-        #
-        # `on_line=self.append` 是**安全**的：主窗口的 `append` 走 `log_signal.emit`
-        # （Qt 信号跨线程自动排队到主线程），不是直接碰控件 —— 与姿势页那个 `_report`
-        # 不同（那个直接 `self.result.append`，从工作线程调就是段错误，见 v6.5.2 那条）。
-        # 传它是为了把脚本的进度行（等第一帧 / 已走 25% / 已到位）实时显示出来。
-        self._head_stream_thread = LocalTaskThread(
-            lambda: self.launcher.head_to_data_position(on_line=self.append))
-        self._head_stream_thread.finished.connect(self._on_head_minus32_done)
-        self._head_stream_thread.start()
-
-    @guard_slot
-    def _on_head_minus32_done(self, ok: bool, payload, error: str):
-        """回报。三种结果**分开说**：走到位 / 没走成 / **未经确认**（不合并成一句）。"""
-        label = f"头部至 {HEAD_DATA_TARGET_DEG:g}°"
-        if not (ok and isinstance(payload, dict)):
-            self.append(f"⚠ {label}未完成：{error or '后台任务没有回话'}")
-            return
-        status = payload.get("ok")
-        if status is True:
-            # 脚本"走到位才返回 0"，所以正常退出就是它自己确认到位了
-            self.append(f"✅ {label}已到位（H{payload.get('axis')}）—— "
-                        "脚本正常结束 = 它自己走到了才退")
-        elif status is None:
-            self.append(f"⚠ {label} —— 未经确认：{payload.get('reason') or '没有得到退出码'}")
-        else:
-            self.append(f"⚠ {label}没有走成："
-                        f"{payload.get('reason') or '脚本没有正常结束'}")
 
     def _robot_monitor_running(self) -> bool:
         return (self.robot_monitor_proc is not None

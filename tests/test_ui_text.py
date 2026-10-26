@@ -40,7 +40,7 @@ TEXT_CLASSES = {"QLabel", "QMessageBox", "QInputDialog", "append", "show_error",
 #: **v6.5.3 补 `append`**：日志区那条路的最后一跳就是 `self.append(...)`，而
 #: `_is_text_call` 对属性调用的判定是"`func.attr` 在清单里" —— `append` 原先不在，
 #: 于是 `self.append("…**未确认**…")` **整类躲过了扫描**。
-#: 实测漏掉的后果：`_on_head_minus32_done` 与 `launch.py` 的清理风险提示都带着一对
+#: 实测漏掉的后果：`_on_trunk_lock_done` 与 `launch.py` 的清理风险提示都带着一对
 #: 星号显示给现场（日志区是 `QTextEdit`，不渲染 markdown，只显示字面的 `**`）。
 TEXT_SINKS = {"_report", "_note", "append"}
 

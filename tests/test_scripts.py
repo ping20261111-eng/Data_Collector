@@ -1310,7 +1310,7 @@ def test_motion_stream_limits_and_rate_match_the_robot_side_sources(stream_modul
         assert round(1000 / 8) == stream_module.DEFAULT_ARM_RATE
 
 
-# ==================== 【采数】头部至 -32°：只改一个轴 ====================
+# ==================== 躯干实时流：只改指定轴（--set / --force，通用能力） ====================
 # 现场 2026-10-15 的要求：点一下把 H6 走到 -32°，**其余轴保持当前角度**。
 # 做法是给 `motion_stream.py` 加了 `--set`（目标 = 脚本自己读到的当前角度 + 覆写指定的轴），
 # 而不是让上位机先读一遍角度、再拼 6 个值发 `--values` —— 那是两次读数，两次之间的差异
@@ -1379,8 +1379,8 @@ def test_main_set_mode_refuses_out_of_range_without_force(stream_module, capsys)
     """-32 超出文档量程（H6 是 ±30）→ **不给 `--force` 就拦下，一个值都不发**。
 
     守的是"越界只拦下、不静默钳位"那条纪律在新加的 `--set` 这条路上同样成立
-    （新参数最容易只做对 happy path）。`--force` 的唯一用处见
-    `core_motion.HEAD_DATA_TARGET_DEG`。
+      （新参数最容易只做对 happy path）。`--force` 当前**没有调用方** ——
+      此前唯一的用处（头部 H6 走到 -32°）已移交机器侧，能力本身保留。
     """
     streamer = _HeadStreamRecorder()
     code = stream_module.main(
@@ -1440,176 +1440,6 @@ def test_main_rejects_values_and_set_together(stream_module, capsys):
     assert "只能给一个" in capsys.readouterr().out
 
 
-# ========== head_minus32.py（头部至 -32°：专用脚本，时序照现场实测那份）==========
-# 现场 2026-10-15：用户提供的 `to-32.py` 实测能驱动机构，要求按时序实现。
-# 它与 `motion_stream.py` 的**关键差别是准备阶段的间隔**（2s vs 0.3s）——
-# 下面第一条守卫盯的就是它，因为"把两个脚本的等待时间统一一下"这个念头非常自然，
-# 而那会把现场验证过的时序改坏，且坏得很安静（目标被控制节点静默丢弃）。
-
-@pytest.fixture
-def head_module(stream_module):
-    """加载 `scripts/head_minus32.py`。
-
-    直接依赖 `stream_module`：它已经把 rclpy / std_msgs / wheeled_robot_msgs 的替身装进
-    `sys.modules`，两个脚本要的替身项是同一套（都订阅 `TrunkState`、都发
-    `Bool` / `Byte` / `Float32MultiArray`）。
-    """
-    return _load_module("head_minus32", "head_minus32.py")
-
-
-class _HeadScriptStreamer:
-    """`head_minus32.py` 的 streamer 替身：把"等了多久"也记下来。
-
-    ⚠️ **必须记 `spins`**：这个脚本的核心特征是"准备阶段每步等 2s"，
-    而等待是通过 `spin(seconds)` 表达的 —— 只记录"发了什么"的话，
-    时序这条最关键的约束就完全测不到。
-    """
-
-    def __init__(self, current=(55.0, 100.0, 45.0, 0.0, 0.0, 0.0)):
-        self.current = None if current is None else list(current)
-        self.spins = []          # 每次 spin 等了多少秒
-        self.other = []          # (类型, 话题, 值) —— 准备阶段的三步
-        self.targets = []        # 发出去的躯干目标序列
-        self.listened = False
-
-    def listen(self):
-        self.listened = True
-
-    def wait_current(self, timeout=0):
-        return None if self.current is None else list(self.current)
-
-    def spin(self, seconds):
-        self.spins.append(round(float(seconds), 3))
-
-    def publish_bool(self, topic, value):
-        self.other.append(("bool", topic, bool(value)))
-
-    def publish_byte(self, topic, value):
-        self.other.append(("byte", topic, int(value)))
-
-    def publish_target(self, values):
-        self.targets.append([float(item) for item in values])
-
-    def current_missing_reason(self):
-        return "（替身）读不到当前角度"
-
-    def shutdown(self):
-        pass
-
-
-def test_head_script_prepares_with_the_field_proven_two_second_gaps(head_module):
-    """⚠️ 准备阶段**每步等 2s** —— 这是"能动"与"不动"的分界，别改小。
-
-    现场那份脚本（用户提供、实测能用）的准备是
-    `connect` → 等 2s → `motor_mode 1` → 等 2s → `connect` → 等 2s。
-    而 `motor_mode` 改完会让控制节点**重新连电机** —— 重连期间发出去的目标
-    **会被静默丢弃**，表现是"命令发了、订阅者也匹配、机构就是不动"。
-
-    这条守卫盯的是"顺手统一"这个动作：`motion_stream.py` 用的是 0.3s，
-    很容易有人把这里的 2s 也改成 0.3s。改坏之后本地测试照样绿（时序不影响断言），
-    只有现场会表现为"点了没反应"。
-    """
-    assert head_module.PREPARE_GAP == 2.0, (
-        "准备间隔必须保持现场脚本的 2s；改小会让目标被控制节点静默丢弃")
-
-    streamer = _HeadScriptStreamer(current=[10.0, 20.0, 30.0, 0.0, 0.0, 5.0])
-    assert head_module.run(streamer) == head_module.EXIT_OK
-
-    assert streamer.listened, "必须先建订阅（准备那几秒里就把当前角度收进来）"
-    kinds = [(kind, topic) for kind, topic, _value in streamer.other]
-    assert kinds == [
-        ("bool", head_module.TRUNK_CONNECT_TOPIC),
-        ("byte", head_module.TRUNK_MODE_TOPIC),
-        ("bool", head_module.TRUNK_CONNECT_TOPIC),
-    ], f"准备三步的顺序不对：{kinds}"
-    assert streamer.spins[:3] == [2.0, 2.0, 2.0], (
-        f"准备阶段每步必须等 2s：{streamer.spins[:3]}")
-    # 第二步必须是"切实时"那个值（0x01）
-    assert streamer.other[1][2] == head_module.TRUNK_MODE_REALTIME == 1
-
-
-def test_head_script_moves_only_the_head_axis(head_module):
-    """起点 = **读到的当前角度**，终点只改 H6；**其余 5 轴全程一个都不动**。
-
-    这就是现场那句「读取现在躯干的角度，写入 start_position，然后将 H6 改为 -32」。
-    若误把起点写成常量 `[55, 100, 45, 0, 0, 0]`（现场脚本里就是这么写的），
-    H1~H5 会跟着走一大段 —— 采数前的一次定位会变成一次全身动作。
-    """
-    current = [10.0, 20.0, 30.0, 1.0, 2.0, 5.0]
-    streamer = _HeadScriptStreamer(current=current)
-
-    assert head_module.run(streamer) == head_module.EXIT_OK
-
-    targets = streamer.targets
-    assert targets, "应当发出目标"
-    assert targets[0] == current, f"起点必须是当前角度：{targets[0]}"
-    assert targets[-1] == [10.0, 20.0, 30.0, 1.0, 2.0, -32.0], \
-        f"终点应当是当前角度 + H6 = -32：{targets[-1]}"
-    for frame in targets:
-        assert frame[:5] == current[:5], f"没被点名的轴动了：{frame}"
-    # 目标要覆盖整条插值（不是只发一条）
-    assert len(targets) > head_module.RATE, f"目标条数太少，像是没插值：{len(targets)}"
-
-
-def test_head_script_does_not_move_when_the_current_angle_is_unreadable(head_module):
-    """读不到当前角度 → **一个目标都不发**（退出码 3）。
-
-    这条比 `--values` 那条更要紧：目标 = 当前角度 + 覆写 H6，读不到当前值就**构造不出目标**，
-    那时最坏的做法是拿 0 当基准 —— 会把 H1~H5 一起带向 0°。
-    """
-    streamer = _HeadScriptStreamer(current=None)
-
-    assert head_module.run(streamer) == head_module.EXIT_NO_DATA
-    assert streamer.targets == [], "读不到当前角度时必须一个目标都不发"
-
-
-def test_head_script_does_not_set_the_layout(head_module):
-    """照现场脚本：**不设 `layout`**，只发 `data`。
-
-    这条容易被"顺手补上"：v6.3.3 有一条实测结论"躯干目标必须设 `data_offset = 1`"，
-    但那说的是**非实时 + 单条点位**那条路；实时模式那条路的现场可用样本**都不设**。
-    两条路不能互相套用（`core_motion` 的 docstring 里也是这么写的）。
-    """
-    import inspect
-
-    source = inspect.getsource(head_module.RosStreamer.publish_target)
-    # docstring 里正是在解释"为什么不设 layout"，所以只检查 docstring **之后**的代码
-    body = source.split('"""', 2)[-1]
-    assert ".layout" not in body and "layout=" not in body, (
-        "`publish_target` 不该设 layout —— 实时模式下照现场脚本原样发 data 就行")
-
-
-def test_head_script_constants_match_the_client(head_module):
-    """脚本里的常量与上位机侧那份**必须一致**（两处各一份：脚本是独立进程、不 import 包）。
-
-    漂了的表现：上位机按 5s/100Hz/3s 算等待上限，而脚本实际按别的节奏跑 ——
-    "其实在跑"会被判成超时（或反过来，超时了还在等）。
-    """
-    from data_collector import core_motion
-
-    assert head_module.HEAD_TARGET_DEG == core_motion.HEAD_DATA_TARGET_DEG == -32.0
-    assert head_module.HEAD_AXIS_INDEX == core_motion.HEAD_DATA_AXIS_INDEX == 5
-    assert head_module.DURATION == core_motion.HEAD_DATA_DURATION_SEC
-    assert head_module.RATE == core_motion.HEAD_DATA_RATE
-    assert head_module.HOLD == core_motion.HEAD_DATA_HOLD_SEC
-    # 话题名与模式值也必须一致（脚本自己写死，不 import 包）
-    assert head_module.TRUNK_TARGET_TOPIC == core_motion.TRUNK_TARGET_TOPIC
-    assert head_module.TRUNK_MODE_TOPIC == core_motion.TRUNK_MODE_TOPIC
-    assert head_module.TRUNK_CONNECT_TOPIC == core_motion.TRUNK_CONNECT_TOPIC
-    assert head_module.TRUNK_MODE_REALTIME == core_motion.TRUNK_MODE_REALTIME
-
-
-def test_head_script_waits_for_the_first_frame_instead_of_assuming_zero(head_module):
-    """`head_target` 是**纯函数**：目标只由"当前角度 + 常量"决定，没有隐式的 0 基准。"""
-    assert head_module.head_target([1.0, 2.0, 3.0, 4.0, 5.0, 6.0]) == \
-        [1.0, 2.0, 3.0, 4.0, 5.0, -32.0]
-    # 入参不被改动
-    source = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-    head_module.head_target(source)
-    assert source == [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
-
-
-
 # ========== ROS 数组字段：不能对数组求布尔值（现场踩过**两次**：2026-09-29 / 2026-10-16）==========
 #
 # ⚠️ 数组替身**不要另写一个** —— 本文件下面已经有一个 `_AmbiguousArray`
@@ -1628,59 +1458,10 @@ class _StateMsg:
         self.joint_position = _AmbiguousArray(position)
 
 
-def test_head_script_reads_the_current_angle_from_a_real_numpy_array(head_module):
-    """有 numpy 时，用**现场那个真实类型**再钉一遍。
-
-    替身（`_AmbiguousArray`）是自己模拟的语义；这一条用的是真的 `numpy.ndarray`
-    —— 实测 1.26.4，`list(a or [])` 抛出的报错文本与现场 traceback **逐字一致**。
-    没有 numpy 的环境自动跳过；替身那条**始终**在跑，所以覆盖不会丢。
-    """
-    np = pytest.importorskip("numpy")
-
-    streamer = head_module.RosStreamer.__new__(head_module.RosStreamer)
-    streamer.state_msgs = 0
-    streamer.field_errors = 0
-    streamer._current = None
-
-    msg = _StateMsg([0.0] * 6)
-    msg.joint_position = np.array([50.595, 90.953, 40.602, 0.0, 0.0, 0.0], dtype="float32")
-
-    streamer._on_trunk_state(msg)
-
-    assert streamer._current is not None, "真 numpy 数组也必须读得到"
-    assert [round(item, 3) for item in streamer._current] == \
-        [50.595, 90.953, 40.602, 0.0, 0.0, 0.0]
-    assert streamer.field_errors == 0
-
-
-def test_head_script_reads_the_current_angle_from_a_ros_array(head_module):
-    """`head_minus32.py` 必须能从**真实的 ROS 数组字段**里读出当前角度。
-
-    现场 2026-10-16：点「头部至 -32°」崩在
-    `position = list(getattr(msg, "joint_position", []) or [])`，
-    功能完全走不通。这条用例修复前必红（`_AmbiguousArray.__bool__` 抛 ValueError）。
-    """
-    streamer = head_module.RosStreamer.__new__(head_module.RosStreamer)
-    streamer.state_msgs = 0
-    streamer.field_errors = 0
-    streamer._current = None
-
-    angles = [50.595, 90.953, 40.602, 0.0, 0.0, 0.0]
-    streamer._on_trunk_state(_StateMsg(angles))
-
-    assert streamer._current == angles, "从数组字段里也必须读得到当前角度"
-    assert streamer.field_errors == 0, "类型是正常的，不该记成字段错误"
-
-    # 轴数不对时不写入（别把残缺的一帧当当前角度）
-    streamer_current = streamer._current
-    streamer._on_trunk_state(_StateMsg([1.0, 2.0]))
-    assert streamer._current == streamer_current
-
-
 def test_motion_stream_reads_trunk_and_arm_from_ros_arrays(stream_module):
     """同一处写法在 `motion_stream.py` 里也有两份（躯干 / 手臂），一并钉住。
 
-    它比 `head_minus32.py` 更危险：**躯干下发与手臂下发都走它** ——
+    它比「只改一个轴」那条路更危险：**躯干下发与手臂下发都走它** ——
     只要真机上 `joint_position` 是数组，这两条路都会崩。
     """
     streamer = stream_module.RosStreamer.__new__(stream_module.RosStreamer)

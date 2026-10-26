@@ -134,10 +134,6 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         self._trunk_lock_threads: list = []
         #: 自锁还在下发时又按了一次：它一回来立刻补发（不丢这次按下）。
         self._trunk_lock_pending = False
-        # 头部至 -32°（采数）的后台线程，与自锁同一条理由：引用自己留着，
-        # `LocalTaskThread` 刻意不接收 parent（见 status.py / threads.py 的说明）。
-        self._head_stream_thread = None
-
         # 连接信号
         self.progress_signal.connect(self.update_progress_label)
         self.log_signal.connect(self.append_safe)

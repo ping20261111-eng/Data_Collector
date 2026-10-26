@@ -19,10 +19,7 @@ from .core import (
     load_calibrations, load_yaml, normalize_user,
 )
 # 姿势控制用到的常量与 payload 构造函数（话题名/消息类型/单位换算只有一处定义 —— 见 core_motion）
-from .core_motion import (HEAD_DATA_AXIS_INDEX, HEAD_DATA_DURATION_SEC,
-                          HEAD_DATA_HOLD_SEC, HEAD_DATA_RATE, HEAD_DATA_STREAM_TIMEOUT,
-                          HEAD_DATA_TARGET_DEG, HEAD_STREAM_SCRIPT,
-                          MOTION_STREAM_SCRIPT, STREAM_TIMEOUT_PAD,
+from .core_motion import (MOTION_STREAM_SCRIPT, STREAM_TIMEOUT_PAD,
                           TRUNK_LOCK_AXES_TEXT, TRUNK_LOCK_INDEXES,
                           TRUNK_LOCK_LAYOUT_OFFSET, TRUNK_LOCK_MSG, TRUNK_LOCK_TOPIC,
                           stream_job_args, stream_job_key)
@@ -2145,53 +2142,6 @@ class Launcher:
                 emit(f"[{key}] 脚本以退出码 {code} 结束（原因见上面那几行）")
                 results[key] = False
         return results
-
-    def head_to_data_position(self, on_line=None, is_aborted=None) -> dict:
-        """【采数专用】把头部 **H6** 走到 `HEAD_DATA_TARGET_DEG`（-32°），其余轴保持当前角度。
-
-        现场（2026-10-15）要的动作：**点一下就到位**，然后在这个位姿采数。
-        起的是**专用脚本** `scripts/head_minus32.py` —— 它的时序**逐字来自现场实测能用的
-        那份脚本**（用户提供的 `to-32.py`）：
-
-            connect → 等 2s → motor_mode 1 → 等 2s → connect → 等 2s
-            → 100Hz easeInOutCubic 插值 5s → 按目标保持 3s
-
-        **为什么不复用 `motion_stream.py`**：那份的准备阶段每步只等 0.3s，而 `motor_mode`
-        改完会让控制节点重新连电机 —— **重连期间发出去的目标会被静默丢弃**
-        （表现是"命令发了、订阅者也匹配、机构就是不动"）。现场那份脚本 2s 的间隔是
-        "能动"的直接证据，所以以它为准。
-
-        **"读当前角度 → 只改 H6"这两步都在脚本里**，所以这里不预先读一遍：若在界面侧先读
-        一次、脚本再读一次，两次读数之间的差异会变成其余 5 轴的一次无谓运动。
-
-        **读不到当前角度就不动**：脚本自己判（退出码 3），这里如实回报，不假装成功。
-
-        ⚠️ **H6 的 -32° 超出 SDK 文档写的量程下限 -30°** —— 越界只发生在**那份专用脚本
-        内部**（它不做量程检查，目标常量是现场定的）；通用下发路径（轴表 / 预设 /
-        手动输入 / `motion_stream.py`）仍是文档量程。
-
-        Returns:
-            ``{ok, axis, value, reason}``；`ok` 取 `True`（脚本正常退出，它走到位才退）/
-            `False`（脚本非 0 退出，原因已随进度行打出）/ `None`（**没取到退出码 = 未经确认**）。
-        """
-        job = {
-            "kind": "trunk",
-            "label": f"头部至 {HEAD_DATA_TARGET_DEG:g}°",
-            "script": HEAD_STREAM_SCRIPT,     # 专用脚本（时序现场实测过，见常量说明）
-            "args": [],                       # 目标与节奏都写在那份脚本里
-        }
-        results = self.run_motion_streams([job], on_line=on_line, is_aborted=is_aborted,
-                                          timeout=HEAD_DATA_STREAM_TIMEOUT)
-        ok = results.get(stream_job_key(job))
-        if ok is None:
-            reason = "没有得到退出码 —— 未经确认（可能已超时或被中止）"
-        elif ok is False:
-            reason = ("脚本没有正常结束（最常见的原因是读不到当前角度、或 ROS 环境没就绪）"
-                      "—— 具体原因见上面那几行")
-        else:
-            reason = ""
-        return {"ok": ok, "axis": HEAD_DATA_AXIS_INDEX + 1,
-                "value": HEAD_DATA_TARGET_DEG, "reason": reason}
 
     def release_hardware_connections(self, timeout: float = 4.0) -> List[str]:
         """向 躯干 / 手臂 / 底盘 下发 `connect=false`（下使能），返回可直出的日志行。

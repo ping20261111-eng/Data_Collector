@@ -2967,7 +2967,7 @@ def test_robot_menu_wired(ui_env):
     # 名称写全、**不带省略号**（现场 2026-09-28 要求："下拉菜单的名称补全，不要有…"）
     assert actions == ["夹爪控制", "末端参数", "姿势控制",
                        "开始标定（自动启动节点）", "戳点", "躯干自锁",
-                       "头部至 -32°（采数）", "全屏显示"]
+                           "全屏显示"]
     assert not any(act.text().endswith("…") for act in menu.actions() if act.text())
     # 分隔线代替层级：把"开窗口"、"起节点"、"直接改机构状态"、"操作窗口"四组分开
     assert sum(1 for act in menu.actions() if act.isSeparator()) == 3
@@ -8282,83 +8282,30 @@ def test_the_menu_trunk_lock_ignores_the_checked_flag(status_env, monkeypatch):
     assert calls == ["lock", "lock"], (
         f"两次触发都必须下发自锁，实际收到 {calls}")
 
-def test_head_to_minus32_is_reachable_from_the_robot_menu(status_env):
-    """「机器人控制 ▾」里有「头部至 -32°（采数）」—— 现场点的就是这一项。
+def test_the_head_minus32_feature_is_really_gone(status_env):
+    """头部 H6 走到 -32° 这个功能**已移交机器侧**（v6.8.0 从本程序移除）。
 
-    放菜单而不是姿势控制页，是有意的：现场说「启动遥操作后点它」，而姿势控制页在
-    遥操作运行期间会挡住下发（那一页的规矩是"先停止遥操作"）。菜单项不受那个门禁。
+    为什么留这条守卫：移除是**有意的决定**，不是漏改。没有它，下一个人 diff 到
+    "菜单少了一项、脚本少了一个" 时只能猜；万一有人把手改回去一半（比如只加回菜单项
+    不加回脚本），现场就会看到"点了没反应"。
+
+    查四层：界面入口 / 后台方法 / 专用脚本 / 配置常量。
     """
-    win, _cm, _status_file = status_env
-    assert hasattr(win, "btn_head_minus32"), "机器人控制菜单里应当有这个动作"
-    assert win.btn_head_minus32.text() == "头部至 -32°（采数）"
-    assert win._head_stream_thread is None
+    from pathlib import Path as _Path
 
+    win, _cm, _status = status_env
+    assert not hasattr(win, "btn_head_minus32"), "菜单里不该再有这个动作"
+    assert not hasattr(win, "on_head_minus32"), "界面槽不该留着"
+    assert not hasattr(win.launcher, "head_to_data_position"), "后台方法不该留着"
 
-def test_head_to_minus32_asks_before_moving_and_does_nothing_on_cancel(status_env,
-                                                                      monkeypatch):
-    """**动机构的动作一律先二次确认**（与自锁 / 预设 / 整组下发同一条纪律）。
+    from data_collector import core_motion
+    for name in ("HEAD_DATA_TARGET_DEG", "HEAD_STREAM_SCRIPT", "HEAD_DATA_AXIS_INDEX",
+                 "HEAD_DATA_STREAM_TIMEOUT"):
+        assert not hasattr(core_motion, name), f"{name} 应当随功能一起删除"
 
-    点「否」时**一个任务都不该起** —— 否则"确认框"只是摆设。
-    """
-    win, _cm, _status_file = status_env
-    lines = []
-    monkeypatch.setattr(win, "append", lambda text: lines.append(text))
-    monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
-                        lambda *args, **kwargs: _BOX.No)
-    started = []
-    monkeypatch.setattr(win.launcher, "head_to_data_position",
-                        lambda **kwargs: started.append(kwargs) or {"ok": True})
-
-    win.on_head_minus32()
-
-    assert started == [], "点了「否」就不该下发"
-    assert any("已取消" in line for line in lines), f"应当说一句已取消：{lines}"
-
-
-def test_head_to_minus32_says_when_it_is_unconfirmed(status_env, monkeypatch):
-    """拿不到退出码时窗口里要写「未经确认」——**不能写成"已到位"**（与自锁同一条）。
-
-    同时钉住**进度回调必须是主窗口的 `append`**：`on_line` 是在工作线程里被调的，
-    主窗口的 `append` 走 `log_signal.emit`（跨线程排队，安全），而姿势控制页那个
-    `_report` 是**直接碰控件** —— 从工作线程调就是段错误（v6.5.2 踩过一次）。
-    """
-    win, _cm, _status_file = status_env
-    lines = []
-    monkeypatch.setattr(win, "append", lambda text: lines.append(text))
-    _inline_task_thread(monkeypatch)
-    monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
-                        lambda *args, **kwargs: _BOX.Yes)
-
-    def fake_head(**kwargs):
-        assert kwargs.get("on_line") == win.append, (
-            "进度回调必须走主窗口的 append（走信号、线程安全）")
-        return {"ok": None, "axis": 6, "value": -32.0, "reason": "没有得到退出码"}
-
-    monkeypatch.setattr(win.launcher, "head_to_data_position", fake_head)
-
-    win.on_head_minus32()
-
-    joined = "\n".join(lines)
-    assert "未经确认" in joined, f"应当如实说未经确认：{joined}"
-    assert "已到位" not in joined, "拿不到退出码时不能写成已到位"
-
-
-def test_head_to_minus32_writes_the_actual_command_into_the_log(status_env, monkeypatch):
-    """走到位时的回报要**带上是哪个轴、哪个角度**（现场要能对上自己点的那一下）。"""
-    win, _cm, _status_file = status_env
-    lines = []
-    monkeypatch.setattr(win, "append", lambda text: lines.append(text))
-    _inline_task_thread(monkeypatch)
-    monkeypatch.setattr("data_collector.ui.panels.status.QMessageBox.question",
-                        lambda *args, **kwargs: _BOX.Yes)
-    monkeypatch.setattr(win.launcher, "head_to_data_position",
-                        lambda **kwargs: {"ok": True, "axis": 6, "value": -32.0,
-                                          "reason": ""})
-
-    win.on_head_minus32()
-
-    joined = "\n".join(lines)
-    assert "已到位" in joined and "H6" in joined and "-32" in joined, joined
+    project_root = _Path(__file__).resolve().parents[1]
+    assert not (project_root / "scripts" / "head_minus32.py").exists(), (
+        "专用脚本应当随功能一起删除（留着会被当成'还在用'）")
 
 
 # ==================== 角度读数：丢负号那个缺陷（现场「躯干角度显示不全」） ====================

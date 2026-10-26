@@ -7,9 +7,7 @@ from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout,
                              QPushButton, QCheckBox, QLabel, QProgressBar, QMenu,
                              QFrame, QSizePolicy, QAction, QMessageBox)
 from ... import theme
-from ...core_motion import (HEAD_DATA_AXIS_INDEX, HEAD_DATA_DURATION_SEC,
-                            HEAD_DATA_HOLD_SEC, HEAD_DATA_RATE, HEAD_DATA_TARGET_DEG,
-                            TRUNK_LOCK_AXES_TEXT)
+from ...core_motion import TRUNK_LOCK_AXES_TEXT
 
 from ..common import (SP, make_panel_head)
 from ..threads import LocalTaskThread
@@ -304,23 +302,6 @@ class ActionsMixin(ExportTargetMixin):
         # 用 lambda 明确不传参。
         self.btn_trunk_lock.triggered.connect(lambda *_args: self.on_trunk_lock())
 
-        # 头部至 -32°（采数，现场 2026-10-15 要求）：与自锁一样"不进页面、菜单里点一下"，
-        # 现场用它做采数前的定位。**点一下 = 读一次当前角度 → 只把 H6 改成目标 → 平滑到位**，
-        # 其余 5 轴保持不动（做法与依据见 `Launcher.head_to_data_position`）。
-        #
-        # 与自锁放在同一组（都属于"直接改机构状态"），并**照项目一致的做法走二次确认**：
-        # 它会真的让头部动起来，而且目标 -32° 超出文档量程（见下）—— 点错一次就是一次
-        # 机构动作。确认框里把三件事说清：只动一个轴、超出文档量程、遥操作在跑时会互相覆盖。
-        self.btn_head_minus32 = QAction(f"头部至 {HEAD_DATA_TARGET_DEG:g}°（采数）", self)
-        self.btn_head_minus32.setToolTip(
-            f"把头部 H{HEAD_DATA_AXIS_INDEX + 1}（颈 · 抬头）走到 "
-            f"{HEAD_DATA_TARGET_DEG:g}°，其余轴保持当前角度。\n"
-            f"会先读一次当前角度（读不到就不动）；{HEAD_DATA_DURATION_SEC:g}s / "
-            f"{HEAD_DATA_RATE}Hz 平滑到位，之后按目标保持 {HEAD_DATA_HOLD_SEC:g}s。\n"
-            f"⚠️ 该角度超出文档量程（文档写 H{HEAD_DATA_AXIS_INDEX + 1} 为 ±30°）"
-            "—— 这是现场采数要的位姿；通用下发路径仍然按文档量程拦。")
-        self.btn_head_minus32.triggered.connect(self.on_head_minus32)
-
         self.btn_fullscreen = QAction("全屏显示", self)
         self.btn_fullscreen.setShortcut("F11")
         self.btn_fullscreen.setToolTip("铺满整块屏幕（F11 也可切换）。"
@@ -338,7 +319,6 @@ class ActionsMixin(ExportTargetMixin):
         robot_menu.addAction(self.btn_pokepoint)
         robot_menu.addSeparator()          # 上面是"起节点"，这两条是"直接改机构状态"
         robot_menu.addAction(self.btn_trunk_lock)
-        robot_menu.addAction(self.btn_head_minus32)
         robot_menu.addSeparator()          # 上面都是"操作机器人"，这条是"操作这个窗口"
         robot_menu.addAction(self.btn_fullscreen)
         # 菜单项名字随「本页下发过什么」变（自锁 / 解除自锁）。本菜单的约定是
@@ -350,7 +330,7 @@ class ActionsMixin(ExportTargetMixin):
         self.btn_robot_menu.setProperty("variant", "ghost")
         self.btn_robot_menu.setMenu(robot_menu)
         self.btn_robot_menu.setToolTip("机器控制类功能：夹爪控制 / 末端参数 / 姿势控制 / "
-                                       "开始标定 / 戳点 / 躯干自锁 / 头部至 -32° / 全屏显示"
+                                       "开始标定 / 戳点 / 躯干自锁 / 全屏显示"
                                        "（都直接操作机器人本体；上、下使能在「姿势控制」页里）")
 
         # 停止相机标定：只在标定节点运行期间出现 —— 空闲时既不该占位、也不该
