@@ -4090,6 +4090,190 @@ def test_search_and_kind_filter_narrow_the_table(ui_env, tmp_path, monkeypatch):
     assert dialog.table.rowCount() == 2
 
 
+# ---------- 实时帧率看板（v6.7.5） ----------
+
+def _fake_recorder(bag_dir=None, active=True):
+    """录制器替身：只回答「在不在录」「当前往哪个目录写」。"""
+    class _Rec:
+        def __init__(self):
+            self.active = active
+            self.dir = bag_dir
+
+        def is_active(self):
+            return self.active
+
+        def current_bag_dir(self):
+            return self.dir if self.active else None
+
+    return _Rec()
+
+
+def _make_rate_bag(bag_dir, topics):
+    """造一个与 rosbag2 同结构的空 db3（只有话题表，还没落帧）。"""
+    import sqlite3
+
+    bag_dir.mkdir(parents=True, exist_ok=True)
+    db3 = bag_dir / f"{bag_dir.name}_0.db3"
+    conn = sqlite3.connect(db3)
+    conn.execute("CREATE TABLE topics (id INTEGER PRIMARY KEY, name TEXT, type TEXT)")
+    conn.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, topic_id INTEGER, "
+                 "timestamp INTEGER, data BLOB)")
+    conn.execute("CREATE INDEX timestamp_idx ON messages (timestamp ASC)")
+    for index, topic in enumerate(topics, start=1):
+        conn.execute("INSERT INTO topics VALUES (?,?,'x')", (index, topic))
+    conn.commit()
+    conn.close()
+    return db3
+
+
+def test_live_rate_is_off_by_default(ui_env):
+    """**默认关闭**：不打开就一分资源都不占（不开定时器、不建采样器、不显示读数行）。
+
+    这条要防的是"顺手把它默认打开" —— 那等于给每台机器都加一个每 2 秒跑一次的
+    定时器，而绝大多数场次并不看这个数。
+    """
+    win, _cm = ui_env
+
+    assert win.btn_live_rate.isChecked() is False
+    # 用 isHidden 而不是 isVisible：ui_env 不调用 show()，父窗口不可见时子控件的
+    # isVisible() 恒为 False —— 拿它当判据，这条用例永远绿、也就永远抓不到
+    # "默认打开"（项目里测按钮可见性一律用 isHidden，见 test_points 的既有写法）。
+    assert win.live_rate_label.isHidden() is True
+    assert win.live_rate_timer.isActive() is False
+    assert win.live_rate_sampler is None
+    assert win.btn_live_rate.text() == "显示帧率"
+
+
+def test_live_rate_toggle_on_shows_the_row_and_starts_the_timer(ui_env):
+    """打开：按钮改文案、读数行出现、定时器启动、采样器就位。"""
+    win, _cm = ui_env
+    win.btn_live_rate.setChecked(True)
+
+    win.on_toggle_live_rate()
+
+    assert win.live_rate_label.isHidden() is False
+    assert win.live_rate_timer.isActive() is True
+    assert win.live_rate_sampler is not None
+    assert win.btn_live_rate.text() == "隐藏帧率"
+
+
+def test_live_rate_says_not_recording_without_a_session(ui_env):
+    """没在录制：如实说"未在录制"，而不是显示一排 0 或破折号。
+
+    帧率的数据源是 bag，没有录制就没有可读的东西 —— 显示 0 会让现场去查相机。
+    """
+    win, _cm = ui_env
+    win.recorder = _fake_recorder(active=False)
+    win.btn_live_rate.setChecked(True)
+    win.on_toggle_live_rate()
+
+    assert "未在录制" in win.live_rate_label.text()
+
+
+def test_live_rate_waits_for_the_first_file(ui_env):
+    """在录制但 bag 目录还没出现：说"等待第一个文件落盘"，不要报错。"""
+    win, _cm = ui_env
+    win.recorder = _fake_recorder(bag_dir=None, active=True)
+    win.btn_live_rate.setChecked(True)
+    win.on_toggle_live_rate()
+
+    assert "等待第一个文件落盘" in win.live_rate_label.text()
+
+
+def test_live_rate_measures_then_reports_numbers(ui_env, tmp_path):
+    """第一次采样只取基准（"正在测量…"），第二次才出数字。"""
+    import sqlite3
+    import time
+
+    from data_collector.live_rate import TARGET_TOPICS
+
+    win, _cm = ui_env
+    bag = tmp_path / "bag" / "20261026_demo"
+    db3 = _make_rate_bag(bag, TARGET_TOPICS)
+    win.recorder = _fake_recorder(bag_dir=bag, active=True)
+    win.btn_live_rate.setChecked(True)
+    win.on_toggle_live_rate()
+
+    assert "正在测量" in win.live_rate_label.text(), "第一次采样只有基准，不产出读数"
+
+    time.sleep(0.3)
+    conn = sqlite3.connect(db3)
+    for i in range(9):                        # 9 帧 / 0.3 s ≈ 30 Hz
+        for topic_id in range(1, len(TARGET_TOPICS) + 1):
+            conn.execute("INSERT INTO messages (topic_id, timestamp, data) VALUES (?,?,?)",
+                         (topic_id, int(time.time() * 1e9) + i, b""))
+    conn.commit()
+    conn.close()
+    win._sample_live_rate()
+
+    text = win.live_rate_label.text()
+    assert text.startswith("帧率  "), text
+    assert "rgb" in text and "关节" in text, f"七个目标话题都要出现：{text}"
+    assert "—" not in text, f"第二次采样应当有数字：{text}"
+
+
+def test_live_rate_toggle_off_hides_and_releases(ui_env, tmp_path):
+    """关闭：读数行隐藏、定时器停、sqlite 连接释放（别留着占页缓存）。"""
+    from data_collector.live_rate import TARGET_TOPICS
+
+    win, _cm = ui_env
+    bag = tmp_path / "bag" / "demo"
+    _make_rate_bag(bag, TARGET_TOPICS)
+    win.recorder = _fake_recorder(bag_dir=bag, active=True)
+    win.btn_live_rate.setChecked(True)
+    win.on_toggle_live_rate()
+    sampler = win.live_rate_sampler
+    assert sampler._files, "打开并采样后应当持有连接"
+
+    win.btn_live_rate.setChecked(False)
+    win.on_toggle_live_rate()
+
+    assert win.live_rate_label.isHidden() is True
+    assert win.live_rate_timer.isActive() is False
+    assert win.live_rate_sampler is None
+    assert sampler._files == {}, "关闭时要释放 sqlite 连接"
+
+
+def test_live_rate_stopping_recording_drops_the_connection(ui_env, tmp_path):
+    """录制停止后：读数改回"未在录制"，并释放连接（避免长时间占着页缓存）。"""
+    from data_collector.live_rate import TARGET_TOPICS
+
+    win, _cm = ui_env
+    bag = tmp_path / "bag" / "demo"
+    _make_rate_bag(bag, TARGET_TOPICS)
+    recorder = _fake_recorder(bag_dir=bag, active=True)
+    win.recorder = recorder
+    win.btn_live_rate.setChecked(True)
+    win.on_toggle_live_rate()
+    sampler = win.live_rate_sampler
+    assert sampler._files
+
+    recorder.active = False
+    win._sample_live_rate()
+
+    assert "未在录制" in win.live_rate_label.text()
+    assert sampler._files == {}, "停止录制后不该继续持有连接"
+
+
+def test_live_rate_closing_the_window_releases_the_sampler(ui_env, tmp_path):
+    """关窗口要释放 sqlite 连接 —— 与其它资源一起收，别留给进程退出时兜底。"""
+    from data_collector.live_rate import TARGET_TOPICS
+
+    win, _cm = ui_env
+    bag = tmp_path / "bag" / "demo"
+    _make_rate_bag(bag, TARGET_TOPICS)
+    win.recorder = _fake_recorder(bag_dir=bag, active=True)
+    win.btn_live_rate.setChecked(True)
+    win.on_toggle_live_rate()
+    sampler = win.live_rate_sampler
+    assert sampler._files
+
+    win._shutdown_threads()          # closeEvent 里回收定时器/线程的那一步
+
+    assert win.live_rate_timer.isActive() is False
+    assert sampler._files == {}, "关窗口时要释放 sqlite 连接"
+
+
 def test_closing_the_window_releases_the_point_panel(ui_env):
     """打点面板是独立顶层窗口：主窗口关掉时必须一并收掉。
 

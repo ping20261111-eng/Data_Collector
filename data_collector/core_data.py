@@ -466,6 +466,17 @@ class RecorderManager:
         except Exception as exc:
             logger.warning(f"写录制清单失败（不影响录制）：{exc}")
 
+    def current_bag_dir(self) -> Optional[Path]:
+        """**当前这次录制**的 bag 目录；没在录制（或还没落盘）时返回 None。
+
+        给实时帧率用：它需要知道"现在往哪个目录写"，而不是"历史上最新的目录"。
+        所以这里先判 `is_active()` —— 录制已经停了还去读最新目录，会把上一场
+        的数据当成这一场显示。
+        """
+        if not self.is_active():
+            return None
+        return self._latest_bag_dir()
+
     def _latest_bag_dir(self) -> Optional[Path]:
         try:
             bag_root = self.session_bag_dir()

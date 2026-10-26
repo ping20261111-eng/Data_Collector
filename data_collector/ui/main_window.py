@@ -103,6 +103,13 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         self.record_start_time = None
         self._record_health_warned = False   # 录制异常只报一次，避免每秒刷屏
 
+        # 实时帧率（v6.7.5）：只在「显示帧率」开关打开时跑，2 秒一次。
+        # 单独一个定时器而不是挂在 record_timer 上 —— 后者只负责录制计时与看门狗，
+        # 而帧率看板可以独立开关（它们没有依赖关系）。
+        self.live_rate_timer = QTimer()
+        self.live_rate_timer.timeout.connect(self._sample_live_rate)
+        self.live_rate_sampler = None
+
         # 机器人状态 / SDK 服务刷新
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.refresh_robot_status)
@@ -293,9 +300,14 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         for timer in (getattr(self, "status_timer", None),
                       getattr(self, "teleop_timer", None),
                       getattr(self, "teleop_startup_timer", None),
+                      getattr(self, "live_rate_timer", None),
                       getattr(self, "record_timer", None)):
             if timer is not None:
                 timer.stop()
+
+        sampler = getattr(self, "live_rate_sampler", None)
+        if sampler is not None:
+            sampler.close()            # 释放 sqlite 连接（纯读，不涉及数据）
 
         workers = (
             ("遥操作日志", "teleop_thread", "stop"),

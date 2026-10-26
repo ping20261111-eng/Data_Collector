@@ -195,11 +195,31 @@ class LayoutMixin:
         self.btn_clear_log = QPushButton("清空")
         self.btn_clear_log.setProperty("variant", "ghost")
         self.btn_clear_log.clicked.connect(self.on_clear_log)
+        # 实时帧率开关（v6.7.5）：默认关闭 —— 不打开就一分资源都不占。
+        # 读的是**录制中 bag 的索引计数**，不是订阅话题（理由见 live_rate 模块说明）。
+        self.btn_live_rate = QPushButton("显示帧率")
+        self.btn_live_rate.setProperty("variant", "ghost")
+        self.btn_live_rate.setCheckable(True)
+        self.btn_live_rate.setToolTip(
+            "在日志区上方显示 7 个数据验证目标话题的实时帧率\n"
+            "读的是录制中 bag 的落盘计数 —— 反映「真的录进去了多少帧」，"
+            "开销约 2~3 MB 内存、每 2 秒不到 1 ms")
+        self.btn_live_rate.clicked.connect(self.on_toggle_live_rate)
 
         head, _ = make_panel_head("运行日志", [self.robot_monitor_label,
+                                               self.btn_live_rate,
                                                self.btn_robot_monitor,
                                                self.btn_clear_log])
         outer.addWidget(head)
+
+        # 帧率读数行：只在开关打开时出现，占用一行（等宽，方便对齐比较）
+        self.live_rate_label = QLabel("")
+        self.live_rate_label.setObjectName("Hint")
+        self.live_rate_label.setFont(theme.mono_font(theme.TYPE_SCALE["fs_sm"]))
+        self.live_rate_label.setContentsMargins(theme.px(10), theme.px(2),
+                                                theme.px(10), theme.px(2))
+        self.live_rate_label.hide()
+        outer.addWidget(self.live_rate_label)
 
         self.log = LogView()
         self.log.setObjectName("Console")
