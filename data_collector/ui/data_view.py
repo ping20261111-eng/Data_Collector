@@ -29,6 +29,7 @@ from ..core_data import (UploadBatchQueue, UploadCancelledError,
                          sort_bags_by_capture_time)
 from ..verify import read_bag_verdict
 from . import bag_verdict
+from . import bag_row_delegate
 
 
 from .common import (SP, describe_export_target, ensure_remote_password,
@@ -221,6 +222,9 @@ class DataViewDialog(QDialog):
         outer.addWidget(head)
 
         self.bag_list = self._list_widget()
+        # 三列按固定列位画（名字 / 时间 / 判定）。**必须挂在列表上而不是靠
+        # 空格对齐**：名字长短不一，时间与判定的起点会跟着漂（v6.9.1 现场反馈）。
+        self.bag_list.setItemDelegate(bag_row_delegate.BagRowDelegate(self.bag_list))
         self.bag_list.itemDoubleClicked.connect(self._on_bag_double_click)
         outer.addWidget(self.bag_list, 1)
 
@@ -291,6 +295,8 @@ class DataViewDialog(QDialog):
         # 按录制时间倒序：最新的在最上面（排序逻辑在 core_data 里，可单测）
         for captured, folder in sort_bags_by_capture_time(self.uploader.get_bag_folders()):
             self._add_bag_row(folder, captured)
+        # 按当前最长名字给"名字列"定宽（只在整表刷新时量一次，逐条更新不重排）。
+        bag_row_delegate.fit_name_column(self.bag_list)
 
         self._refresh_local_space()
 

@@ -98,3 +98,70 @@ def test_a_pending_row_is_not_red():
     normal = theme.palette(theme.active_mode())["text"]
     assert bag_verdict.foreground(_verdict(ok=False), pending=True).name() == \
         QColor(normal).name()
+
+# ==================== 行文本与列位（v6.9.1 列对齐） ====================
+
+def test_split_row_round_trips_row_text():
+    """`split_row` 必须是 `row_text` 的逆函数。
+
+    绘制层拿到的只有 item 的 `text()`，靠它拆回三段。两边各写一份分隔符的话，
+    改了一处就静默拆不开 —— 表现是整行只显示名字，而看起来像"列对齐失效"。
+    """
+    text = bag_verdict.row_text("vla_20261026143957", "10-26 14:39:57", "不合格")
+    assert bag_verdict.split_row(text) == ("vla_20261026143957", "10-26 14:39:57", "不合格")
+
+
+def test_split_row_keeps_a_malformed_row_visible_instead_of_raising():
+    """拆不开的行**不抛异常**，整段当名字显示。这一步在每一次重绘里跑。"""
+    assert bag_verdict.split_row("随便一段没有分隔符的字") == ("随便一段没有分隔符的字", "", "")
+    assert bag_verdict.split_row("") == ("", "", "")
+    assert bag_verdict.split_row("只 有 空 格")[0] == "只 有 空 格"
+
+
+def test_all_labels_lists_every_possible_verdict_text():
+    """判定列的宽度要按**最长**文案预留，所以这张表必须齐。"""
+    assert set(bag_verdict.ALL_LABELS) == {
+        bag_verdict.PASS_TEXT, bag_verdict.FAIL_TEXT,
+        bag_verdict.NONE_TEXT, bag_verdict.PENDING_TEXT}
+
+
+def test_column_layout_ignores_the_name_length():
+    """列位的输入里**根本没有名字** —— 这就是"名字多长都不影响列对齐"的结构保证。
+
+    时间列与判定列的 x 只由容器宽度与两列的固有宽度决定；同一个容器宽度下，
+    无论哪一行、名字多长，算出来的坐标都是同一组。
+    """
+    a = bag_verdict.column_layout(600, 109, 59, hpad=10, gap=16, name_cap=180)
+    b = bag_verdict.column_layout(600, 109, 59, hpad=10, gap=16, name_cap=180)
+    assert a == b
+    # 与容器无关的常量只有两个列宽；起点必须由容器宽度推出来
+    assert a.stamp_x > a.name_x and a.verdict_x > a.stamp_x
+    assert a.stamp_x == a.name_x + a.name_w + 16
+    assert a.verdict_x == a.stamp_x + 109 + 16
+
+
+def test_column_layout_shrinks_the_name_column_when_the_window_narrows():
+    """窗口变窄时**先压名字列**，不挤时间与判定。
+
+    判定列是这一版的全部意义；把它挤出视口等于功能没做。名字可以截断（它只是标识）。
+    """
+    wide = bag_verdict.column_layout(800, 109, 59, hpad=10, gap=16, name_cap=400)
+    narrow = bag_verdict.column_layout(300, 109, 59, hpad=10, gap=16, name_cap=400)
+
+    assert narrow.name_w < wide.name_w, (narrow.name_w, wide.name_w)
+    assert narrow.verdict_x + narrow.verdict_w <= 300, "判定列被挤出视口了"
+    assert narrow.name_w >= 0, "名字列宽度不能为负"
+
+
+def test_column_layout_honours_the_name_cap_and_leaves_the_rest_blank():
+    """宽窗口下名字列到 `name_cap` 就停，多出来的宽度留白。
+
+    不封顶的话，窗口一宽名字与时间之间就是一大片空白，几十行看下来像两个
+    互不相干的列表（第一版就是这样，实拍才发现）。
+    """
+    capped = bag_verdict.column_layout(1200, 109, 59, hpad=10, gap=16, name_cap=200)
+    uncapped = bag_verdict.column_layout(1200, 109, 59, hpad=10, gap=16)
+
+    assert capped.name_w == 200
+    assert uncapped.name_w > capped.name_w
+    assert capped.stamp_x < uncapped.stamp_x

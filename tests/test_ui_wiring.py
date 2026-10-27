@@ -8558,3 +8558,30 @@ def test_the_angle_column_width_is_computed_from_the_widest_literal(qapp):
         "最宽字面量由 `fmt_number(round(v, 4))` 与 H2 的 ±150 量程推出："
         "负号 + 3 位整数 + 小数点 + 4 位小数")
 
+def test_data_view_draws_bag_rows_with_the_column_delegate(ui_env, tmp_path):
+    """数据列表必须挂上三列绘制器，并且在刷新后按最长名字定宽（v6.9.1）。
+
+    ## 这条守的是"唯一抓不到的那一环"
+
+    `bag_verdict.column_layout` 是纯函数，它当然"算得对"；`bag_row_delegate` 自己
+    也有像素级测试。但**忘了 `setItemDelegate`** 时二者都照样绿 ——
+    列表退回默认绘制，行文本里那四个空格又开始让时间列随名字漂移。
+    这类"接线漏了"的缺陷，只能由这一层发现。
+    """
+    from data_collector.ui import DataViewDialog
+    from data_collector.ui.bag_row_delegate import BagRowDelegate
+
+    win, _cm = ui_env
+    root = tmp_path / "bags"
+    root.mkdir()
+    _make_bag(root, "a_20261027100000", "判定: 合格")
+    _make_bag(root, "cloth_rack_20261027110000", "判定: 合格")
+
+    win.uploader.bag_dir = root
+    dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
+    dlg.refresh_lists()
+
+    delegate = dlg.bag_list.itemDelegate()
+    assert isinstance(delegate, BagRowDelegate), \
+        "数据列表没挂三列绘制器 —— 时间列会随名字长短漂移（现场投诉的就是这个）"
+    assert delegate.name_width() > 0, "刷新后没有按最长名字给名字列定宽"
