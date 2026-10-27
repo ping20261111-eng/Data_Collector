@@ -25,7 +25,8 @@ from .core_motion import (MOTION_STREAM_SCRIPT, STREAM_TIMEOUT_PAD,
                           stream_job_args, stream_job_key)
 # 常驻命令通道（v6.2.0）：姿态控制的下发走它，起不来就降级到一次性 CLI
 from .ros_bridge import RosBridge
-from .verify import verification_report_path
+from .verify import (has_fresh_report, latest_verification_report,
+                     verification_report_path)
 
 
 def _terminate_stream(proc: subprocess.Popen, force: bool = False) -> None:
@@ -3223,7 +3224,8 @@ class Launcher:
             env="ros", runner="python3", hold=True, proc_name="bag_rate_stat")
 
     def verify_bag_folders(self, bag_paths, on_progress=None, should_stop=None,
-                           timeout: float = 1800.0) -> dict:
+                           timeout: float = 1800.0, on_bag_done=None,
+                           reuse_existing: bool = True) -> dict:
         """**批量数据验证**：逐个 bag 跑一次 `bag_rate_stat.py --no-plot`。
 
         每个 bag 的报告写回**它自己的目录**（`数据验证结果_<时间>.txt`），
@@ -3245,6 +3247,15 @@ class Launcher:
             should_stop: `f() -> bool`；在**每个 bag 之间**检查（不打断正在跑的那一份，
                 那样留下的报告是半截的）。
             timeout: 单个 bag 的上限（秒）。
+            reuse_existing: 目录里已有**不早于数据文件**的报告时直接复用、不重跑
+                （默认开）。一次几十份、每份几分钟，而大部分之前已经验过 ——
+                每次都全量重跑等于让操作员白等十几分钟。
+                判据在 `verify.has_fresh_report`：比的是数据文件自身的 mtime，
+                所以"重录覆盖过的目录"会自动重验，不会拿旧结论冒充新数据。
+            on_bag_done: `f(result: dict)`，**每完成一个 bag 立刻调一次**，
+                传入的就是 `results` 里那一条。给界面"完成一条刷一条"用 ——
+                否则用户要盯着一个不动的列表等整批跑完（几十份就是十几分钟）。
+                同样**在工作线程里被调**，调用方自己转到主线程。
 
         Returns:
             `{ok, total, done, succeeded, failed, stopped, results}`；
@@ -3252,7 +3263,8 @@ class Launcher:
         """
         paths = [Path(item) for item in (bag_paths or [])]
         summary = {"ok": True, "total": len(paths), "done": 0, "succeeded": 0,
-                   "failed": 0, "stopped": False, "results": [], "reason": ""}
+                   "failed": 0, "reused": 0, "stopped": False,
+                   "results": [], "reason": ""}
         if not paths:
             summary.update(ok=False, reason="没有选中任何数据文件夹")
             return summary
@@ -3269,6 +3281,24 @@ class Launcher:
                     on_progress(f"已请求停止：完成 {summary['done']} 个，"
                                 f"剩余 {len(paths) - summary['done']} 个未验证")
                 break
+            if reuse_existing and has_fresh_report(bag):
+                # 已有结果且不早于数据 → 直接复用。仍走 on_bag_done，界面才能
+                # 把这一行从「待验证」立刻换成它已有的判定。
+                existing = latest_verification_report(bag)
+                entry = {"bag": str(bag), "ok": True,
+                         "report": str(existing) if existing else "",
+                         "code": 0, "reason": "", "reused": True}
+                summary["results"].append(entry)
+                summary["reused"] += 1
+                if on_progress:
+                    on_progress(f"（{index}/{len(paths)}）已有验证结果，跳过：{bag.name}")
+                if on_bag_done is not None:
+                    try:
+                        on_bag_done(entry)
+                    except Exception as exc:                 # noqa: BLE001
+                        logger.warning(f"验证进度回调失败（不影响本批其余文件）：{exc}")
+                continue
+
             report = verification_report_path(bag)
             if on_progress:
                 on_progress(f"（{index}/{len(paths)}）正在验证：{bag.name}")
@@ -3298,11 +3328,19 @@ class Launcher:
                     reason = "脚本已退出但没有生成报告（数据目录不可写？）"
                 else:
                     reason = tail[-1] if tail else f"退出码 {code}"
-            summary["results"].append({
+            entry = {
                 "bag": str(bag), "ok": ok,
                 "report": str(report) if written else "",
                 "code": code, "reason": reason,
-            })
+            }
+            summary["results"].append(entry)
+            if on_bag_done is not None:
+                # 回调是**观察者**：它出错不能把整批验证带停（否则界面上一个
+                # 绘制异常就会让剩下几十份全部不验证）。记日志、继续。
+                try:
+                    on_bag_done(entry)
+                except Exception as exc:                     # noqa: BLE001
+                    logger.warning(f"验证进度回调失败（不影响本批其余文件）：{exc}")
             summary["done"] += 1
             if ok:
                 summary["succeeded"] += 1

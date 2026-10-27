@@ -552,6 +552,201 @@ def test_verify_bag_folders_runs_each_bag_and_writes_reports(launcher_env, monke
     assert any("1/2" in line for line in progress), progress
 
 
+def test_verify_bag_folders_reuses_existing_results(launcher_env, monkeypatch):
+    """目录里已有**不早于数据**的报告 → 直接复用，不重跑（v6.9.0）。
+
+    一次几十份、每份几分钟。大部分之前已经验过，全量重跑等于让操作员白等
+    十几分钟 —— 而结论其实早就在目录里躺着。
+    """
+    import re
+
+    from data_collector import core_operations
+
+    launcher, tmp, _cfg, _calls = launcher_env
+    done, fresh = tmp / "bag_done", tmp / "bag_fresh"
+    for folder in (done, fresh):
+        folder.mkdir()
+        (folder / "x.mcap").write_bytes(b"x")
+    # bag_done 的报告比数据新 → 可复用
+    (done / "数据验证结果_20261027-100000.txt").write_text(
+        "数据验证结果\n====\n判定: 合格\n", encoding="utf-8")
+
+    runs = []
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        runs.append(argv[2])
+        matched = re.search(r"--report\s+'?([^'\s]+)'?", argv[2])
+        Path(matched.group(1)).write_text("数据验证结果\n====\n判定: 合格\n", encoding="utf-8")
+        return _Done()
+
+    monkeypatch.setattr(core_operations.subprocess, "run", fake_run)
+
+    seen = []
+    summary = launcher.verify_bag_folders([done, fresh], on_bag_done=seen.append)
+
+    assert summary["reused"] == 1, summary
+    assert summary["done"] == 1 and summary["succeeded"] == 1, summary
+    assert len(runs) == 1, f"只该跑没验过的那一份：{runs}"
+    # 复用也要走 on_bag_done —— 界面靠它把「待验证」换成已有判定
+    assert len(seen) == 2 and [bool(i.get("reused")) for i in seen] == [True, False], seen
+
+
+def test_verify_bag_folders_reverifies_when_the_data_is_newer(launcher_env, monkeypatch):
+    """数据比报告新 → **必须重验**，不许拿旧结论冒充。
+
+    现场会重录到同名目录；这时旧报告还在，若只看"有没有报告"就会把旧结论
+    当真 —— 而这正是「把坏数据标成合格」的那条路。
+    """
+    import os
+    import re
+
+    from data_collector import core_operations
+
+    launcher, tmp, _cfg, _calls = launcher_env
+    folder = tmp / "bag_rerun"
+    folder.mkdir()
+    data = folder / "x.mcap"
+    data.write_bytes(b"x")
+    report = folder / "数据验证结果_20261020-090000.txt"
+    report.write_text("数据验证结果\n====\n判定: 合格\n", encoding="utf-8")
+    os.utime(report, (1_000_000, 1_000_000))
+    os.utime(data, (2_000_000, 2_000_000))          # 数据更新
+
+    runs = []
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        runs.append(argv[2])
+        matched = re.search(r"--report\s+'?([^'\s]+)'?", argv[2])
+        Path(matched.group(1)).write_text("数据验证结果\n====\n判定: 合格\n", encoding="utf-8")
+        return _Done()
+
+    monkeypatch.setattr(core_operations.subprocess, "run", fake_run)
+    summary = launcher.verify_bag_folders([folder])
+
+    assert summary["reused"] == 0, summary
+    assert len(runs) == 1, "数据更新过就该重跑"
+
+
+def test_verify_bag_folders_can_force_a_full_rerun(launcher_env, monkeypatch):
+    """`reuse_existing=False` → 无视已有报告，全部重跑（需要强制刷新时用）。"""
+    import re
+
+    from data_collector import core_operations
+
+    launcher, tmp, _cfg, _calls = launcher_env
+    folder = tmp / "bag_force"
+    folder.mkdir()
+    (folder / "x.mcap").write_bytes(b"x")
+    (folder / "数据验证结果_20261027-100000.txt").write_text(
+        "数据验证结果\n====\n判定: 合格\n", encoding="utf-8")
+
+    runs = []
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        runs.append(argv[2])
+        matched = re.search(r"--report\s+'?([^'\s]+)'?", argv[2])
+        Path(matched.group(1)).write_text("数据验证结果\n====\n判定: 合格\n", encoding="utf-8")
+        return _Done()
+
+    monkeypatch.setattr(core_operations.subprocess, "run", fake_run)
+    summary = launcher.verify_bag_folders([folder], reuse_existing=False)
+
+    assert summary["reused"] == 0 and summary["done"] == 1
+    assert len(runs) == 1
+
+
+def test_verify_bag_folders_reports_each_bag_as_it_finishes(launcher_env, monkeypatch):
+    """每完成一个 bag 就回调一次 —— 界面靠它"完成一条刷一条"（v6.9.0）。
+
+    为什么必须逐条而不是等整批：一次几十份、串行跑就是十几分钟，
+    期间列表一个标记都不动，用户既不知道跑到哪了，也看不到已经判了几条不合格。
+    """
+    import re
+
+    from data_collector import core_operations
+
+    launcher, tmp, _cfg, _calls = launcher_env
+    bags = []
+    for name in ("bag_a", "bag_b", "bag_c"):
+        folder = tmp / name
+        folder.mkdir()
+        bags.append(folder)
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        command = argv[2]
+        matched = re.search(r"--report\s+'?([^'\s]+)'?", command)
+        Path(matched.group(1)).write_text("报告", encoding="utf-8")
+        return _Done()
+
+    monkeypatch.setattr(core_operations.subprocess, "run", fake_run)
+
+    seen = []
+    summary = launcher.verify_bag_folders(bags, on_bag_done=seen.append)
+
+    assert len(seen) == 3, f"应当每完成一个就回调一次，实际 {len(seen)} 次"
+    assert [Path(item["bag"]).name for item in seen] == ["bag_a", "bag_b", "bag_c"]
+    # 回调拿到的就是最终 results 里那一条（同一份数据，不是另拼的摘要）
+    assert seen == summary["results"]
+
+
+def test_a_broken_progress_callback_does_not_stop_the_batch(launcher_env, monkeypatch):
+    """回调抛异常时**继续验剩下的**，只记一条日志。
+
+    回调是观察者（界面刷新），它出错不能把整批带停 —— 否则界面上一个绘制异常
+    就会让后面几十份全部不验证，而现场只看得到"验证没跑完"。
+    """
+    import re
+
+    from data_collector import core_operations
+
+    launcher, tmp, _cfg, _calls = launcher_env
+    bags = []
+    for name in ("bag_a", "bag_b", "bag_c"):
+        folder = tmp / name
+        folder.mkdir()
+        bags.append(folder)
+
+    class _Done:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        matched = re.search(r"--report\s+'?([^'\s]+)'?", argv[2])
+        Path(matched.group(1)).write_text("报告", encoding="utf-8")
+        return _Done()
+
+    monkeypatch.setattr(core_operations.subprocess, "run", fake_run)
+
+    def boom(_item):
+        raise RuntimeError("界面刷新炸了")
+
+    summary = launcher.verify_bag_folders(bags, on_bag_done=boom)
+
+    assert summary["done"] == 3, f"回调出错不该中断整批：{summary}"
+    assert summary["succeeded"] == 3
+
+
 def test_verify_bag_folders_stops_between_bags(launcher_env, monkeypatch):
     """中途停止：**当前这一份跑完才停**（不打断正在分析的进程）。
 

@@ -4347,7 +4347,211 @@ def test_data_view_lists_bags_newest_first_and_shows_the_time(ui_env, tmp_path):
     ordered = [text.split("    ")[0] for text in texts]
     assert ordered == ["vla_20261026140000", "vla_20261026110000", "vla_20261026090000"], (
         f"应当按录制时间倒序，而不是 mtime：{texts}")
-    assert texts[0].endswith("10-26 14:00:00"), f"条目里要显示到秒：{texts[0]}"
+    assert "10-26 14:00:00" in texts[0], f"条目里要显示到秒：{texts[0]}"
+    # 末尾还有判定列（v6.9.0）：这三个目录里都没有验证报告。
+    assert texts[0].endswith("未验证"), f"没有报告时应显示未验证：{texts[0]}"
+
+
+# ==================== 查看数据：每条数据的合格判定（v6.9.0） ====================
+
+def _verdict_label(text):
+    """取条目末尾那一列（判定）。用 rsplit 而不是 endswith：
+    「不合格」也以「合格」结尾，用 endswith 会把不合格误判成合格。"""
+    return text.rsplit("    ", 1)[-1]
+
+
+def _make_bag(root, name, verdict_line=None, stamp="20261027-100000"):
+    folder = root / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "x.mcap").write_bytes(b"x")
+    if verdict_line is not None:
+        (folder / f"数据验证结果_{stamp}.txt").write_text(
+            f"数据验证结果\n====\n{verdict_line}\n", encoding="utf-8")
+    return folder
+
+
+def test_reusing_every_result_is_not_reported_as_not_started(ui_env, tmp_path, monkeypatch):
+    """全部复用（一条也没重跑）时**不许**弹「数据验证未开始」。
+
+    现场一批数据大多早就验过，点「批量验证」很可能一条都不跑。若这里误报
+    "未能启动"，用户会以为按钮坏了或验证功能失效，然后去重装/重配。
+    """
+    from PyQt5.QtWidgets import QMessageBox
+
+    from data_collector.ui import DataViewDialog
+
+    shown = []
+
+    def _record(kind):
+        def _call(_parent, title, text, *args, **kwargs):
+            shown.append((kind, title, text))
+            return QMessageBox.Ok
+        return staticmethod(_call)
+
+    monkeypatch.setattr(QMessageBox, "information", _record("info"))
+    monkeypatch.setattr(QMessageBox, "critical", _record("crit"))
+
+    win, _cm = ui_env
+    root = tmp_path / "bags"
+    root.mkdir()
+    a = _make_bag(root, "a_20261027100000", "判定: 合格")
+    win.uploader.bag_dir = root
+    dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
+    dlg.refresh_lists()
+
+    dlg._on_verify_finished(True, {
+        "results": [{"bag": str(a), "ok": True,
+                     "report": str(a / "数据验证结果_20261027-100000.txt"), "reused": True}],
+        "total": 1, "done": 0, "succeeded": 0, "failed": 0, "reused": 1,
+        "stopped": False}, "")
+
+    assert shown, "应当弹一个提示"
+    kind, title, text = shown[-1]
+    assert kind == "info", f"不该弹 critical：{shown}"
+    assert "未开始" not in title and "未开始" not in text, shown
+    assert "复用" in text and "没有重复验证" in text, text
+    # 还要告诉现场怎么强制重验，否则下次还是不知道怎么办
+    assert "删掉" in text and "数据验证结果" in text, text
+
+
+def test_summary_counts_the_reused_bags_separately(ui_env, tmp_path, monkeypatch):
+    """汇总里要把"验了几个"和"复用几个"分开说。
+
+    只说"共 3 个、成功 2 个"会让现场以为少跑了一个；而实际上那一个是有结果的。
+    """
+    from PyQt5.QtWidgets import QMessageBox
+
+    from data_collector.ui import DataViewDialog
+
+    shown = []
+    monkeypatch.setattr(QMessageBox, "information",
+                        staticmethod(lambda _p, title, text, *a, **k:
+                                     shown.append((title, text)) or QMessageBox.Ok))
+    monkeypatch.setattr(QMessageBox, "warning",
+                        staticmethod(lambda _p, title, text, *a, **k:
+                                     shown.append((title, text)) or QMessageBox.Ok))
+
+    win, _cm = ui_env
+    dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
+
+    dlg._on_verify_finished(True, {"results": [], "total": 3, "done": 2, "succeeded": 2,
+                                   "failed": 0, "reused": 1, "stopped": False}, "")
+
+    _title, text = shown[-1]
+    assert "复用已有结果 1 个" in text, text
+    assert "验证 2 个" in text, text
+
+
+def test_data_view_shows_the_verdict_at_the_end_of_every_bag_row(ui_env, tmp_path):
+    """每行末尾是 合格 / 不合格 / 未验证，且**只有不合格**整行转红。
+
+    为什么只给不合格上色：一屏几十行里如果合格也染绿，红色就不再跳眼了 ——
+    而"哪几条要返工"正是这个列表最该一眼看出来的东西。
+    """
+    from PyQt5.QtGui import QColor
+
+    from data_collector import theme
+    from data_collector.ui import DataViewDialog
+
+    win, _cm = ui_env
+    root = tmp_path / "bags"
+    root.mkdir()
+    _make_bag(root, "a_20261027100000", "判定: 合格")
+    _make_bag(root, "b_20261027110000", "判定: 不合格 | 缺 1 个话题")
+    _make_bag(root, "c_20261027120000", None)
+
+    win.uploader.bag_dir = root
+    dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
+    dlg.refresh_lists()
+
+    rows = {Path(dlg.bag_list.item(i).data(1)).name: dlg.bag_list.item(i)
+            for i in range(dlg.bag_list.count())}
+    assert _verdict_label(rows["a_20261027100000"].text()) == "合格"
+    assert _verdict_label(rows["b_20261027110000"].text()) == "不合格"
+    assert _verdict_label(rows["c_20261027120000"].text()) == "未验证"
+
+    danger = QColor(theme.palette(theme.active_mode())["danger"]).name()
+    assert rows["b_20261027110000"].foreground().color().name() == danger
+    assert rows["a_20261027100000"].foreground().color().name() != danger
+    assert rows["c_20261027120000"].foreground().color().name() != danger
+
+    # 不合格必须能查到"为什么"（列表只有三个字，详情在 tooltip）
+    assert "缺 1 个话题" in rows["b_20261027110000"].toolTip()
+    assert "还没有验证报告" in rows["c_20261027120000"].toolTip()
+
+
+def test_verifying_one_bag_updates_only_that_row(ui_env, tmp_path):
+    """批量验证每完成一条，只改那一行 —— 不重建列表。
+
+    重建（clear + 重新 add）会丢选中、丢滚动位置，而用户在验证期间往往正拿着
+    这个列表做别的判断（比如决定哪几份要重录）。
+    """
+    from data_collector.ui import DataViewDialog
+
+    win, _cm = ui_env
+    root = tmp_path / "bags"
+    root.mkdir()
+    a = _make_bag(root, "a_20261027100000")
+    b = _make_bag(root, "b_20261027110000")
+    c = _make_bag(root, "c_20261027120000")
+
+    win.uploader.bag_dir = root
+    dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
+    dlg.refresh_lists()
+
+    rows = {Path(dlg.bag_list.item(i).data(1)).name: dlg.bag_list.item(i)
+            for i in range(dlg.bag_list.count())}
+    rows["b_20261027110000"].setSelected(True)
+    before = dlg.bag_list.count()
+
+    # a 的报告出现了（验证刚跑完），界面收到"这一条完成"的通知
+    (a / "数据验证结果_20261027-160000.txt").write_text(
+        "数据验证结果\n====\n判定: 合格\n", encoding="utf-8")
+    dlg._on_bag_verified({"bag": str(a), "ok": True})
+
+    assert dlg.bag_list.count() == before, "不该重建列表"
+    assert _verdict_label(rows["a_20261027100000"].text()) == "合格"
+    assert _verdict_label(rows["b_20261027110000"].text()) == "未验证", "不该动别的行"
+    assert _verdict_label(rows["c_20261027120000"].text()) == "未验证"
+    assert rows["b_20261027110000"].isSelected(), "选中状态被冲掉了"
+
+
+def test_pending_rows_get_restored_when_the_batch_stops_early(ui_env, tmp_path):
+    """验证被取消时，没跑到的行要恢复成磁盘上的真实判定。
+
+    不恢复的话它们会一直挂着临时的「待验证」—— 那是假信息：既不是"验过"，
+    也不是"没验过"，下次看列表的人会以为还在跑。
+    """
+    from data_collector.ui import DataViewDialog
+
+    win, _cm = ui_env
+    root = tmp_path / "bags"
+    root.mkdir()
+    a = _make_bag(root, "a_20261027100000")
+    b = _make_bag(root, "b_20261027110000")
+
+    win.uploader.bag_dir = root
+    dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
+    dlg.refresh_lists()
+
+    rows = {Path(dlg.bag_list.item(i).data(1)).name: dlg.bag_list.item(i)
+            for i in range(dlg.bag_list.count())}
+
+    # 开始验证：两条都标待验证（其中 b 有一条旧报告，收尾后应显示旧判定）
+    (b / "数据验证结果_20261027-100000.txt").write_text(
+        "数据验证结果\n====\n判定: 不合格 | 缺 2 个话题\n", encoding="utf-8")
+    dlg._verify_pending = {str(a), str(b)}
+    for path in (a, b):
+        dlg._mark_row_pending(path)
+    assert _verdict_label(rows["a_20261027100000"].text()) == "待验证"
+    assert _verdict_label(rows["b_20261027110000"].text()) == "待验证"
+
+    # 用户点了取消：一条都没跑完
+    dlg._on_verify_finished(True, {"results": [], "total": 2, "done": 0,
+                                   "succeeded": 0, "failed": 0, "stopped": True}, "")
+
+    assert _verdict_label(rows["a_20261027100000"].text()) == "未验证"
+    assert _verdict_label(rows["b_20261027110000"].text()) == "不合格"
 
 
 def test_closing_the_window_releases_the_point_panel(ui_env):

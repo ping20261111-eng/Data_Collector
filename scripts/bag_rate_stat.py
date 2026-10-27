@@ -11,7 +11,7 @@ Requires the ROS environment of the robot workspace
 zstd and fonts-noto-cjk.
 """
 import argparse
-from collections import defaultdict
+from collections import defaultdict, namedtuple
 from datetime import datetime
 from functools import lru_cache
 from pathlib import Path
@@ -38,6 +38,150 @@ ROS_ENV_HINT = ('缺少 ROS 2 Python 环境，脚本需要先 source 机器人�
 REPORT_NAME_FMT = '数据验证结果_%Y%m%d-%H%M%S.txt'
 
 
+#: 报告里的判定行前缀与取值。上位机按它判断"这批数据合格吗"。
+#:
+#: ⚠️ **不要按行号读判定**：报告正文会随需求增删，行号一定会漂。
+#: 上位机侧 `data_collector/verify.py` 有一份同名字面量，两者必须逐字一致 ——
+#: 脚本要能**独立**在机器人上跑（不 import 本包），所以刻意不合并。
+#: 守卫：`test_bag_verdict_words_match_between_script_and_app`。
+VERDICT_PREFIX = '判定: '
+VERDICT_PASS = '合格'
+VERDICT_FAIL = '不合格'
+
+
+#: 各部位的合格频率下限。**这是现场给的标尺（2026-10-27），不是随手定的**：
+#:
+#: | 部位 | 标称 | 允许偏差 | 判定下限 |
+#: | --- | --- | --- | --- |
+#: | 相机 | 30 Hz | — | 30 Hz |
+#: | 手臂 | 1000 Hz | ±5% | **950 Hz** |
+#: | 手部 | 100 Hz | — | 100 Hz |
+#:
+#: 三条口径上的取舍：
+#:
+#: 1. **只判下限、不判上限**。超频不影响数据可用性，丢帧才是问题；
+#:    给上限只会在标称值附近制造无意义的误判。
+#: 2. 相机与手部现场只给了标称值、没给容差，所以这里容差取 0（低于标称即不合格）。
+#:    若之后发现太严（统计误差会让 30 Hz 实测出 29.9），改这张表的第三列即可，
+#:    不要在判定逻辑里另加特例。
+#: 3. **躯干/头部不在这张表里**：现场没给它的标称频率。拿一个猜出来的数字
+#:    去判"不合格"，比不判更糟 —— 但它的 `max` 间隔仍受 `MAX_INTERVAL_MS` 约束。
+#:
+#: 真实的关节名（2026-10-27 从机器人侧配置核对过）：
+#: 手臂 `AR5_Ljoint_1` … `AR5_Ljoint_7` / `AR5_Rjoint_1` …，手部 `LJoint1` / `RJoint1`。
+#:
+#: 两组 token **大小写不同**（`Ljoint` vs `LJoint`），所以本来就不会互相误匹配 ——
+#: 这里仍然把手臂排在前面，只是因为"更具体的 token 先匹配"是更稳的习惯
+#: （将来若有人把某一侧改名成大小写一致的写法，也不会悄悄串味）。
+#: 顺序与 `display_name` 保持一致，便于对照报告里的标签。
+RATE_TARGETS = (
+    ('/vision/', '相机', 30.0, 0.0),
+    ('/camera_', '相机', 30.0, 0.0),
+    ('AR5_Ljoint', '手臂', 1000.0, 0.05),
+    ('AR5_Rjoint', '手臂', 1000.0, 0.05),
+    ('LJoint', '手部', 100.0, 0.0),
+    ('RJoint', '手部', 100.0, 0.0),
+)
+
+#: 任何分组的**最大帧间隔**上限（毫秒）。现场硬要求：任一项都不得超过 150 ms。
+#: 这条对**所有**分组生效（含躯干/头部这类没有标称频率的），因为它衡量的是
+#: "有没有一段长时间断流"，与频率高低无关。
+MAX_INTERVAL_MS = 150.0
+
+
+def rate_standard_text():
+    """一句话概括频率标尺。报告和工具的提示语都用它 —— 数字只从 RATE_TARGETS 出。
+
+    第一版把「相机 30 Hz / 手部 100 Hz」直接写进了报告文案，而同一条结论里
+    手臂的下限又是从表里取 `rate_target_for('/vision/x')`（取错了部位，拿成 30）。
+    两处各自拼数字必然对不上，所以统一到这里生成。
+    """
+    camera = rate_target_for('/vision/x')
+    arm = rate_target_for('AR5_Ljoint')
+    hand = rate_target_for('LJoint')
+    return (f'相机 {camera[2]:g} Hz / 手臂 ≥{arm[1]:g} Hz'
+            f'（{arm[2]:g} Hz 允许 ±{arm[3] * 100:g}%）/ 手部 {hand[2]:g} Hz')
+
+
+def rate_target_for(key):
+    """这个分组属于哪个部位、合格下限是多少。
+
+    Returns:
+        `(部位, 下限 Hz, 标称 Hz, 容差比例)` 或 `None`（该部位没有标称频率）。
+    """
+    for token, label, hz, tolerance in RATE_TARGETS:
+        if token in key:
+            return label, hz * (1.0 - tolerance), hz, tolerance
+    return None
+
+
+#: 一次判定的完整结果。用命名元组而不是裸元组：调用方要同时看
+#: 频率不达标与间隔超限两类明细，位置元组到第 5 个字段就没人记得住了。
+Verdict = namedtuple('Verdict', 'ok detail missing bad slow spiky')
+
+
+def evaluate_verdict(results, samples, topic_types=None):
+    """判定一次验证是"合格"还是"不合格"，并给出原因摘要。
+
+    ## 合格的定义（v6.9.0 起这是**产品定义**，不是随手写的比较条件）
+
+    两条同时满足才算合格：
+
+    1. 每个目标话题都有数据（缺失 = 整段没录到，下游训练会缺一路输入）；
+    2. 每个分组的帧间隔都能算（≥2 帧），且没有非递增时间戳
+       （时间戳乱序 / 时钟跳变会让时间对齐失效）。
+
+    这两条正好对应现场最常出现的两类坏数据，所以"不合格"这个标记要能让人
+    回头去查具体是哪一条。
+
+    ## 为什么必须是纯函数、且只此一处实现
+
+    判定结果有**三个消费方**：报告里的判定行、上位机列表里的标记、测试里的期望。
+    三处各写一套比较条件的话，迟早出现"报告说合格、列表显示不合格"——
+    而这种不一致比任何一方单独出错都更难查（两边都是"照代码来说没错"）。
+
+    Returns:
+        `(ok, detail, missing, bad)`：
+        `detail` 是给 tooltip 看的一句话（合格时为空串）。
+    """
+    topic_types = TOPIC_TYPES if topic_types is None else topic_types
+
+    # ⚠️ 不能直接 `key not in results`：`/joint_states` 会被按关节名集合**分组**
+    # 成 `/joint_states [a,b,...]` 这样的键。判"这个话题有没有数据"必须与
+    # `analyze_bag` 里那条打印逻辑一致（`key == topic or key.startswith(topic + ' [')`），
+    # 否则报告会写出「有数据 -4」这种自相矛盾的数字。
+    def _has_data(topic):
+        return any(key == topic or key.startswith(topic + ' [') for key in results)
+
+    missing = [topic for topic in topic_types if not _has_data(topic)]
+    bad = [key for key, stat in sorted(results.items())
+           if not stat or stat['nonpositive']]
+
+    slow, spiky = [], []
+    for key, stat in sorted(results.items()):
+        if not stat:
+            continue                       # 帧数不足：已在 bad 里，算不出频率
+        label = display_name(key)
+        target = rate_target_for(key)
+        if target is not None and stat['hz'] is not None:
+            _part, floor, _nominal, _tolerance = target
+            if stat['hz'] < floor:
+                slow.append(f'{label} {stat["hz"]:.1f}Hz < {floor:g}Hz')
+        if stat['max_ms'] > MAX_INTERVAL_MS:
+            spiky.append(f'{label} 最大间隔 {stat["max_ms"]:.0f}ms > {MAX_INTERVAL_MS:g}ms')
+
+    reasons = []
+    if missing:
+        reasons.append(f'缺 {len(missing)} 个话题')
+    if bad:
+        reasons.append(f'{len(bad)} 个分组需复查')
+    if slow:
+        reasons.append(f'频率不达标 {len(slow)} 项（{slow[0]}）')
+    if spiky:
+        reasons.append(f'间隔超限 {len(spiky)} 项（{spiky[0]}）')
+    return Verdict(not reasons, '；'.join(reasons), missing, bad, slow, spiky)
+
+
 def build_report(bag_path, samples, results, *, generated_at=None, host=None):
     """把一次验证的结果组织成**纯文本报告**（纯函数，不碰 IO，便于单测）。
 
@@ -51,22 +195,21 @@ def build_report(bag_path, samples, results, *, generated_at=None, host=None):
 
     when = generated_at or _datetime.now()
     host = host or socket.gethostname()
-    # ⚠️ 不能直接 `key not in results`：`/joint_states` 会被按关节名集合**分组**
-    # 成 `/joint_states [a,b,...]` 这样的键。判"这个话题有没有数据"必须与
-    # `analyze_bag` 里那条打印逻辑一致（`key == topic or key.startswith(topic + ' [')`），
-    # 否则报告会写出「有数据 -4」这种自相矛盾的数字。
-    def _has_data(topic):
-        return any(key == topic or key.startswith(topic + ' [') for key in results)
-
-    missing = [topic for topic in TOPIC_TYPES if not _has_data(topic)]
+    v = evaluate_verdict(results, samples)
+    # 判定行放在**标题之后第一行**：一是让人一眼看到，二是上位机只需要读报告
+    # 头部几行就能拿到结论（列表刷新要扫几十份报告，不必整份读）。
+    verdict_line = f'{VERDICT_PREFIX}{VERDICT_PASS if v.ok else VERDICT_FAIL}'
+    if v.detail:
+        verdict_line += f' | {v.detail}'
     lines = [
         '数据验证结果',
         '=' * 60,
+        verdict_line,
         f'生成时间: {when:%Y-%m-%d %H:%M:%S}',
         f'主机: {host}',
         f'数据目录: {bag_path}',
         f'分析分组: {len(results)}；目标话题 {len(TOPIC_TYPES)} 个'
-        f'（有数据 {len(TOPIC_TYPES) - len(missing)}，缺失 {len(missing)}）',
+        f'（有数据 {len(TOPIC_TYPES) - len(v.missing)}，缺失 {len(v.missing)}）',
         '',
         '一、逐话题（Header 帧间隔，全量原始帧、无重采样）',
         '-' * 60,
@@ -85,18 +228,28 @@ def build_report(bag_path, samples, results, *, generated_at=None, host=None):
             lines.append('   频率: 帧数不足（少于 2 帧，无法计算间隔）')
         lines.append('')
     lines += ['二、结论', '-' * 60]
-    if missing:
-        lines.append(f'· 缺失 {len(missing)} 个目标话题（整段没有消息）：')
-        lines += [f'    - {key}' for key in missing]
+    if v.missing:
+        lines.append(f'· 缺失 {len(v.missing)} 个目标话题（整段没有消息）：')
+        lines += [f'    - {key}' for key in v.missing]
     else:
         lines.append('· 全部目标分组均有数据。')
-    bad = [key for key, stat in sorted(results.items())
-           if not stat or stat['nonpositive']]
-    if bad:
-        lines.append(f'· 需要复查 {len(bad)} 个分组（无有效间隔，或存在非递增时间戳）：')
-        lines += [f'    - {key}' for key in bad]
+    if v.bad:
+        lines.append(f'· 需要复查 {len(v.bad)} 个分组（无有效间隔，或存在非递增时间戳）：')
+        lines += [f'    - {key}' for key in v.bad]
     else:
         lines.append('· 所有分组的帧间隔均可计算，且没有非递增时间戳。')
+    # 频率与最大间隔分开写：现场判断"要不要重录"时看的是这两条，
+    # 而它们对应的返工原因完全不同（一个是码率不够，一个是中途中段断流）。
+    if v.slow:
+        lines.append(f'· 频率不达标 {len(v.slow)} 项（{rate_standard_text()}）：')
+        lines += [f'    - {item}' for item in v.slow]
+    else:
+        lines.append(f'· 频率全部达标（{rate_standard_text()}）。')
+    if v.spiky:
+        lines.append(f'· 最大间隔超限 {len(v.spiky)} 项（上限 {MAX_INTERVAL_MS:g} ms）：')
+        lines += [f'    - {item}' for item in v.spiky]
+    else:
+        lines.append(f'· 所有分组最大间隔均 ≤ {MAX_INTERVAL_MS:g} ms。')
     lines.append('')
     return '\n'.join(lines)
 

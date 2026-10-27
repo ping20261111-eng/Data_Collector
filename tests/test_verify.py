@@ -15,10 +15,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from data_collector.core_data import DataUploader
 from data_collector.errors import ErrorCode
 from data_collector.verify import (
+    BAG_VERDICT_FAIL,
+    BAG_VERDICT_PASS,
+    BAG_VERDICT_PREFIX,
     FAT32_SAFE_FILE_BYTES,
     check_size_limits,
     detect_filesystem,
+    has_fresh_report,
     has_single_file_limit,
+    read_bag_verdict,
     sha256_file,
     write_sha256_sidecar,
 )
@@ -297,3 +302,183 @@ def test_verification_report_sits_inside_the_bag_directory(tmp_path):
 
     assert report.parent == bag, f"报告应直接放在 bag 目录下，实际 {report.parent}"
     assert report.name == "数据验证结果_20261020-110203.txt", report.name
+
+# ==================== 判定：读报告得出"这批数据合格吗"（v6.9.0） ====================
+
+def _write_report(bag: Path, stamp: str, body: str) -> Path:
+    bag.mkdir(parents=True, exist_ok=True)
+    path = bag / f"数据验证结果_{stamp}.txt"
+    path.write_text(body, encoding="utf-8")
+    return path
+
+
+def test_read_bag_verdict_returns_none_without_a_report(tmp_path):
+    """目录里没有报告 → None（界面据此显示"未验证"）。
+
+    不能返回"合格"或"不合格"：那两种都是有依据的判断，而"没验过"是第三种状态。
+    混进任何一边都会误导 —— 显示合格最危险。
+    """
+    bag = tmp_path / "no_report"
+    bag.mkdir()
+    (bag / "a.mcap").write_bytes(b"x")
+    assert read_bag_verdict(bag) is None
+
+
+def test_read_bag_verdict_parses_the_machine_readable_line(tmp_path):
+    """新报告：认 `判定:` 行，不合格时带上原因。"""
+    bag = tmp_path / "ok"
+    _write_report(bag, "20261027-100000",
+                  f"数据验证结果\n====\n{BAG_VERDICT_PREFIX}{BAG_VERDICT_PASS}\n生成时间: x\n")
+    verdict = read_bag_verdict(bag)
+    assert verdict["ok"] is True and verdict["detail"] == ""
+    assert verdict["inferred"] is False
+
+    bag2 = tmp_path / "bad"
+    _write_report(bag2, "20261027-100000",
+                  f"数据验证结果\n====\n{BAG_VERDICT_PREFIX}{BAG_VERDICT_FAIL}"
+                  " | 缺 2 个话题；1 个分组需复查\n")
+    verdict2 = read_bag_verdict(bag2)
+    assert verdict2["ok"] is False
+    assert verdict2["detail"] == "缺 2 个话题；1 个分组需复查", verdict2
+
+
+def test_read_bag_verdict_picks_the_newest_report(tmp_path):
+    """多次验证过 → 取**文件名时间戳最新**的那一份（不是 mtime，也不取旧结论）。
+
+    mtime 会被 rsync / 解压 / 清理改写，而文件名里的时间戳不会 ——
+    与 v6.7.7「数据时间不许用目录 mtime」同一个理由。
+    """
+    bag = tmp_path / "twice"
+    _write_report(bag, "20261020-090000",
+                  f"数据验证结果\n====\n{BAG_VERDICT_PREFIX}{BAG_VERDICT_FAIL} | 缺 1 个话题\n")
+    _write_report(bag, "20261027-150000",
+                  f"数据验证结果\n====\n{BAG_VERDICT_PREFIX}{BAG_VERDICT_PASS}\n")
+    assert read_bag_verdict(bag)["ok"] is True
+
+
+def test_read_bag_verdict_infers_from_legacy_reports(tmp_path):
+    """旧报告没有判定行 → 按「二、结论」段落推断，并标 `inferred=True`。
+
+    `inferred` 不是给人看的装饰：界面的 tooltip 要靠它说明"这是推断的，
+    想拿到确定结论就重跑一次验证"。
+    """
+    ok_bag = tmp_path / "legacy_ok"
+    _write_report(ok_bag, "20261020-090000",
+                  "数据验证结果\n====\n二、结论\n"
+                  "· 全部目标分组均有数据。\n"
+                  "· 所有分组的帧间隔均可计算，且没有非递增时间戳。\n")
+    verdict = read_bag_verdict(ok_bag)
+    assert verdict["ok"] is True and verdict["inferred"] is True
+
+    bad_bag = tmp_path / "legacy_bad"
+    _write_report(bad_bag, "20261020-090000",
+                  "数据验证结果\n====\n二、结论\n· 缺失 2 个目标话题（整段没有消息）：\n")
+    verdict2 = read_bag_verdict(bad_bag)
+    assert verdict2["ok"] is False and verdict2["inferred"] is True
+
+
+def test_read_bag_verdict_never_treats_garbage_as_pass(tmp_path):
+    """判定行内容认不出来时判**不合格**，不许猜成合格。
+
+    版本错配（脚本改了措辞、上位机是旧版）时两种选择：
+    报不合格 → 现场去查，代价是多看一份报告；
+    报合格 → 一份其实有问题的数据被当成合格带走，代价是训练集里混进坏数据。
+    这两者不对等，所以默认走保守那一侧。
+    """
+    bag = tmp_path / "garbage"
+    _write_report(bag, "20261027-100000",
+                  f"数据验证结果\n====\n{BAG_VERDICT_PREFIX}说不清\n")
+    verdict = read_bag_verdict(bag)
+    assert verdict["ok"] is False
+    assert "无法识别" in verdict["detail"], verdict
+
+
+def test_bag_verdict_words_match_between_script_and_app():
+    """判定行前缀与两个取值在**脚本与应用侧必须逐字一致**。
+
+    与 `test_verify_report_name_matches_the_script` 同一类契约：脚本要能独立
+    在机器人上跑（不 import 本包），所以字面量是两份；只改一处就会让上位机
+    永远读不到判定 —— 而那种故障的表现是"全都是未验证"，看着像没跑过验证。
+    """
+    import re
+
+    content = (Path(__file__).resolve().parents[1] / "scripts" / "bag_rate_stat.py") \
+        .read_text(encoding="utf-8")
+
+    prefix = re.search(r"^VERDICT_PREFIX = '([^']*)'", content, re.MULTILINE)
+    passed = re.search(r"^VERDICT_PASS = '([^']*)'", content, re.MULTILINE)
+    failed = re.search(r"^VERDICT_FAIL = '([^']*)'", content, re.MULTILINE)
+    assert prefix and passed and failed, "脚本里找不到判定常量"
+
+    assert prefix.group(1) == BAG_VERDICT_PREFIX
+    assert passed.group(1) == BAG_VERDICT_PASS
+    assert failed.group(1) == BAG_VERDICT_FAIL
+
+def test_fresh_report_requires_a_report_at_all(tmp_path):
+    """没有报告 → 不复用（必须去验）。"""
+    bag = tmp_path / "empty"
+    bag.mkdir()
+    (bag / "a.mcap").write_bytes(b"x")
+    assert has_fresh_report(bag) is False
+
+
+def test_fresh_report_is_true_when_the_report_is_not_older_than_the_data(tmp_path):
+    """报告不比数据旧 → 可以复用（这就是"不用重复验证"的判据）。"""
+    import os
+
+    bag = tmp_path / "fresh"
+    bag.mkdir()
+    data = bag / "a.mcap"
+    data.write_bytes(b"x")
+    os.utime(data, (1_000_000, 1_000_000))
+
+    report = _write_report(bag, "20261027-100000",
+                           f"数据验证结果\n====\n{BAG_VERDICT_PREFIX}{BAG_VERDICT_PASS}\n")
+    os.utime(report, (1_000_100, 1_000_100))
+    assert has_fresh_report(bag) is True
+
+
+def test_fresh_report_is_false_when_the_data_is_newer_than_the_report(tmp_path):
+    """数据比报告新 → **必须重验**。
+
+    这是"复用"最容易出错的地方：目录名被重录覆盖时旧报告还在，
+    只看"有没有报告"就会把旧结论当成新数据的结论 ——
+    正是「把坏数据标成合格」的那类错。
+    """
+    import os
+
+    bag = tmp_path / "stale"
+    bag.mkdir()
+    report = _write_report(bag, "20261020-090000",
+                           f"数据验证结果\n====\n{BAG_VERDICT_PREFIX}{BAG_VERDICT_PASS}\n")
+    os.utime(report, (1_000_000, 1_000_000))
+
+    data = bag / "a.mcap"
+    data.write_bytes(b"x")
+    os.utime(data, (2_000_000, 2_000_000))          # 数据比报告新
+    assert has_fresh_report(bag) is False
+
+
+def test_fresh_report_ignores_the_report_file_itself_and_export_leftovers(tmp_path):
+    """判"数据有多新"时，跳报告自身与导出产物（SHA256SUMS / 其它 .txt）。
+
+    不跳的话，写完报告就会把"数据时间"顶到当前时刻，判据永远成立 ——
+    那样重录覆盖过的目录也永远不会重验。
+    """
+    import os
+
+    bag = tmp_path / "leftovers"
+    bag.mkdir()
+    data = bag / "a.mcap"
+    data.write_bytes(b"x")
+    os.utime(data, (1_000_000, 1_000_000))
+
+    report = _write_report(bag, "20261027-100000",
+                           f"数据验证结果\n====\n{BAG_VERDICT_PREFIX}{BAG_VERDICT_PASS}\n")
+    os.utime(report, (1_000_100, 1_000_100))
+
+    exported = bag / "SHA256SUMS"
+    exported.write_text("deadbeef  a.mcap\n", encoding="utf-8")
+    os.utime(exported, (3_000_000, 3_000_000))      # 导出产物很新，但不该影响判据
+
+    assert has_fresh_report(bag) is True

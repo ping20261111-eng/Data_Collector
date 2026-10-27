@@ -2439,3 +2439,194 @@ def test_yamlcheck_flags_tab_indentation(yamlcheck, tmp_path):
     text = "\n".join(report)
     assert ok is False
     assert "tab" in text.lower(), text
+
+
+# ==================== bag_rate_stat：合格判定（v6.9.0） ====================
+#
+# 现场给的标尺（2026-10-27）：
+#   相机 30 Hz / 手臂 1000 Hz（允许 ±5%，下限 950）/ 手部 100 Hz
+#   任一项的 max 间隔不得超过 150 ms
+# 下面每一条都对着这张表写，改标尺时从这里能立刻看出哪些断言要跟着动。
+
+@pytest.fixture
+def bag_stat():
+    return _load_module("bag_rate_stat_verdict", "bag_rate_stat.py")
+
+
+CAM = "/vision/rgb"
+ARM = "/joint_states [AR5_Ljoint_1,AR5_Ljoint_2]"
+HAND = "/joint_states [LJoint1,RJoint1]"
+TRUNK = "/joint_states [trunk_yaw,trunk_pitch]"
+
+
+def _stat(hz=30.0, **over):
+    base = {"hz": hz, "mean_ms": 1000.0 / hz if hz else 0.0, "std_ms": 1.0,
+            "p95_ms": 40.0, "max_ms": 60.0, "nonpositive": 0}
+    base.update(over)
+    return base
+
+
+def _all_ok(bag_stat, **overrides):
+    """按部位给出"刚好达标"的一组结果，再按需覆盖某一路。"""
+    results = {CAM: _stat(30.0), ARM: _stat(1000.0), HAND: _stat(100.0)}
+    results.update(overrides)
+    samples = {key: [0, 1, 2] for key in results}
+    return bag_stat.evaluate_verdict(results, samples, list(results))
+
+
+def test_verdict_passes_when_every_part_meets_its_rate(bag_stat):
+    """三路各自达标 → 合格，且 detail 为空（列表 tooltip 靠它判断"有没有原因"）。"""
+    v = _all_ok(bag_stat)
+    assert v.ok is True, v.detail
+    assert v.detail == ""
+    assert v.missing == [] and v.bad == []
+    assert v.slow == [] and v.spiky == []
+
+
+def test_verdict_fails_a_camera_below_30hz(bag_stat):
+    """相机 28 Hz → 不合格，原因里要有具体数字（现场据此判断丢了多少）。"""
+    v = _all_ok(bag_stat, **{CAM: _stat(28.0)})
+    assert v.ok is False
+    assert len(v.slow) == 1
+    assert "28.0Hz < 30Hz" in v.slow[0], v.slow
+
+
+def test_arm_rate_gets_a_five_percent_margin(bag_stat):
+    """手臂是关键一条：**允许 ±5%**，所以 955 Hz 合格、940 Hz 不合格。
+
+    手臂按 1000 Hz 采，实际抖动到 955 是正常的；如果按 1000 硬判，
+    现场会看到大量"不合格"却找不到真问题。反过来说 940 已经丢了 6%，
+    那就是真的掉帧了。
+    """
+    ok_case = _all_ok(bag_stat, **{ARM: _stat(955.0)})
+    assert ok_case.ok is True, ok_case.detail
+
+    bad_case = _all_ok(bag_stat, **{ARM: _stat(940.0)})
+    assert bad_case.ok is False
+    assert "950Hz" in bad_case.slow[0], bad_case.slow
+
+
+def test_hand_rate_is_judged_at_100hz(bag_stat):
+    """手部 95 Hz → 不合格。"""
+    v = _all_ok(bag_stat, **{HAND: _stat(95.0)})
+    assert v.ok is False
+    assert "95.0Hz < 100Hz" in v.slow[0], v.slow
+
+
+def test_a_long_gap_fails_regardless_of_the_average_rate(bag_stat):
+    """最大间隔 > 150 ms → 不合格，**哪怕平均频率达标**。
+
+    这条正是"平均看不出问题"的那类故障：整段 1000 Hz，中间断了 200 ms，
+    平均值几乎不受影响，但那 200 ms 里的动作在训练时就是缺失的。
+    """
+    v = _all_ok(bag_stat, **{ARM: _stat(1000.0, max_ms=210.0)})
+    assert v.ok is False
+    assert v.slow == [], "平均频率是达标的"
+    assert "210ms > 150ms" in v.spiky[0], v.spiky
+
+
+def test_trunk_has_no_rate_floor_but_still_checks_the_gap(bag_stat):
+    """躯干/头部没有标称频率 → 不判频率；但**最大间隔照样受 150 ms 约束**。
+
+    现场只给了相机/手臂/手部三个标尺。拿一个猜出来的数字去判它"不合格"，
+    会让现场去修一个根本没问题的东西 —— 而不查断流则是真的放过坏数据。
+    """
+    # 频率很低（比如 10 Hz）但不判不合格
+    v = _all_ok(bag_stat, **{TRUNK: _stat(10.0)})
+    assert v.slow == [], f"躯干不该有频率门槛：{v.slow}"
+    assert v.ok is True, v.detail
+
+    # 但断流要抓
+    v2 = _all_ok(bag_stat, **{TRUNK: _stat(10.0, max_ms=300.0)})
+    assert v2.ok is False
+    assert v2.spiky and "躯干/头部" in v2.spiky[0], v2.spiky
+
+
+def test_missing_topic_still_fails(bag_stat):
+    """整段没录到某个话题 → 不合格（这条与频率无关，是"根本没数据"）。"""
+    results = {CAM: _stat(30.0)}
+    samples = {CAM: [0, 1]}
+    v = bag_stat.evaluate_verdict(results, samples, [CAM, "/vision/depth"])
+    assert v.ok is False
+    assert v.missing == ["/vision/depth"]
+    assert "缺 1 个话题" in v.detail
+
+
+def test_too_few_frames_still_counts_as_needing_review(bag_stat):
+    """帧数不足（stat 为 None）→ 需复查；它算不出频率，不该被当成"频率不达标"。"""
+    results = {CAM: None, ARM: _stat(1000.0)}
+    samples = {CAM: [0], ARM: [0, 1]}
+    v = bag_stat.evaluate_verdict(results, samples, [CAM, ARM])
+    assert v.ok is False
+    assert v.bad == [CAM]
+    assert v.slow == [], "帧数不足不该再报一条频率问题"
+
+
+def test_non_increasing_timestamps_still_fail(bag_stat):
+    results = {CAM: _stat(30.0, nonpositive=2)}
+    samples = {CAM: [0, 1]}
+    v = bag_stat.evaluate_verdict(results, samples, [CAM])
+    assert v.ok is False
+    assert v.bad == [CAM]
+
+
+def test_report_prints_the_verdict_and_lists_every_failing_item(bag_stat):
+    """报告第 3 行是判定行；结论段要把**每一项**不达标都列出来。
+
+    列表只显示三个字，现场想知道"到底哪一路不行"必须能查报告 ——
+    而明细逐个列出来，才不用再跑一遍验证去猜。
+    """
+    from datetime import datetime
+
+    topics = list(bag_stat.TOPIC_TYPES)
+    results = {tp: _stat(1000.0 if "AR5" in tp else 30.0) for tp in topics}
+    samples = {tp: [0, 1] for tp in topics}
+
+    text = bag_stat.build_report("/x", samples, results,
+                                 generated_at=datetime(2026, 10, 27, 10, 0, 0),
+                                 host="h")
+    assert text.splitlines()[2].startswith(f"{bag_stat.VERDICT_PREFIX}{bag_stat.VERDICT_PASS}")
+
+    # 两类问题各挑一路已存在的相机话题：不凭空造键（`samples` 里没有的键会让
+    # build_report 在算帧数时 KeyError —— 真实数据里也不可能出现这种组合）。
+    other = [tp for tp in topics if tp != CAM][0]
+    bad = dict(results)
+    bad[CAM] = _stat(20.0)                    # 频率不达标
+    bad[other] = _stat(30.0, max_ms=400.0)    # 平均达标但断流 400 ms
+    text2 = bag_stat.build_report("/x", samples, bad,
+                                  generated_at=datetime(2026, 10, 27, 10, 0, 0),
+                                  host="h")
+    assert text2.splitlines()[2].startswith(f"{bag_stat.VERDICT_PREFIX}{bag_stat.VERDICT_FAIL}")
+    assert "频率不达标" in text2 and "20.0Hz < 30Hz" in text2
+    assert "最大间隔超限" in text2 and "400ms > 150ms" in text2
+
+
+def test_rate_standard_text_matches_the_agreed_numbers(bag_stat):
+    """标尺文案必须是现场给的三个数（含手臂的 ±5%）。
+
+    文案是报告里唯一的"口径声明"。它和判定逻辑各写一遍数字的话，
+    迟早出现"报告说相机 30、实际按 25 判"这种没人能看出来的偏差。
+    """
+    text = bag_stat.rate_standard_text()
+    assert "相机 30 Hz" in text
+    assert "手臂 ≥950 Hz" in text and "±5%" in text
+    assert "手部 100 Hz" in text
+
+
+def test_real_joint_names_map_to_the_right_parts(bag_stat):
+    """用**真实的关节名**核对部位映射（2026-10-27 从机器人侧配置抄的）。
+
+    真实命名：手臂 `AR5_Ljoint_1`…`AR5_Ljoint_7`，手部 `LJoint1`。
+    这两组 token 大小写不同（`Ljoint` vs `LJoint`），所以不会互相误匹配；
+    但必须确认它们各自都能被认出来 —— 认不出来的那一侧会**没有频率门槛**，
+    也就是"永远合格"，等于这条判定对它失效，而报告上完全看不出来。
+    """
+    arm = bag_stat.rate_target_for("/joint_states [AR5_Ljoint_1,AR5_Ljoint_7]")
+    hand = bag_stat.rate_target_for("/joint_states [LJoint1,RJoint1]")
+    trunk = bag_stat.rate_target_for("/joint_states [trunk_yaw]")
+
+    assert arm is not None and arm[0] == "手臂" and arm[1] == 950.0, arm
+    assert hand is not None and hand[0] == "手部" and hand[1] == 100.0, hand
+    assert trunk is None, "躯干没有标称频率，不该有门槛"
+    # 手臂下限必须是手部的 9.5 倍 —— 若两个 token 认混了，这条会立刻暴露
+    assert arm[1] == 9.5 * hand[1]

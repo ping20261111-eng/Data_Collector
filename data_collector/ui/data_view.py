@@ -27,6 +27,8 @@ from ..core_operations import (Launcher, TeleopManager, SdkServiceManager,
 from ..core_data import RecorderManager, DataUploader, LogFetcher
 from ..core_data import (UploadBatchQueue, UploadCancelledError,
                          sort_bags_by_capture_time)
+from ..verify import read_bag_verdict
+from . import bag_verdict
 
 
 from .common import (SP, describe_export_target, ensure_remote_password,
@@ -38,6 +40,16 @@ from .remote_browser import (RemoteDirectoryDialog)
 
 
 class DataViewDialog(QDialog):
+    #: 批量验证「每完成一条」的通知（v6.9.0）。
+    #:
+    #: 在工作线程里 emit（`verify_bag_folders(on_bag_done=...)` 的调用点），
+    #: 主线程的槽只做一件事：**把那一行**的判定重画。
+    #:
+    #: 为什么不用 `finished` 一把刷完：一次几十份，串行跑就是十几分钟，
+    #: 期间列表一个标记都不动，用户没法知道"跑到哪了、已经判了几条不合格"。
+    #: 也不能在回调里直接改 item —— 那是工作线程碰控件，Qt 会直接崩。
+    bag_verified = pyqtSignal(object)
+
     """查看数据：左边机器人上的日志文件，右边本机已录制的 bag 目录。
 
     2026-09-18 重构：去掉遗留的「放大窗口 / 缩小窗口」按钮（那是设计稿之前的过渡
@@ -72,6 +84,11 @@ class DataViewDialog(QDialog):
         # 只会留下半截报告，比"多等一分钟"糟得多。
         self._verify_thread = None
         self._verify_stop = False
+        #: 本批"还没出结果"的 bag 路径。验证开始时全部填入，每完成一条去掉一条。
+        #: 收尾时按它把剩余行恢复成磁盘上的真实判定 —— 取消/中断后那些行还挂着
+        #: 临时的「待验证」，不恢复就成了假信息。
+        self._verify_pending = set()
+        self.bag_verified.connect(self._on_bag_verified)
         self.verify_in_progress = False
 
         layout = QVBoxLayout(self)
@@ -252,6 +269,12 @@ class DataViewDialog(QDialog):
         操作员不用再靠目录名猜。
 
         日志列表同理：文件名的修改时间就是它的写入时间，直接显示即可。
+
+        ## 数据列表末尾还有判定列（v6.9.0）
+
+        每行是 `名字    录制时间    判定`，判定取该目录里**最新一份**验证报告的结论
+        （合格 / 不合格 / 未验证）。它由 `_apply_bag_row` 统一渲染 —— 逐条更新
+        （`_on_bag_verified`）和整表刷新都走同一个函数，不会出现两种口径。
         """
         self.log_list.clear()
         for f in self.log_fetcher.get_log_files():
@@ -267,11 +290,67 @@ class DataViewDialog(QDialog):
         self.bag_list.clear()
         # 按录制时间倒序：最新的在最上面（排序逻辑在 core_data 里，可单测）
         for captured, folder in sort_bags_by_capture_time(self.uploader.get_bag_folders()):
-            item = QListWidgetItem(f"{folder.name}    {captured:%m-%d %H:%M:%S}")
-            item.setData(1, str(folder))
-            self.bag_list.addItem(item)
+            self._add_bag_row(folder, captured)
 
         self._refresh_local_space()
+
+    # ---------- 数据行的判定列（v6.9.0） ----------
+
+    def _add_bag_row(self, folder, captured):
+        """新建一行。
+
+        `data(2)` 存**已格式化的时间文本**，不是 datetime 对象：Qt 的 `setData`
+        会把它过一遍 QVariant，取回来已经不是 Python 的 datetime 了
+        （实测 `f"{value:%H:%M}"` 直接抛 `Invalid format specifier`）。
+        逐条更新时要的只是这段文本，存文本最省事也最不容易再踩。
+        """
+        item = QListWidgetItem()
+        item.setData(1, str(folder))
+        item.setData(2, f"{captured:%m-%d %H:%M:%S}")
+        self._apply_bag_row(item, Path(folder), item.data(2))
+        self.bag_list.addItem(item)
+        return item
+
+    def _apply_bag_row(self, item, folder, stamp, pending: bool = False) -> None:
+        """重设一行的文本 / 提示 / 颜色。渲染细节都在 `ui.bag_verdict` 里。"""
+        verdict = read_bag_verdict(folder)
+        item.setText(bag_verdict.row_text(Path(folder).name, stamp,
+                                          bag_verdict.label(verdict, pending)))
+        item.setToolTip(bag_verdict.tooltip(verdict))
+        item.setForeground(bag_verdict.foreground(verdict, pending))
+
+    def _find_bag_row(self, folder):
+        """按 `data(1)` 里存的路径找行 —— 绝不按文本匹配（文本里现在有判定列）。"""
+        target = str(folder)
+        for index in range(self.bag_list.count()):
+            item = self.bag_list.item(index)
+            if item.data(1) == target:
+                return item
+        return None
+
+    def _refresh_bag_row(self, folder) -> None:
+        item = self._find_bag_row(folder)
+        if item is None:
+            return
+        self._apply_bag_row(item, Path(folder), item.data(2))
+
+    def _mark_row_pending(self, folder) -> None:
+        item = self._find_bag_row(folder)
+        if item is None:
+            return
+        self._apply_bag_row(item, Path(folder), item.data(2), pending=True)
+
+    def _on_bag_verified(self, result) -> None:
+        """主线程槽：批量验证每完成一条就更新那一行。
+
+        只动这一行，不 `clear()` 重建列表 —— 重建会丢选中、丢滚动位置，
+        而用户在验证期间往往正拿这个列表做别的判断。
+        """
+        path = str((result or {}).get("bag") or "")
+        if not path:
+            return
+        self._verify_pending.discard(path)
+        self._refresh_bag_row(path)
 
     # ---------- 本地磁盘空间 ----------
     @staticmethod
@@ -607,14 +686,24 @@ class DataViewDialog(QDialog):
         self._set_busy_controls(True)
         self.append_log(f"开始数据验证：{len(folders)} 个数据文件夹（结果写回各自目录）")
 
+        # 先把这一批全部标成「待验证」：用户一眼看到范围，也知道自己没选错。
+        self._verify_pending = {str(path) for path in folders}
+        for path in folders:
+            self._mark_row_pending(path)
+
         def progress(text):
             # **在工作线程里被调**：只能走信号，不能碰控件
             if self.parent() and hasattr(self.parent(), "progress_signal"):
                 self.parent().progress_signal.emit(text)
 
+        def on_bag_done(result):
+            # 同上，工作线程里被调 —— emit 到主线程由 `_on_bag_verified` 改那一行。
+            self.bag_verified.emit(result)
+
         thread = LocalTaskThread(
             lambda: launcher.verify_bag_folders(
-                folders, progress, lambda: self._verify_stop))
+                folders, progress, lambda: self._verify_stop,
+                on_bag_done=on_bag_done))
         self._verify_thread = thread
         thread.finished.connect(self._on_verify_finished)
         thread.start()
@@ -634,7 +723,9 @@ class DataViewDialog(QDialog):
         results = payload.get("results") or []
         for item in results:
             name = Path(item.get("bag", "")).name
-            if item.get("ok"):
+            if item.get("reused"):
+                self.append_log(f"↺ {name}：复用已有结果 {Path(item['report']).name}")
+            elif item.get("ok"):
                 self.append_log(f"✔ {name}：报告 {Path(item['report']).name}")
             else:
                 self.append_log(f"✖ {name}：{item.get('reason') or '未完成'}")
@@ -643,20 +734,39 @@ class DataViewDialog(QDialog):
         done = int(payload.get("done") or 0)
         succeeded = int(payload.get("succeeded") or 0)
         failed = int(payload.get("failed") or 0)
+        reused = int(payload.get("reused") or 0)
         stopped = bool(payload.get("stopped"))
-        self.refresh_lists()
+        # 跑完的刚才已逐条更新过；这里只把**没跑到**的（取消 / 中断）恢复成磁盘上
+        # 的真实判定 —— 否则它们会一直挂着临时的「待验证」，那是假信息。
+        # 刻意**不** `refresh_lists()`：重建列表会丢选中与滚动位置，而验证既不改
+        # bag 集合、也不改录制时间，没有重建的必要。
+        for path in list(self._verify_pending):
+            self._refresh_bag_row(path)
+        self._verify_pending = set()
 
-        if total and not done and not stopped:
+        if total and not done and not reused and not stopped:
             QMessageBox.critical(self, "数据验证未开始",
                                  payload.get("reason") or "数据验证没能启动")
             return
         failed_names = [Path(item["bag"]).name for item in results if not item.get("ok")]
         if stopped:
-            head = f"已停止：完成 {done}/{total}（成功 {succeeded} 个、失败 {failed} 个）"
+            head = f"已停止：验证 {done} 个（成功 {succeeded} 个、失败 {failed} 个）"
         else:
-            head = f"共 {done} 个：成功 {succeeded} 个、失败 {failed} 个"
+            head = f"共 {total} 个：验证 {done} 个（成功 {succeeded} 个、失败 {failed} 个）"
+        if reused:
+            # 复用的要单独说：否则"共 N 个、只验了 3 个"看着像漏了一批。
+            head += f"，复用已有结果 {reused} 个（未重跑）"
+        if reused and not done:
+            # 一条都没跑，必须说清楚原因 —— 否则现场看到"进度条一闪就结束"，
+            # 会以为按钮坏了或验证没生效。
+            QMessageBox.information(
+                self, "全部复用已有结果",
+                head + "\n\n这些目录里已有「不早于数据」的验证报告，因此没有重复验证。\n"
+                "如需重验，删掉目录里的「数据验证结果_*.txt」再点批量验证。")
+            return
+
         detail = "\n\n报告已写入各自的数据目录：" +                  "\n".join(Path(item["report"]).name for item in results if item.get("ok")) \
-                 if succeeded else ""
+                   if succeeded else ""
         if failed_names:
             more = "…" if len(failed_names) > 5 else ""
             QMessageBox.warning(self, "数据验证完成",

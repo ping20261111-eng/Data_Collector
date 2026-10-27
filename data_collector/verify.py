@@ -59,6 +59,159 @@ LIMITED_FS = SINGLE_FILE_LIMIT_FS
 #: 守卫：`test_verify_report_name_matches_the_script`。
 VERIFY_REPORT_NAME_FMT = "数据验证结果_%Y%m%d-%H%M%S.txt"
 
+#: 报告判定行的前缀与取值。**必须与 `scripts/bag_rate_stat.py` 的同名常量逐字一致**
+#: （那个脚本要能独立在机器人上跑，不 import 本包，所以刻意不合并）。
+#: 守卫：`test_bag_verdict_words_match_between_script_and_app`。
+BAG_VERDICT_PREFIX = "判定: "
+BAG_VERDICT_PASS = "合格"
+BAG_VERDICT_FAIL = "不合格"
+
+#: 旧报告（v6.9.0 之前生成）没有判定行，只能从"二、结论"段的措辞推断。
+#: 这两句是 `build_report` 在无问题时固定写出的原话 —— 改动它们就同时改这里。
+_LEGACY_OK_LINES = ("全部目标分组均有数据", "所有分组的帧间隔均可计算")
+
+
+#: 算"数据文件"的后缀。验证报告（.txt）与导出产物（SHA256SUMS）**不算** ——
+#: 它们是验证/搬运的产物，不是数据本身；把它们算进来，判据会自证成立。
+_DATA_FILE_SUFFIXES = (".mcap", ".db3", ".yaml", ".json", ".csv")
+
+
+def verification_reports(bag: Path) -> List[Path]:
+    """目录里的全部验证报告，按**文件名时间戳升序**（最后一个是最新的）。
+
+    排序键用文件名而不是 mtime：文件名里的时间戳拷来拷去不会变，
+    mtime 会被 rsync / 解压 / 清理改写（与 v6.7.7「数据时间」同一个坑）。
+    """
+    try:
+        return sorted(
+            (p for p in Path(bag).iterdir()
+             if p.is_file() and p.name.startswith("数据验证结果_")
+             and p.suffix == ".txt"),
+            key=lambda p: p.name)
+    except OSError:
+        return []
+
+
+def latest_verification_report(bag: Path) -> Optional[Path]:
+    """最新的一份验证报告；没有返回 None。"""
+    reports = verification_reports(bag)
+    return reports[-1] if reports else None
+
+
+def newest_data_mtime(bag: Path) -> float:
+    """目录里**数据文件**的最新修改时间（秒）。没有数据文件返回 0。"""
+    newest = 0.0
+    try:
+        for entry in Path(bag).iterdir():
+            if not entry.is_file():
+                continue
+            if entry.name.startswith("数据验证结果_"):
+                continue
+            if entry.suffix.lower() not in _DATA_FILE_SUFFIXES:
+                continue
+            try:
+                newest = max(newest, entry.stat().st_mtime)
+            except OSError:
+                continue
+    except OSError:
+        return 0.0
+    return newest
+
+
+def has_fresh_report(bag: Path) -> bool:
+    """目录里已有报告，且**报告不早于数据文件** → 可以复用，不必重跑。
+
+    ## 为什么不能"有报告就复用"
+
+    同一个目录名可能被重新录制覆盖（现场常这么干）。这时旧报告还在，数据已经
+    换了 —— 只看"有没有报告"，会把旧结论当成新数据的结论，而这正好是
+    「把坏数据标成合格」的那类错。
+
+    ## 为什么比具体文件的 mtime，而不是目录 mtime
+
+    报告写在 bag 目录里，**会改变目录 mtime** —— 用目录 mtime 比，判据会
+    永远成立（刚写完报告，目录一定是最新的）。所以只比数据文件自身的 mtime。
+    """
+    report = latest_verification_report(bag)
+    if report is None:
+        return False
+    try:
+        return report.stat().st_mtime >= newest_data_mtime(Path(bag))
+    except OSError:
+        return False
+
+
+def read_bag_verdict(bag: Path) -> Optional[dict]:
+    """读 bag 目录里**最新**的一份验证报告，返回判定；没有报告返回 None。
+
+    ## 为什么从报告读，而不是在内存里记
+
+    批量验证时"刚跑完的那几条"当然可以记在内存里，但那个状态一重启就没了，
+    而"这批数据验证过没有、合不合格"恰恰是要**随数据一起被回答**的问题。
+    报告就写在 bag 目录里（`verification_report_path` 的落点），所以它是唯一
+    可信来源；内存只用于"验证进行中"这种瞬时状态。
+
+    ## 取"最新"的判据是文件名而不是 mtime
+
+    文件名里带 `%Y%m%d-%H%M%S`，字典序就是时间序，且拷来拷去不会变；
+    mtime 会被 rsync / 解压 / 清理改写（与 v6.7.7 数据时间那个坑同源）。
+
+    Returns:
+        `None`（目录里没有报告）或::
+
+            {"ok": bool,            # True = 合格
+             "detail": str,         # 不合格的原因摘要；合格时为空
+             "report": Path,        # 用的是哪份报告
+             "when": Optional[datetime],   # 报告生成时间（从文件名解析）
+             "inferred": bool}      # True = 旧报告，结论是推断出来的
+    """
+    from datetime import datetime as _datetime
+
+    bag = Path(bag)
+    report = latest_verification_report(bag)
+    if report is None:
+        return None
+    try:
+        text = report.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+    try:
+        when = _datetime.strptime(report.stem, "数据验证结果_" + "%Y%m%d-%H%M%S")
+    except ValueError:
+        when = None
+
+    lines = text.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith(BAG_VERDICT_PREFIX):
+            continue
+        body = stripped[len(BAG_VERDICT_PREFIX):].strip()
+        # 形如「不合格 | 缺 2 个话题；1 个分组需复查」
+        head, _, detail = body.partition("|")
+        head, detail = head.strip(), detail.strip()
+        if head == BAG_VERDICT_PASS:
+            return {"ok": True, "detail": "", "report": report,
+                    "when": when, "inferred": False}
+        if head == BAG_VERDICT_FAIL:
+            return {"ok": False, "detail": detail or "详见报告", "report": report,
+                    "when": when, "inferred": False}
+        # 判定行存在但内容不认识（版本错配）：如实报"不合格"而不是猜"合格" ——
+        # 把坏数据标成合格，比标成不合格危险得多。
+        return {"ok": False, "detail": f"判定行无法识别（{head or '空'}）",
+                "report": report, "when": when, "inferred": False}
+
+    # ---------- 旧报告：没有判定行，从结论段措辞推断 ----------
+    # 两个标记出现在报告的不同行，所以对整份正文做包含判断，不是逐行。
+    ok = all(marker in text for marker in _LEGACY_OK_LINES)
+    if ok:
+        return {"ok": True, "detail": "", "report": report,
+                "when": when, "inferred": True}
+    return {"ok": False,
+            "detail": "旧格式报告（无判定行），按结论段推断为不合格",
+            "report": report, "when": when, "inferred": True}
+
+
 
 def verification_report_path(bag: Path, when=None) -> Path:
     """一次数据验证的报告落在**数据自己的目录里**（v6.7.0）。
