@@ -4386,3 +4386,59 @@ def test_the_head_axis_keeps_its_documented_range():
     stream_text = (PROJECT_ROOT / "scripts" / "motion_stream.py").read_text(encoding="utf-8")
     assert "(-30.0, 30.0)" in stream_text, (
         "motion_stream.py 的 H6 量程应当仍是文档写的 ±30（它走的是通用路径）")
+
+# ==================== save_yaml：原子写 + 写前自校验（v6.8.2） ====================
+
+def test_save_yaml_replaces_atomically_and_leaves_no_temp(tmp_path):
+    """写成功后目标内容正确，且**不留 `.tmp` 残骸**。
+
+    留残骸不只是脏：下次 `_prune` / 人工核对时会把它当"可疑文件"，
+    而它其实是完全正常的中间产物。
+    """
+    target = tmp_path / "conf.yaml"
+    save_yaml(target, {"a": 1, "b": {"c": [1, 2]}})
+
+    # 用项目自己的读取函数回读：顺带验证 save_yaml 写出的东西 load_yaml 认。
+    from data_collector.core import load_yaml
+    assert load_yaml(target) == {"a": 1, "b": {"c": [1, 2]}}
+    assert list(tmp_path.glob("*.tmp")) == [], "不该留下临时文件"
+
+
+def test_save_yaml_keeps_the_old_file_when_the_replace_fails(tmp_path, monkeypatch):
+    """替换失败时**旧文件必须完好** —— 这就是原子写存在的全部理由。
+
+    机器人侧 `teleop_config.yaml` 靠这个函数写。写到一半坏掉的话，
+    遥操作整个起不来（现场 2026-10-27 报的 YAML 解析错误就是这么一类）。
+    这里让 `os.replace` 失败来模拟"写到一半被打断"。
+    """
+    target = tmp_path / "conf.yaml"
+    save_yaml(target, {"version": 1})
+    before = target.read_text(encoding="utf-8")
+
+    def boom(*args, **kwargs):
+        raise OSError("simulated power loss between write and rename")
+
+    monkeypatch.setattr("data_collector.core.os.replace", boom)
+    with pytest.raises(OSError):
+        save_yaml(target, {"version": 2})
+
+    assert target.read_text(encoding="utf-8") == before, "旧配置被破坏了"
+    assert list(tmp_path.glob("*.tmp")) == [], "失败后应清掉临时文件"
+
+
+def test_save_yaml_refuses_to_write_text_it_cannot_read_back(tmp_path, monkeypatch):
+    """序列化出非法 YAML 时**拒绝写盘**，而不是把坏文件留给现场。
+
+    真实触发条件很窄（键里带换行/特殊控制字符），但后果不小：写下去之后
+    下次读就是解析失败，而现场只会看到"配置坏了"，不知道是谁写坏的。
+    """
+    target = tmp_path / "conf.yaml"
+    save_yaml(target, {"ok": True})
+    before = target.read_text(encoding="utf-8")
+
+    monkeypatch.setattr("data_collector.core.yaml.dump", lambda *a, **k: "a: [\n")
+    with pytest.raises(ValueError) as ei:
+        save_yaml(target, {"ok": False})
+
+    assert "无法解析" in str(ei.value)
+    assert target.read_text(encoding="utf-8") == before, "拒绝写盘却动了原文件"

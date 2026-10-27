@@ -2376,3 +2376,66 @@ def test_bench_verify_mode_comes_from_the_production_rule(bench):
     for cfg, legacy in cases:
         expected = resolve_disk_verify_mode({"verify_mode": cfg["verify_mode"]}, legacy)
         assert bench.effective_verify_mode(cfg) == expected, cfg
+
+# ==================== check_yaml_layout.py（YAML 结构体检，v6.8.2） ====================
+
+@pytest.fixture
+def yamlcheck():
+    return _load_module("check_yaml_layout", "check_yaml_layout.py")
+
+
+GOOD_TELEOP = """teleop:
+  calibration: yyt
+  zoffset: 0.22
+calibrations:
+  default:
+    tracker_index: tracker4
+    shoulder_width: 0.3
+  yyt:
+    tracker_index: tracker4
+    shoulder_width: 0.382362887
+trackers:
+  tracker1:
+    left_tracker: 7050952
+"""
+
+
+def test_yamlcheck_passes_a_healthy_file(yamlcheck, tmp_path):
+    """正常文件必须报 OK —— 体检工具自己误报会让现场不敢用。"""
+    path = tmp_path / "ok.yaml"
+    path.write_text(GOOD_TELEOP, encoding="utf-8")
+    ok, report = yamlcheck.check_file(path)
+    assert ok is True, report
+    assert any("解析：OK" in line for line in report)
+
+
+def test_yamlcheck_pins_the_one_space_typo_to_the_right_line(yamlcheck, tmp_path):
+    """现场那个案例：`yyt:` 少打一个空格 → 必须指到第 8 行并给出"改成 2"。
+
+    这条是这份工具存在的理由。2026-10-27 机器人侧报的是
+    `expected <block end>` + `line 8, column 2`（真实文件第 14 行，这里缩成 8 行），
+    看报错完全想不到"少了一个空格"。工具必须把这一句翻译出来。
+    """
+    bad = GOOD_TELEOP.replace("\n  yyt:", "\n yyt:")       # 2 空格 → 1 空格
+    path = tmp_path / "bad.yaml"
+    path.write_text(bad, encoding="utf-8")
+
+    ok, report = yamlcheck.check_file(path)
+    text = "\n".join(report)
+
+    assert ok is False
+    assert "第 8 行" in text, text
+    assert "expected <block end>" in text
+    assert "2 个空格" in text, f"必须给出正确缩进值：{text}"
+
+
+def test_yamlcheck_flags_tab_indentation(yamlcheck, tmp_path):
+    """tab 缩进是 YAML 的硬错误，判据要给"换成空格"，不能只说"有问题"。"""
+    bad = GOOD_TELEOP.replace("\n  yyt:", "\n\tyyt:")
+    path = tmp_path / "tab.yaml"
+    path.write_text(bad, encoding="utf-8")
+
+    ok, report = yamlcheck.check_file(path)
+    text = "\n".join(report)
+    assert ok is False
+    assert "tab" in text.lower(), text

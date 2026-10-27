@@ -64,8 +64,43 @@ def load_yaml(path: Path) -> dict:
         return yaml.safe_load(f)
 
 def save_yaml(path: Path, data: dict) -> None:
-    with open(path, 'w', encoding='utf-8') as f:
-        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    """写 YAML 文件：**先自校验，再原子替换**。
+
+    ## 为什么不能直接 `open(path, 'w')` 写
+
+    直接写有两个独立的失败模式，现实里都会遇到：
+
+    1. **写到一半被打断**（进程被杀 / 断电 / 磁盘满）→ 盘上留着半截 YAML。
+       下一次读就是 `yaml.parser` 的 `expected <block end>` 之类报错，而人看到的
+       是"昨天还好好的配置今天打不开"。机器人侧 `teleop_config.yaml` 被写坏时，
+       整个遥操作都起不来 —— 而它是靠 `save_teleop_config` 走这个函数写的。
+    2. **序列化出非法 YAML** → `yaml.dump` 对极端输入（键里带换行等）能产出
+       自身都 `safe_load` 不回来的文本。写盘前先读回来一遍，几毫秒就挡住。
+
+    项目里 `UserPrefs.update` 与 `patch_export_settings_text` 早就用了
+    "临时文件 + `os.replace`"，唯独这个最常用的入口漏了。
+
+    两处加固都**不改变文件最终内容**，只是把"可能留下坏文件"变成
+    "要么旧文件还在，要么新文件完整"。
+    """
+    path = Path(path)
+    text = yaml.dump(data, allow_unicode=True, default_flow_style=False, sort_keys=False)
+    try:
+        yaml.safe_load(text)
+    except yaml.YAMLError as exc:
+        # 走到了就说明序列化结果非法 —— 这是代码缺陷，必须当场暴露，不能写盘。
+        raise ValueError(
+            f"序列化出的 YAML 自身无法解析，已拒绝写盘：{path.name}（{exc}）") from exc
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
 
 
 # ============ app_config.yaml 的按行改写 ============
