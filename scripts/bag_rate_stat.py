@@ -20,12 +20,25 @@ import subprocess
 import sys
 import tempfile
 
-TOPICS = ['/vision/rgb', '/vision/depth'] + [
-    f'/camera_{side}/{stream}' for side in ('left', 'right')
-    for stream in ('color/image_rect_raw', 'aligned_depth_to_color/image_raw')]
+#: **必需**话题：缺任何一个都判不合格（整段没录到 = 下游训练缺一路输入）。
+REQUIRED_TOPICS = ['/vision/rgb'] + [
+    f'/camera_{side}/color/image_rect_raw' for side in ('left', 'right')]
+
+#: **可选**话题：深度三路。VLA 包不录深度（现场 2026-10-28 确认：符合预期），
+#: 所以"整段没有"**不算不合格**；但只要录了，帧率与断流照常查 ——
+#: 别的录制类型会带它们，不能因为默认不录就默认不查。
+OPTIONAL_TOPICS = ['/vision/depth'] + [
+    f'/camera_{side}/aligned_depth_to_color/image_raw' for side in ('left', 'right')]
+
+#: 参与分析的全部话题（必需 + 可选）。有数据就统计，缺可选不算失败。
+TOPICS = REQUIRED_TOPICS + OPTIONAL_TOPICS
 
 TOPIC_TYPES = dict.fromkeys(TOPICS, 'sensor_msgs/msg/Image')
 TOPIC_TYPES['/joint_states'] = 'sensor_msgs/msg/JointState'
+
+#: 判定「缺话题」时用的清单。`/joint_states` 也在里面 —— 它会被按关节名集合
+#: 拆成多组，但"整段没有 joint_states"仍是硬失败。
+VERDICT_TOPICS = REQUIRED_TOPICS + ['/joint_states']
 
 ROS_ENV_HINT = ('缺少 ROS 2 Python 环境，脚本需要先 source 机器人工作空间的 setup.bash：\n'
                 '  source ${ROBOT_WORKSPACE:-<工作空间>}/install/setup.bash\n'
@@ -51,19 +64,21 @@ VERDICT_FAIL = '不合格'
 
 #: 各部位的合格频率下限。**这是现场给的标尺（2026-10-27），不是随手定的**：
 #:
-#: | 部位 | 标称 | 允许偏差 | 判定下限 |
+#: | 部位 | 标称 | 判定下限 | 现场口径 |
 #: | --- | --- | --- | --- |
-#: | 相机 | 30 Hz | — | 30 Hz |
-#: | 手臂 | 1000 Hz | ±5% | **950 Hz** |
-#: | 手部 | 100 Hz | — | 100 Hz |
+#: | 相机 | 30 Hz | **28 Hz** | 实测 >28 Hz 即合格 |
+#: | 手臂 | 1000 Hz | **950 Hz** | 允许 ±5% |
+#: | 手部 | 100 Hz | **98 Hz** | 实测 98~100 Hz 之间合格 |
 #:
 #: 三条口径上的取舍：
 #:
 #: 1. **只判下限、不判上限**。超频不影响数据可用性，丢帧才是问题；
-#:    给上限只会在标称值附近制造无意义的误判。
-#: 2. 相机与手部现场只给了标称值、没给容差，所以这里容差取 0（低于标称即不合格）。
-#:    若之后发现太严（统计误差会让 30 Hz 实测出 29.9），改这张表的第三列即可，
-#:    不要在判定逻辑里另加特例。
+#:    给上限只会在标称值附近制造无意义的误判（手部现场口语里的「<100 Hz」
+#:    描述的是实测常态，不是上限要求）。
+#: 2. 相机下限 30 → **28**、手部 100 → **98**（现场 2026-10-28 改口）：
+#:    按标称硬判会把 29.99 / 99.87 Hz 这种正常抖动全判成不合格 ——
+#:    实测一份 40 分钟的 VLA 包里相机 29.99、手部 99.87，全是好数据。
+#: 3. 下限值只在这张表里，判定逻辑里不许再写数字。
 #: 3. **躯干/头部不在这张表里**：现场没给它的标称频率。拿一个猜出来的数字
 #:    去判"不合格"，比不判更糟 —— 但它的 `max` 间隔仍受 `MAX_INTERVAL_MS` 约束。
 #:
@@ -75,12 +90,12 @@ VERDICT_FAIL = '不合格'
 #: （将来若有人把某一侧改名成大小写一致的写法，也不会悄悄串味）。
 #: 顺序与 `display_name` 保持一致，便于对照报告里的标签。
 RATE_TARGETS = (
-    ('/vision/', '相机', 30.0, 0.0),
-    ('/camera_', '相机', 30.0, 0.0),
-    ('AR5_Ljoint', '手臂', 1000.0, 0.05),
-    ('AR5_Rjoint', '手臂', 1000.0, 0.05),
-    ('LJoint', '手部', 100.0, 0.0),
-    ('RJoint', '手部', 100.0, 0.0),
+    ('/vision/', '相机', 28.0, '标称 30 Hz'),
+    ('/camera_', '相机', 28.0, '标称 30 Hz'),
+    ('AR5_Ljoint', '手臂', 950.0, '标称 1000 Hz，允许 ±5%'),
+    ('AR5_Rjoint', '手臂', 950.0, '标称 1000 Hz，允许 ±5%'),
+    ('LJoint', '手部', 98.0, '标称 100 Hz'),
+    ('RJoint', '手部', 98.0, '标称 100 Hz'),
 )
 
 #: 任何分组的**最大帧间隔**上限（毫秒）。现场硬要求：任一项都不得超过 150 ms。
@@ -99,20 +114,35 @@ def rate_standard_text():
     camera = rate_target_for('/vision/x')
     arm = rate_target_for('AR5_Ljoint')
     hand = rate_target_for('LJoint')
-    return (f'相机 {camera[2]:g} Hz / 手臂 ≥{arm[1]:g} Hz'
-            f'（{arm[2]:g} Hz 允许 ±{arm[3] * 100:g}%）/ 手部 {hand[2]:g} Hz')
+    return (f'相机 ≥{camera[1]:g} Hz（{camera[2]}）'
+            f' / 手臂 ≥{arm[1]:g} Hz（{arm[2]}）'
+            f' / 手部 ≥{hand[1]:g} Hz（{hand[2]}）')
 
 
 def rate_target_for(key):
     """这个分组属于哪个部位、合格下限是多少。
 
     Returns:
-        `(部位, 下限 Hz, 标称 Hz, 容差比例)` 或 `None`（该部位没有标称频率）。
+        `(部位, 下限 Hz, 标称说明)` 或 `None`（该部位没有标称频率）。
+        说明是给人看的（「标称 1000 Hz，允许 ±5%」），判定只用下限。
     """
-    for token, label, hz, tolerance in RATE_TARGETS:
+    for token, label, floor, note in RATE_TARGETS:
         if token in key:
-            return label, hz * (1.0 - tolerance), hz, tolerance
+            return label, floor, note
     return None
+
+
+def has_topic_data(results, topic):
+    """这份结果里有没有这个话题的数据。
+
+    ⚠️ 不能直接 `topic in results`：`/joint_states` 会被按关节名集合**分组**成
+    `/joint_states [a,b,...]` 这样的键。判据必须与 `analyze_bag` 的打印逻辑一致，
+    否则报告会写出「有数据 -4」这种自相矛盾的数字。
+
+    抽成模块级是因为 `evaluate_verdict`（判缺话题）与 `build_report`
+    （写"可选话题未录制"）都要用 —— 两处各写一遍迟早分叉。
+    """
+    return any(key == topic or key.startswith(topic + ' [') for key in results)
 
 
 #: 一次判定的完整结果。用命名元组而不是裸元组：调用方要同时看
@@ -144,16 +174,9 @@ def evaluate_verdict(results, samples, topic_types=None):
         `(ok, detail, missing, bad)`：
         `detail` 是给 tooltip 看的一句话（合格时为空串）。
     """
-    topic_types = TOPIC_TYPES if topic_types is None else topic_types
+    topic_types = VERDICT_TOPICS if topic_types is None else topic_types
 
-    # ⚠️ 不能直接 `key not in results`：`/joint_states` 会被按关节名集合**分组**
-    # 成 `/joint_states [a,b,...]` 这样的键。判"这个话题有没有数据"必须与
-    # `analyze_bag` 里那条打印逻辑一致（`key == topic or key.startswith(topic + ' [')`），
-    # 否则报告会写出「有数据 -4」这种自相矛盾的数字。
-    def _has_data(topic):
-        return any(key == topic or key.startswith(topic + ' [') for key in results)
-
-    missing = [topic for topic in topic_types if not _has_data(topic)]
+    missing = [topic for topic in topic_types if not has_topic_data(results, topic)]
     bad = [key for key, stat in sorted(results.items())
            if not stat or stat['nonpositive']]
 
@@ -164,9 +187,11 @@ def evaluate_verdict(results, samples, topic_types=None):
         label = display_name(key)
         target = rate_target_for(key)
         if target is not None and stat['hz'] is not None:
-            _part, floor, _nominal, _tolerance = target
+            _part, floor, _note = target
             if stat['hz'] < floor:
-                slow.append(f'{label} {stat["hz"]:.1f}Hz < {floor:g}Hz')
+                # 两位小数：一位小数会把 29.99 打成「30.0Hz < 30Hz」这种
+                # 自相矛盾的句子（现场照着念会以为程序算错了）。
+                slow.append(f'{label} {stat["hz"]:.2f}Hz < {floor:g}Hz')
         if stat['max_ms'] > MAX_INTERVAL_MS:
             spiky.append(f'{label} 最大间隔 {stat["max_ms"]:.0f}ms > {MAX_INTERVAL_MS:g}ms')
 
@@ -208,8 +233,9 @@ def build_report(bag_path, samples, results, *, generated_at=None, host=None):
         f'生成时间: {when:%Y-%m-%d %H:%M:%S}',
         f'主机: {host}',
         f'数据目录: {bag_path}',
-        f'分析分组: {len(results)}；目标话题 {len(TOPIC_TYPES)} 个'
-        f'（有数据 {len(TOPIC_TYPES) - len(v.missing)}，缺失 {len(v.missing)}）',
+        f'分析分组: {len(results)}；必需话题 {len(VERDICT_TOPICS)} 个'
+        f'（有数据 {len(VERDICT_TOPICS) - len(v.missing)}，缺失 {len(v.missing)}）；'
+        f'可选话题 {len(OPTIONAL_TOPICS)} 个（缺了不影响判定）',
         '',
         '一、逐话题（Header 帧间隔，全量原始帧、无重采样）',
         '-' * 60,
@@ -233,6 +259,14 @@ def build_report(bag_path, samples, results, *, generated_at=None, host=None):
         lines += [f'    - {key}' for key in v.missing]
     else:
         lines.append('· 全部目标分组均有数据。')
+    # 可选话题（深度）默认不录。**必须写出来**：否则现场只看到"缺失"字样
+    # 却不知道是被程序忽略了，会以为还有一次性要补录。
+    optional_missing = [topic for topic in OPTIONAL_TOPICS
+                        if not has_topic_data(results, topic)]
+    if optional_missing:
+        lines.append(f'· 可选话题未录制 {len(optional_missing)} 项'
+                     f'（不计入判定，符合预期时可忽略）：')
+        lines += [f'    - {key}' for key in optional_missing]
     if v.bad:
         lines.append(f'· 需要复查 {len(v.bad)} 个分组（无有效间隔，或存在非递增时间戳）：')
         lines += [f'    - {key}' for key in v.bad]

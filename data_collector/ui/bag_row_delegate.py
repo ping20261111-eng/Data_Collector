@@ -29,6 +29,7 @@ from PyQt5.QtCore import QRect, QSize, Qt
 from PyQt5.QtGui import QColor, QFontMetrics, QPen
 from PyQt5.QtWidgets import (QApplication, QStyle, QStyledItemDelegate,
                              QStyleOptionViewItem)
+from typing import Optional
 
 from .. import theme
 from ..core import logger
@@ -62,7 +63,7 @@ def measure_name_width(metrics: QFontMetrics, names) -> int:
     `elidedText` 判"放不放得下"用的是同一套度量的另一种算法 —— 实测不留余量时
     最长的那个名字仍会被截成「…」，看起来像列宽算错了。`ELIDE_SLACK` 就是这 1~2px。
 
-    纯函数（只吃度量与字符串），便于单测；用到它的地方见 `fit_name_column`。
+    纯函数（只吃度量与字符串），便于单测；用到它的地方见 `fit_columns`。
     """
     widest = 0
     for name in names:
@@ -70,27 +71,60 @@ def measure_name_width(metrics: QFontMetrics, names) -> int:
     return max(widest + theme.px(ELIDE_SLACK), theme.px(MIN_NAME_W))
 
 
-def fit_name_column(bag_list) -> None:
-    """按列表里当前**最长的目录名**给名字列定宽。
+def _paint_metrics(delegate, bag_list) -> Optional[QFontMetrics]:
+    """**绘制时真正用的那套字体度量**。
+
+    ## 为什么不能用 `bag_list.font()`
+
+    v6.9.2 实测：控件字体是 14px Noto Sans SC（`setFont` 设的等宽字体因
+    `IBM Plex Mono` 未安装被回退），而 `initStyleOption` 交给 delegate 的
+    `option.font` 是 12pt DejaVu —— **两套完全不同的字体**。
+    用控件字体量宽度，名字列就会偏窄：最长的名字明明放得下也被截成「…」，
+    时间列宽也会差 10%。
+
+    所以一律以 `initStyleOption` 的 `font` 为准 —— 那才是 `paint()` 里画的字体。
+    """
+    if bag_list.count() == 0:
+        return None
+    option = QStyleOptionViewItem()
+    delegate.initStyleOption(option, bag_list.model().index(0, 0))
+    return QFontMetrics(option.font)
+
+
+def measure_stamp_width(metrics: QFontMetrics, stamps) -> int:
+    """时间列宽度：取**实际时间戳**里最宽的那个。
+
+    不用固定的探针（`00-00 00:00:00`）而不是因为懒：本机列表其实是**比例字体**
+    （等宽字体没装），探针宽度与真实时间戳能差 10%，多出来的那点就会被判定列吃掉。
+    """
+    return max((metrics.horizontalAdvance(str(s or "")) for s in stamps), default=0)
+
+
+def fit_columns(bag_list) -> None:
+    """按列表里当前的内容给**名字列与时间列**定宽。
 
     ## 为什么只在刷新后量一次
 
-    "验证完成一条"只改文本后两段，名字不变 —— 所以列位在逐条刷新期间是稳的。
-    如果每次重绘都重新量，验证跑到一半列宽会突然变一下，正在看的人会以为列表
-    重排了。
+    "验证完成一条"只改文本后两段，名字与时间都不变 —— 所以列位在逐条刷新期间是稳的。
+    如果每次重绘都重新量，验证跑到一半列宽会突然变一下，正在看的人会以为列表重排了。
 
     ## 为什么这件事不能写进 delegate 自己
 
     delegate 不能持有列表引用（会形成引用环，实测能让之后的 `setStyleSheet`
-    段错误）。所以由这里以**参数**拿到控件、量完把结果（一个整数）交给它。
+    段错误）。所以由这里以**参数**拿到控件、量完把结果（两个整数）交给它。
     """
     delegate = bag_list.itemDelegate()
     if not isinstance(delegate, BagRowDelegate):
         return                      # 别人的 delegate，不去动它的设定
-    metrics = QFontMetrics(bag_list.font())
-    names = (bag_verdict.split_row(bag_list.item(i).text())[0]
-             for i in range(bag_list.count()))
-    delegate.set_name_width(measure_name_width(metrics, names))
+    metrics = _paint_metrics(delegate, bag_list)
+    if metrics is None:
+        delegate.set_name_width(0)
+        delegate.set_stamp_width(0)
+        return
+    rows = [bag_verdict.split_row(bag_list.item(i).text())
+            for i in range(bag_list.count())]
+    delegate.set_name_width(measure_name_width(metrics, (r[0] for r in rows)))
+    delegate.set_stamp_width(measure_stamp_width(metrics, (r[1] for r in rows)))
 
 
 class BagRowDelegate(QStyledItemDelegate):
@@ -98,16 +132,24 @@ class BagRowDelegate(QStyledItemDelegate):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        #: 名字列的上限（像素）。由 `fit_name_column()` 在刷新后量出来。
-        #: 这里存的是**一个整数**，不是控件引用 —— 见上面第 1 条硬约束。
+        #: 名字列的上限 / 时间列的宽度（像素）。都由 `fit_columns()` 在刷新后量。
+        #: 这里存的是**整数**，不是控件引用 —— 见上面第 1 条硬约束。
         self._name_width = 0
+        self._stamp_width = 0
 
     def set_name_width(self, width: int) -> None:
-        """设置名字列的上限。量法见 `fit_name_column()`。"""
+        """设置名字列的上限。量法见 `fit_columns()`。"""
         self._name_width = max(int(width), 0)
 
     def name_width(self) -> int:
         return self._name_width
+
+    def set_stamp_width(self, width: int) -> None:
+        """设置时间列宽度。量法见 `fit_columns()`。"""
+        self._stamp_width = max(int(width), 0)
+
+    def stamp_width(self) -> int:
+        return self._stamp_width
 
     def paint(self, painter, option, index):  # noqa: N802 (Qt 命名)
         # 自绘必须保证 QPainter 收尾：中途抛异常会让它来不及 end()，之后整个进程
@@ -134,7 +176,7 @@ class BagRowDelegate(QStyledItemDelegate):
         metrics = QFontMetrics(opt.font)
         layout = bag_verdict.column_layout(
             opt.rect.width(),
-            metrics.horizontalAdvance(STAMP_PROBE),
+            self._stamp_width or metrics.horizontalAdvance(STAMP_PROBE),
             max(metrics.horizontalAdvance(item) for item in bag_verdict.ALL_LABELS),
             hpad=theme.px(HPAD),
             gap=theme.px(GAP),

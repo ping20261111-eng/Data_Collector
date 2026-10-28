@@ -165,3 +165,17 @@ def test_column_layout_honours_the_name_cap_and_leaves_the_rest_blank():
     assert capped.name_w == 200
     assert uncapped.name_w > capped.name_w
     assert capped.stamp_x < uncapped.stamp_x
+
+def test_row_roles_live_after_qt_user_role():
+    """行数据必须存在 `Qt.UserRole` 之后的角色号里（v6.9.2 踩过的坑）。
+
+    低位角色是 Qt 自己的语义：0=Display、1=Decoration、2=Edit。
+    实测 `setData(2, 时间)` 之后 `setText()` 会让 `data(2)` **回退返回整行文本**，
+    二次渲染把整行当时间列 —— 现场看到的就是三列内容错位。
+    这条断言很便宜，但它挡住的是一整类"把业务数据塞进 Qt 保留角色"的错误。
+    """
+    from PyQt5.QtCore import Qt
+
+    assert bag_verdict.PATH_ROLE >= int(Qt.UserRole), bag_verdict.PATH_ROLE
+    assert bag_verdict.STAMP_ROLE > int(Qt.UserRole), bag_verdict.STAMP_ROLE
+    assert bag_verdict.PATH_ROLE != bag_verdict.STAMP_ROLE

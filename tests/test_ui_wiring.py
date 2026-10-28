@@ -2713,12 +2713,18 @@ def _select_by_names(list_widget, names):
 
     也**不能按 `item.text()` 全等**：v6.7.7 起条目里带上了时间
     （`vla_xxx    10-26 14:00:00`），全等比较永远匹配不上，会静默选中 0 个。
-    按 `data(1)` 里存的路径取 basename 比对才是稳的。
+    按 `bag_verdict.PATH_ROLE` 里存的路径取 basename 比对才是稳的。
+
+    ⚠️ 必须用**共享的角色常量**，不能写死 `setData(1)`/`data(1)`：v6.9.2 把路径从
+    1 号（Qt.DecorationRole）挪到 UserRole 之后，写死的助手读不到路径 → 静默选中 0 个 →
+    "批量删除"看起来删失败了。
     """
+    from data_collector.ui import bag_verdict
+
     wanted = set(names)
     for i in range(list_widget.count()):
         item = list_widget.item(i)
-        raw = item.data(1)
+        raw = item.data(bag_verdict.PATH_ROLE)
         label = Path(raw).name if raw else item.text()
         item.setSelected(label in wanted)
 
@@ -2758,8 +2764,10 @@ def test_batch_delete_rejects_paths_outside_allowed_dir(ui_env, qapp, tmp_path, 
     (outside / "keep.txt").write_text("keep")
 
     # 直接把一个越界项塞进列表，模拟被污染的条目
+    from data_collector.ui import bag_verdict
+
     item = QListWidgetItem(outside.name)
-    item.setData(1, str(outside))
+    item.setData(bag_verdict.PATH_ROLE, str(outside))
     dlg.bag_list.addItem(item)
     dlg.bag_list.item(0).setSelected(False)
     item.setSelected(True)
@@ -4451,7 +4459,7 @@ def test_data_view_shows_the_verdict_at_the_end_of_every_bag_row(ui_env, tmp_pat
     from PyQt5.QtGui import QColor
 
     from data_collector import theme
-    from data_collector.ui import DataViewDialog
+    from data_collector.ui import DataViewDialog, bag_verdict
 
     win, _cm = ui_env
     root = tmp_path / "bags"
@@ -4464,7 +4472,7 @@ def test_data_view_shows_the_verdict_at_the_end_of_every_bag_row(ui_env, tmp_pat
     dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
     dlg.refresh_lists()
 
-    rows = {Path(dlg.bag_list.item(i).data(1)).name: dlg.bag_list.item(i)
+    rows = {Path(dlg.bag_list.item(i).data(bag_verdict.PATH_ROLE)).name: dlg.bag_list.item(i)
             for i in range(dlg.bag_list.count())}
     assert _verdict_label(rows["a_20261027100000"].text()) == "合格"
     assert _verdict_label(rows["b_20261027110000"].text()) == "不合格"
@@ -4486,7 +4494,7 @@ def test_verifying_one_bag_updates_only_that_row(ui_env, tmp_path):
     重建（clear + 重新 add）会丢选中、丢滚动位置，而用户在验证期间往往正拿着
     这个列表做别的判断（比如决定哪几份要重录）。
     """
-    from data_collector.ui import DataViewDialog
+    from data_collector.ui import DataViewDialog, bag_verdict
 
     win, _cm = ui_env
     root = tmp_path / "bags"
@@ -4499,7 +4507,7 @@ def test_verifying_one_bag_updates_only_that_row(ui_env, tmp_path):
     dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
     dlg.refresh_lists()
 
-    rows = {Path(dlg.bag_list.item(i).data(1)).name: dlg.bag_list.item(i)
+    rows = {Path(dlg.bag_list.item(i).data(bag_verdict.PATH_ROLE)).name: dlg.bag_list.item(i)
             for i in range(dlg.bag_list.count())}
     rows["b_20261027110000"].setSelected(True)
     before = dlg.bag_list.count()
@@ -4522,7 +4530,7 @@ def test_pending_rows_get_restored_when_the_batch_stops_early(ui_env, tmp_path):
     不恢复的话它们会一直挂着临时的「待验证」—— 那是假信息：既不是"验过"，
     也不是"没验过"，下次看列表的人会以为还在跑。
     """
-    from data_collector.ui import DataViewDialog
+    from data_collector.ui import DataViewDialog, bag_verdict
 
     win, _cm = ui_env
     root = tmp_path / "bags"
@@ -4534,7 +4542,7 @@ def test_pending_rows_get_restored_when_the_batch_stops_early(ui_env, tmp_path):
     dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
     dlg.refresh_lists()
 
-    rows = {Path(dlg.bag_list.item(i).data(1)).name: dlg.bag_list.item(i)
+    rows = {Path(dlg.bag_list.item(i).data(bag_verdict.PATH_ROLE)).name: dlg.bag_list.item(i)
             for i in range(dlg.bag_list.count())}
 
     # 开始验证：两条都标待验证（其中 b 有一条旧报告，收尾后应显示旧判定）
@@ -8585,3 +8593,56 @@ def test_data_view_draws_bag_rows_with_the_column_delegate(ui_env, tmp_path):
     assert isinstance(delegate, BagRowDelegate), \
         "数据列表没挂三列绘制器 —— 时间列会随名字长短漂移（现场投诉的就是这个）"
     assert delegate.name_width() > 0, "刷新后没有按最长名字给名字列定宽"
+
+def test_a_bag_row_can_be_rendered_twice_without_losing_its_columns(ui_env, tmp_path):
+    """同一行被**二次渲染**后，三列内容必须还是原值（v6.9.2 现场 bug）。
+
+    ## 现场现象
+
+    列表变成 `vla_2026102810… | vla_2026102810 | vla_2` —— 第二列本该是时间，
+    实际是名字；第三列本该是判定，实际是时间的前半截。
+
+    ## 根因（用 Qt 的行为解释，不是猜）
+
+    行里原本用 `item.setData(2, 时间文本)` 存时间，而 2 号角色是 `Qt.EditRole`：
+    `setText()` 之后 `data(2)` 会**回退返回 DisplayRole 的整行文本**。
+    于是"标记待验证"或"验证完成"这类二次渲染把整行文本当成了时间列，
+    再拼一次 `名字 + 整行文本 + 判定` —— 列位全错。
+
+    ## 为什么这条必须走两次渲染
+
+    只渲染一次的话（`refresh_lists` 刚跑完），文本是对的，旧代码照样绿。
+    缺陷只在"第二次把 data 读回来再拼"时才暴露。
+    """
+    from data_collector.ui import DataViewDialog, bag_verdict
+
+    win, _cm = ui_env
+    root = tmp_path / "bags"
+    root.mkdir()
+    folder = _make_bag(root, "vla_20261028102123", "判定: 不合格 | 缺 3 个话题")
+
+    win.uploader.bag_dir = root
+    dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
+    dlg.refresh_lists()
+
+    item = dlg._find_bag_row(folder)
+    assert item is not None
+
+    def columns():
+        return bag_verdict.split_row(item.text())
+
+    # 第一次渲染（刷新）
+    assert columns() == ("vla_20261028102123", "10-28 10:21:23", "不合格"), columns()
+
+    # 第二次渲染：批量验证开始时标"待验证"
+    dlg._mark_row_pending(folder)
+    assert columns() == ("vla_20261028102123", "10-28 10:21:23", "待验证"), columns()
+
+    # 第三次渲染：该条验证完成，回到磁盘上的判定
+    dlg._refresh_bag_row(folder)
+    assert columns() == ("vla_20261028102123", "10-28 10:21:23", "不合格"), columns()
+
+    # 时间必须存在 **UserRole 之后**的角色里：低位角色会被 Qt 的显示语义占用
+    assert item.data(bag_verdict.STAMP_ROLE) == "10-28 10:21:23", \
+        "时间列被整行文本污染了（角色号用错了）"
+    assert item.data(bag_verdict.STAMP_ROLE) != item.text()

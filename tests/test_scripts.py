@@ -2483,12 +2483,23 @@ def test_verdict_passes_when_every_part_meets_its_rate(bag_stat):
     assert v.slow == [] and v.spiky == []
 
 
-def test_verdict_fails_a_camera_below_30hz(bag_stat):
-    """相机 28 Hz → 不合格，原因里要有具体数字（现场据此判断丢了多少）。"""
-    v = _all_ok(bag_stat, **{CAM: _stat(28.0)})
-    assert v.ok is False
-    assert len(v.slow) == 1
-    assert "28.0Hz < 30Hz" in v.slow[0], v.slow
+def test_camera_floor_is_28hz_not_the_nominal_30(bag_stat):
+    """相机下限是 **28 Hz**（现场 2026-10-28 改口），不是标称的 30。
+
+    为什么必须放宽：一份正常录制的 VLA 包里实测 29.99 / 29.992 / 30.000，
+    按 30 硬判会把三路全判成不合格 —— 而那些数据是好的。现场口径：
+    「相机帧率 >28 Hz 属于合格」。
+    """
+    # 28 ~ 30 之间全部合格（含实测常见的 29.99）
+    for hz in (28.5, 29.0, 29.99, 30.0):
+        v = _all_ok(bag_stat, **{CAM: _stat(hz)})
+        assert v.ok is True, f"{hz} Hz 应合格：{v.detail}"
+
+    # 低于 28 才不合格，且原因里带两位小数（一位会把 27.94 打成 27.9，看不出差多少）
+    v2 = _all_ok(bag_stat, **{CAM: _stat(27.94)})
+    assert v2.ok is False
+    assert len(v2.slow) == 1
+    assert "27.94Hz < 28Hz" in v2.slow[0], v2.slow
 
 
 def test_arm_rate_gets_a_five_percent_margin(bag_stat):
@@ -2506,11 +2517,22 @@ def test_arm_rate_gets_a_five_percent_margin(bag_stat):
     assert "950Hz" in bad_case.slow[0], bad_case.slow
 
 
-def test_hand_rate_is_judged_at_100hz(bag_stat):
-    """手部 95 Hz → 不合格。"""
-    v = _all_ok(bag_stat, **{HAND: _stat(95.0)})
-    assert v.ok is False
-    assert "95.0Hz < 100Hz" in v.slow[0], v.slow
+def test_hand_floor_is_98hz(bag_stat):
+    """手部下限 **98 Hz**：实测 98~100 之间算合格（现场 2026-10-28 口径）。
+
+    实测一份好数据是 99.873 / 99.968 Hz —— 按 100 硬判会全判不合格。
+    """
+    for hz in (98.0, 99.0, 99.87, 99.968):
+        v = _all_ok(bag_stat, **{HAND: _stat(hz)})
+        assert v.ok is True, f"{hz} Hz 应合格：{v.detail}"
+
+    v2 = _all_ok(bag_stat, **{HAND: _stat(95.0)})
+    assert v2.ok is False
+    assert "95.00Hz < 98Hz" in v2.slow[0], v2.slow
+
+    # 超频不判不合格：丢帧才是问题，多给数据无害（与手臂同一条口径）
+    v3 = _all_ok(bag_stat, **{HAND: _stat(120.0)})
+    assert v3.ok is True, f"超频不该判不合格：{v3.detail}"
 
 
 def test_a_long_gap_fails_regardless_of_the_average_rate(bag_stat):
@@ -2546,10 +2568,112 @@ def test_missing_topic_still_fails(bag_stat):
     """整段没录到某个话题 → 不合格（这条与频率无关，是"根本没数据"）。"""
     results = {CAM: _stat(30.0)}
     samples = {CAM: [0, 1]}
-    v = bag_stat.evaluate_verdict(results, samples, [CAM, "/vision/depth"])
+    # 用**必需**话题做缺失对象：/vision/depth 已改为可选，缺它不该判不合格
+    v = bag_stat.evaluate_verdict(results, samples,
+                                  [CAM, "/camera_right/color/image_rect_raw"])
     assert v.ok is False
-    assert v.missing == ["/vision/depth"]
+    assert v.missing == ["/camera_right/color/image_rect_raw"]
     assert "缺 1 个话题" in v.detail
+
+
+def test_vla_bag_without_depth_passes_with_the_real_numbers(bag_stat):
+    """**现场那份真实 VLA 包必须判合格**（v6.9.2 的核心回归）。
+
+    数据照抄 `/home/nerv/Downloads/数据验证结果_20261028-102328.txt`：
+
+        相机 29.993 / 29.992 / 30.000 Hz      → 都被 30 硬判成"不达标"
+        手部 99.873 / 99.968 Hz               → 都被 100 硬判成"不达标"
+        深度三路整段没有                       → 被算成"缺 3 个话题"
+
+    三条都是**正常数据**：相机按 28、手部按 98 判，深度按可选话题处理。
+    这条测试就是那三个 bug 的合影 —— 只改一个数字、漏掉一条都会红。
+    """
+    results = {
+        "/vision/rgb": _stat(30.000, max_ms=34.000),
+        "/camera_left/color/image_rect_raw": _stat(29.993, max_ms=33.350),
+        "/camera_right/color/image_rect_raw": _stat(29.992, max_ms=33.345),
+        "/joint_states [AR5_Ljoint_1,AR5_Ljoint_2]": _stat(996.445, max_ms=5.057),
+        "/joint_states [AR5_Rjoint_1,AR5_Rjoint_2]": _stat(997.108, max_ms=6.027),
+        "/joint_states [LJoint1_1]": _stat(99.873, max_ms=20.197),
+        "/joint_states [RJoint1_1]": _stat(99.968, max_ms=20.222),
+        "/joint_states [head1_joint,trunk1_joint]": _stat(249.705, max_ms=12.067),
+    }
+    samples = {key: [0, 1, 2] for key in results}
+
+    v = bag_stat.evaluate_verdict(results, samples)
+
+    assert v.ok is True, f"这份好数据被判不合格了：{v.detail}"
+    assert v.missing == [], "深度话题未录制不该算缺话题"
+    assert v.slow == [] and v.spiky == []
+
+
+def test_depth_topics_are_optional_but_still_checked_when_present(bag_stat):
+    """深度是**可选**话题：缺了不判不合格；但录了就必须查（帧率/断流照常）。
+
+    两个方向都要钉住 —— 只写"缺了不算失败"的话，把深度从 TOPIC_TYPES 里
+    整个删掉也能绿，那样录了深度反而没人查。
+    """
+    base = {"/vision/rgb": _stat(30.0),
+            "/camera_left/color/image_rect_raw": _stat(30.0),
+            "/camera_right/color/image_rect_raw": _stat(30.0),
+            "/joint_states [AR5_Ljoint_1]": _stat(1000.0),
+            "/joint_states [LJoint1_1]": _stat(100.0)}
+
+    # 缺全部深度 → 仍合格
+    v = bag_stat.evaluate_verdict(dict(base), {k: [0, 1] for k in base})
+    assert v.ok is True, v.detail
+    assert v.missing == []
+
+    # 录了深度但只有 10 Hz / 断流 400 ms → 必须抓出来
+    with_depth = dict(base)
+    with_depth["/vision/depth"] = _stat(10.0, max_ms=400.0)
+    v2 = bag_stat.evaluate_verdict(with_depth, {k: [0, 1] for k in with_depth})
+    assert v2.ok is False
+    assert v2.slow and "10.00Hz < 28Hz" in v2.slow[0], v2.slow
+    assert v2.spiky and "400ms > 150ms" in v2.spiky[0], v2.spiky
+
+    # 深度话题必须在分析清单里（否则上面那条根本不会被执行到）
+    assert "/vision/depth" in bag_stat.TOPIC_TYPES
+
+
+def test_report_says_optional_topics_are_skipped_instead_of_missing(bag_stat):
+    """报告的"缺失"与"可选未录制"必须分开写。
+
+    只写"缺 3 个话题"会让现场以为漏录、要回去补拍；
+    只写"可选未录制"而不给清单，又不方便核对到底哪三路。
+    """
+    from datetime import datetime
+
+    results = {tp: _stat(30.0 if "camera" in tp or "vision" in tp else 100.0)
+               for tp in bag_stat.VERDICT_TOPICS}
+    results["/joint_states"] = _stat(1000.0)
+    samples = {k: [0, 1] for k in results}
+
+    text = bag_stat.build_report("/x", samples, results,
+                                 generated_at=datetime(2026, 10, 28, 10, 23, 55),
+                                 host="h")
+
+    assert text.splitlines()[2] == "判定: 合格", text.splitlines()[:3]
+    assert "必需话题" in text and "可选话题" in text
+    assert "可选话题未录制" in text
+    for topic in bag_stat.OPTIONAL_TOPICS:
+        assert f"- {topic}" in text, f"报告里没列出 {topic}"
+    assert "缺失 3 个目标话题" not in text, "可选话题不该写成缺失"
+
+
+def test_a_failing_rate_is_never_printed_as_equal_to_the_floor(bag_stat):
+    """不达标明细里**不许**出现「30.0Hz < 30Hz」这种自相矛盾的句子。
+
+    一位小数会把 29.993 打成 30.0，现场念出来就是"30 小于 30"——
+    看起来像程序算错了，实际是自己看不出差多少。
+    """
+    v = _all_ok(bag_stat, **{CAM: _stat(29.993)})       # 28 以上：合格
+    assert v.ok is True
+
+    v2 = _all_ok(bag_stat, **{CAM: _stat(27.994)})      # 不合格，且要说清差多少
+    detail = v2.slow[0]
+    assert "27.99Hz < 28Hz" in detail, detail
+    assert "28.0Hz < 28Hz" not in detail
 
 
 def test_too_few_frames_still_counts_as_needing_review(bag_stat):
@@ -2597,7 +2721,7 @@ def test_report_prints_the_verdict_and_lists_every_failing_item(bag_stat):
                                   generated_at=datetime(2026, 10, 27, 10, 0, 0),
                                   host="h")
     assert text2.splitlines()[2].startswith(f"{bag_stat.VERDICT_PREFIX}{bag_stat.VERDICT_FAIL}")
-    assert "频率不达标" in text2 and "20.0Hz < 30Hz" in text2
+    assert "频率不达标" in text2 and "20.00Hz < 28Hz" in text2
     assert "最大间隔超限" in text2 and "400ms > 150ms" in text2
 
 
@@ -2608,9 +2732,9 @@ def test_rate_standard_text_matches_the_agreed_numbers(bag_stat):
     迟早出现"报告说相机 30、实际按 25 判"这种没人能看出来的偏差。
     """
     text = bag_stat.rate_standard_text()
-    assert "相机 30 Hz" in text
-    assert "手臂 ≥950 Hz" in text and "±5%" in text
-    assert "手部 100 Hz" in text
+    assert "相机 ≥28 Hz" in text and "标称 30 Hz" in text, text
+    assert "手臂 ≥950 Hz" in text and "±5%" in text, text
+    assert "手部 ≥98 Hz" in text and "标称 100 Hz" in text, text
 
 
 def test_real_joint_names_map_to_the_right_parts(bag_stat):
@@ -2626,7 +2750,7 @@ def test_real_joint_names_map_to_the_right_parts(bag_stat):
     trunk = bag_stat.rate_target_for("/joint_states [trunk_yaw]")
 
     assert arm is not None and arm[0] == "手臂" and arm[1] == 950.0, arm
-    assert hand is not None and hand[0] == "手部" and hand[1] == 100.0, hand
+    assert hand is not None and hand[0] == "手部" and hand[1] == 98.0, hand
     assert trunk is None, "躯干没有标称频率，不该有门槛"
-    # 手臂下限必须是手部的 9.5 倍 —— 若两个 token 认混了，这条会立刻暴露
-    assert arm[1] == 9.5 * hand[1]
+    # 手臂下限比手部高一个数量级 —— 若两个 token 认混了，这条会立刻暴露
+    assert arm[1] > 5 * hand[1], (arm, hand)

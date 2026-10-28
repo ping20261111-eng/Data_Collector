@@ -92,12 +92,23 @@ def _first_ink_x(image, x_from):
     return None
 
 
+def _paint_metrics(widget):
+    """**绘制时**那套字体度量（`initStyleOption` 给的），不是控件字体。
+
+    v6.9.2 实测两者不同（IBM Plex Mono 未安装 → 控件与样式各自回退到不同字体），
+    用控件字体算期望值会让测试与实现分叉 —— 那正是当初漏掉列宽算错的原因。
+    """
+    option = QStyleOptionViewItem()
+    widget.itemDelegate().initStyleOption(option, widget.model().index(0, 0))
+    return QFontMetrics(option.font)
+
+
 def _expected_layout(widget, width):
-    metrics = QFontMetrics(widget.font())
+    metrics = _paint_metrics(widget)
     delegate = widget.itemDelegate()
     return bag_verdict.column_layout(
         width,
-        metrics.horizontalAdvance(bag_row_delegate.STAMP_PROBE),
+        delegate.stamp_width() or metrics.horizontalAdvance(bag_row_delegate.STAMP_PROBE),
         max(metrics.horizontalAdvance(text) for text in bag_verdict.ALL_LABELS),
         hpad=theme.px(bag_row_delegate.HPAD),
         gap=theme.px(bag_row_delegate.GAP),
@@ -117,7 +128,7 @@ def test_time_column_starts_at_the_same_x_for_rows_with_different_name_lengths(q
             _row("vla_20261026143957"),                      # 18
             _row("cloth_rack_20261027120000")]               # 26
     widget = _list(rows, width=600)
-    bag_row_delegate.fit_name_column(widget)
+    bag_row_delegate.fit_columns(widget)
 
     layout = _expected_layout(widget, 600)
     starts = []
@@ -144,7 +155,7 @@ def test_verdict_column_starts_at_the_same_x_for_rows_with_different_labels(qapp
             _row("a_20261027090000", label=bag_verdict.FAIL_TEXT),
             _row("a_20261027090000", label=bag_verdict.NONE_TEXT)]
     widget = _list(rows, width=600)
-    bag_row_delegate.fit_name_column(widget)
+    bag_row_delegate.fit_columns(widget)
 
     layout = _expected_layout(widget, 600)
     starts = []
@@ -164,9 +175,9 @@ def test_verdict_column_starts_at_the_same_x_for_rows_with_different_labels(qapp
 def test_name_column_is_capped_by_the_longest_name_after_fit(qapp):
     """刷新时按最长名字定宽 —— 宽窗口下不把名字与时间之间的空当摊开。"""
     widget = _list([_row("a_1"), _row("cloth_rack_20261027120000")], width=1200)
-    bag_row_delegate.fit_name_column(widget)
+    bag_row_delegate.fit_columns(widget)
 
-    metrics = QFontMetrics(widget.font())
+    metrics = _paint_metrics(widget)
     widest = metrics.horizontalAdvance("cloth_rack_20261027120000")
     width = widget.itemDelegate().name_width()
 
@@ -174,10 +185,79 @@ def test_name_column_is_capped_by_the_longest_name_after_fit(qapp):
         f"名字列宽 {width} 与最长名字 {widest} 不匹配（多余量只该是省略余量）"
 
 
+def test_column_widths_are_measured_with_the_font_that_paints(qapp):
+    """定宽必须用**绘制时那套字体**量，不能用控件字体（v6.9.2 现场 bug）。
+
+    ## 现场现象
+
+    列名与时间都对齐了，但**最长的名字明明放得下也被截成 `vla_202610281021…`**。
+
+    ## 根因
+
+    `bag_list.setFont(theme.mono_font(...))` 因 `IBM Plex Mono` 未安装被回退成
+    14px 的 Noto Sans SC；而 `initStyleOption` 交给 delegate 的 `option.font`
+    是 12pt 的 DejaVu —— **两套完全不同的字体**。用控件字体量出来的名字列比
+    实际绘制需要的窄 20%，于是最长那个名字永远差一点。
+
+    这条断言拿 `initStyleOption` 的字体当基准 —— 它才是 `paint()` 里画字的字体。
+    """
+    from PyQt5.QtGui import QFontMetrics
+    from PyQt5.QtWidgets import QStyleOptionViewItem
+
+    widest = "cloth_rack_20261027120000"
+    widget = _list([_row(widest), _row("a_1")], width=1200)
+    bag_row_delegate.fit_columns(widget)
+
+    option = QStyleOptionViewItem()
+    widget.itemDelegate().initStyleOption(option, widget.model().index(0, 0))
+    needed = QFontMetrics(option.font).horizontalAdvance(widest)
+
+    # 用绘制字体量：必须装得下（否则现场就看到省略号）
+    assert widget.itemDelegate().name_width() >= needed, (
+        f"名字列 {widget.itemDelegate().name_width()} < 绘制所需 {needed}"
+        "（说明用了控件字体量宽）")
+
+    # 时间列宽同理：要按真实时间戳量，别用固定探针
+    stamp = QFontMetrics(option.font).horizontalAdvance("10-28 10:21:23")
+    assert widget.itemDelegate().stamp_width() >= stamp, widget.itemDelegate().stamp_width()
+
+
+def test_longest_name_is_not_elided_when_there_is_room(qapp):
+    """宽窗口下**最长的名字不许被截** —— 用绘制里那条 `elidedText` 直接验。
+
+    只断言"列宽 ≥ 文字宽"还不够：`elidedText` 判"放得下"用的是它自己的口径，
+    差 1~2px 也会吐省略号。这里就把绘制那一行算式抄过来比 ——
+    它返回的还是原名，才说明画出来不会有「…」。
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QFontMetrics
+    from PyQt5.QtWidgets import QStyleOptionViewItem
+
+    widest = "cloth_rack_20261027120000"
+    widget = _list([_row(widest)], width=1200)
+    bag_row_delegate.fit_columns(widget)
+
+    metrics = _paint_metrics(widget)
+    needed = metrics.horizontalAdvance(widest)
+
+    # 宽窗口：实际分到的名字列宽必须装得下（`column_layout` 的结果，不是 cap）
+    wide_w = _expected_layout(widget, 1200).name_w
+    assert metrics.elidedText(widest, Qt.ElideRight, wide_w) == widest, (
+        f"宽窗口下名字被截了：列宽 {wide_w}，名字实测 {needed}")
+
+    # 窄窗口：分不到那么多，必须截（否则会压到时间列上）
+    narrow = _list([_row(widest)], width=320)
+    bag_row_delegate.fit_columns(narrow)
+    narrow_w = _expected_layout(narrow, 320).name_w
+    assert narrow_w < needed, (narrow_w, needed)
+    assert metrics.elidedText(widest, Qt.ElideRight, narrow_w) != widest, \
+        "窗口很窄时名字应该被截断"
+
+
 def test_short_names_still_get_a_minimum_width(qapp):
     """名字只有一两个字符时，时间列不能顶到左边框上。"""
     widget = _list([_row("a")], width=600)
-    bag_row_delegate.fit_name_column(widget)
+    bag_row_delegate.fit_columns(widget)
     assert widget.itemDelegate().name_width() == theme.px(bag_row_delegate.MIN_NAME_W)
 
 
@@ -186,7 +266,7 @@ def test_fit_leaves_a_foreign_delegate_alone(qapp):
     widget = _list([_row("a_1")], width=600)
     widget.setItemDelegate(QStyledItemDelegate(widget))
 
-    bag_row_delegate.fit_name_column(widget)     # 不应抛异常、也不应改动
+    bag_row_delegate.fit_columns(widget)     # 不应抛异常、也不应改动
 
     assert isinstance(widget.itemDelegate(), bag_row_delegate.BagRowDelegate) is False
 
@@ -218,7 +298,7 @@ def test_paint_survives_an_absurdly_narrow_viewport(qapp):
     """极窄视口（列放不下）时不能崩，也不能把判定列画到视口外看不见的地方还能报成功。"""
     widget = _list([_row("cloth_rack_20261027120000", label=bag_verdict.FAIL_TEXT)],
                    width=80)
-    bag_row_delegate.fit_name_column(widget)
+    bag_row_delegate.fit_columns(widget)
     image = _render(widget, 0, 80)
     assert image.width() == 80
 
@@ -239,7 +319,7 @@ def test_delegate_keeps_no_reference_to_the_widget(qapp):
     （见 `point_dialog._LabelCardDelegate` 的同名说明）。
     """
     widget = _list([_row("a_1")], width=600)
-    bag_row_delegate.fit_name_column(widget)
+    bag_row_delegate.fit_columns(widget)
     delegate = widget.itemDelegate()
 
     stored = [value for value in vars(delegate).values() if value is widget]

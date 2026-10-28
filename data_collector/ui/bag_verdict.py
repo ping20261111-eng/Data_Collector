@@ -24,9 +24,18 @@ from collections import namedtuple
 from pathlib import Path
 from typing import Optional
 
+from PyQt5.QtCore import Qt
 from PyQt5.QtGui import QColor
 
 from .. import theme
+
+#: 列表行里存"这一行代表哪个目录"。**必须用 `Qt.UserRole` 及以上的角色** ——
+#: 低位角色是 Qt 自己的语义（0=Display、1=Decoration、2=Edit），拿它们存业务数据
+#: 会与控件行为打架（v6.9.2 踩到：`data(2)` 是 EditRole，而 `setText()` 之后
+#: `data(2)` 会**回退成整行文本**，于是二次渲染把整行文本当成了时间列）。
+PATH_ROLE = int(Qt.UserRole)
+#: 行里存的"已格式化的录制时间"文本。同上，只在 UserRole 之后取号。
+STAMP_ROLE = int(Qt.UserRole) + 1
 
 #: 三段的间隔。`row_text` 与 `split_row` **共用这一个常量** ——
 #: 两边各写一份"四个空格"，改了一处就会静默地拆不开（表现是整行只剩名字，

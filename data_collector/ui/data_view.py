@@ -287,7 +287,7 @@ class DataViewDialog(QDialog):
             except OSError:
                 stamp = "—"
             item = QListWidgetItem(f"{f.name}    {stamp}")
-            item.setData(1, str(f))
+            item.setData(bag_verdict.PATH_ROLE, str(f))
             # 颜色/字体交给主题 QSS：这里写死 Qt.blue 会顶掉主题色（遗留问题）
             self.log_list.addItem(item)
 
@@ -296,7 +296,7 @@ class DataViewDialog(QDialog):
         for captured, folder in sort_bags_by_capture_time(self.uploader.get_bag_folders()):
             self._add_bag_row(folder, captured)
         # 按当前最长名字给"名字列"定宽（只在整表刷新时量一次，逐条更新不重排）。
-        bag_row_delegate.fit_name_column(self.bag_list)
+        bag_row_delegate.fit_columns(self.bag_list)
 
         self._refresh_local_space()
 
@@ -311,9 +311,9 @@ class DataViewDialog(QDialog):
         逐条更新时要的只是这段文本，存文本最省事也最不容易再踩。
         """
         item = QListWidgetItem()
-        item.setData(1, str(folder))
-        item.setData(2, f"{captured:%m-%d %H:%M:%S}")
-        self._apply_bag_row(item, Path(folder), item.data(2))
+        item.setData(bag_verdict.PATH_ROLE, str(folder))
+        item.setData(bag_verdict.STAMP_ROLE, f"{captured:%m-%d %H:%M:%S}")
+        self._apply_bag_row(item, Path(folder), item.data(bag_verdict.STAMP_ROLE))
         self.bag_list.addItem(item)
         return item
 
@@ -330,7 +330,7 @@ class DataViewDialog(QDialog):
         target = str(folder)
         for index in range(self.bag_list.count()):
             item = self.bag_list.item(index)
-            if item.data(1) == target:
+            if item.data(bag_verdict.PATH_ROLE) == target:
                 return item
         return None
 
@@ -338,13 +338,13 @@ class DataViewDialog(QDialog):
         item = self._find_bag_row(folder)
         if item is None:
             return
-        self._apply_bag_row(item, Path(folder), item.data(2))
+        self._apply_bag_row(item, Path(folder), item.data(bag_verdict.STAMP_ROLE))
 
     def _mark_row_pending(self, folder) -> None:
         item = self._find_bag_row(folder)
         if item is None:
             return
-        self._apply_bag_row(item, Path(folder), item.data(2), pending=True)
+        self._apply_bag_row(item, Path(folder), item.data(bag_verdict.STAMP_ROLE), pending=True)
 
     def _on_bag_verified(self, result) -> None:
         """主线程槽：批量验证每完成一条就更新那一行。
@@ -405,7 +405,7 @@ class DataViewDialog(QDialog):
     @staticmethod
     def _selected_paths(widget):
         """列表里选中的全部路径（批量操作用）。"""
-        return [Path(i.data(1)) for i in widget.selectedItems()]
+        return [Path(i.data(bag_verdict.PATH_ROLE)) for i in widget.selectedItems()]
 
     def _one_or_warn(self, widget, noun):
         """单选类操作的取值入口：没选或多选都给明确提示。
@@ -422,7 +422,7 @@ class DataViewDialog(QDialog):
                 self, "提示",
                 f"该操作一次只能选一个{noun}（当前选中 {len(items)} 个）")
             return None
-        return Path(items[0].data(1))
+        return Path(items[0].data(bag_verdict.PATH_ROLE))
 
     def _get_selected_log(self):
         return self._one_or_warn(self.log_list, "一个日志文件")
@@ -987,11 +987,11 @@ class DataViewDialog(QDialog):
             QDesktopServices.openUrl(folder_path.as_uri())
 
     def _on_log_double_click(self, item):
-        file_path = Path(item.data(1))
+        file_path = Path(item.data(bag_verdict.PATH_ROLE))
         self._open_file(file_path)
 
     def _on_bag_double_click(self, item):
-        folder_path = Path(item.data(1))
+        folder_path = Path(item.data(bag_verdict.PATH_ROLE))
         self._open_folder(folder_path)
 
     def append_log(self, text):
