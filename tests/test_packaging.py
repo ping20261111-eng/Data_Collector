@@ -61,6 +61,18 @@ def test_pack_script_excludes_logs(tmp_path):
     for forbidden in (".git/", "__pycache__/", ".pytest_cache/", ".ruff_cache/"):
         assert not any(forbidden in n for n in names), f"包里混进了 {forbidden}"
 
+    # 每台机器都不同的运行时文件，一个都不许随包分发。
+    # 这三条曾经只点名了前两个：`configs/user_prefs.yaml` **漏排了**，
+    # v6.9.2 的包里实测躺着开发机那份（teleop_user: yyt）—— 解包就顶掉现场的选择，
+    # 而且完全不报错。工作区里这个文件是真实存在的（就是上面的 yyt），
+    # 所以这条断言在修好之前**会真的红**，不是空转。
+    for runtime_file in ("Data_Collector/configs/user_prefs.yaml",
+                         "Data_Collector/configs/point_labels.yaml",
+                         "Data_Collector/configs/app_config.yaml"):
+        assert runtime_file not in names, (
+            f"包里带上了每台机器各不相同的 {runtime_file} —— "
+            f"现场解包会顶掉自己那份，且不会有任何报错")
+
 
 # ---------- 自检本身：别让它退回"管道 + grep -q"（v6.5.0） ----------
 def test_pack_selfchecks_do_not_read_the_listing_through_a_pipe():
@@ -83,6 +95,35 @@ def test_pack_selfchecks_do_not_read_the_listing_through_a_pipe():
            if "tar -tzf" in line and "| grep" in line and not line.strip().startswith("#")]
     assert bad == [], f"自检又用管道读清单了（会因 SIGPIPE 变成时好时坏）：{bad}"
     assert 'LIST="$(tar -tzf "$TARBALL")"' in text, "清单应当只取一次再在它上面查"
+
+
+def test_both_export_paths_name_the_runtime_config_files():
+    """**两套导出方式各自点名**：`pack.sh`（tar 复制）与 `.gitattributes`（git archive）。
+
+    这是 v6.9.3 踩出来的：`.gitattributes` 里早就写了
+    `configs/user_prefs.yaml export-ignore`，于是"导出时会排除它"看起来已经成立 ——
+    但 `export-ignore` **只对 `git archive` 生效**，而 `pack.sh` 走的是
+    `tar --exclude` 复制。两套规矩互不生效，谁也没覆盖谁，结果包里就带上了它
+    （实测 v6.9.2 的包：`teleop_user: yyt`）。
+
+    所以这条守卫同时查两处：只要有一处漏了就会红 —— 别再指望"另一处已经写了"。
+    """
+    runtime_files = ("configs/user_prefs.yaml",
+                     "configs/point_labels.yaml",
+                     "configs/app_config.yaml")
+
+    pack_text = PACK_SCRIPT.read_text(encoding="utf-8")
+    for name in runtime_files:
+        assert f"--exclude='{name}'" in pack_text, (
+            f"pack.sh 的 tar 复制清单里少了 --exclude='{name}' —— "
+            f"`.gitattributes` 的 export-ignore 管不到 tar 复制这条路")
+
+    attrs = (PROJECT_ROOT / ".gitattributes")
+    attrs_text = attrs.read_text(encoding="utf-8") if attrs.exists() else ""
+    for name in ("configs/user_prefs.yaml", "configs/point_labels.yaml"):
+        assert f"{name} export-ignore" in attrs_text, (
+            f".gitattributes 里少了 `{name} export-ignore` —— "
+            f"`git archive` 导出（不经 pack.sh）就会把带上")
 
 
 def test_pack_requires_our_record_script_copies(tmp_path):

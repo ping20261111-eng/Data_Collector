@@ -33,9 +33,17 @@
 #    **静默回落**到机器侧那份，于是"重刷后退回硬编码 → 落盘位置失效"这个坑又回来了，
 #    现场看到的仍是一句"脚本启动后立即退出"。所以这里跟上面几条一样用自检拦。
 #
+# 7. **不带 `configs/user_prefs.yaml`**（v6.9.3 加的）：使用者偏好 —— 上次的录制类型/
+#    任务/描述、上次遥操的人。它跟上面两条同一性质（每台机器都不同），但**当初漏排了**：
+#    规则 4/5 是逐个文件点名排掉的，这个文件没被点名。实测 v6.9.2 打出来的包里就躺着
+#    开发机那份（`teleop_user: yyt` / `record_type: bag`）—— 现场一解包就继承别人的
+#    选择，而且**不会报错**：下次遥操界面上预填的是别人的人名，谁也不会联想到是包带的。
+#    `.gitattributes` 里早就有这条 export-ignore（管 `git archive`），可 pack.sh 走的是
+#    `tar` 复制，**那条规则在这里不生效** —— 两套导出方式必须各自点名。
+#
 # 打包末尾会**自检**：包里只要还有 `logs/` 下的文件、或带上
-# `configs/point_labels.yaml` / `configs/app_config.yaml`、或缺了上面第 6 条那几个文件，
-# 就直接失败退出，不靠人记得检查。
+# `configs/point_labels.yaml` / `configs/app_config.yaml` / `configs/user_prefs.yaml`、
+# 或缺了上面第 6 条那几个文件，就直接失败退出，不靠人记得检查。
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -74,6 +82,7 @@ tar -C "$PROJECT_ROOT" \
     --exclude='dist' \
     --exclude='configs/point_labels.yaml' \
     --exclude='configs/app_config.yaml' \
+    --exclude='configs/user_prefs.yaml' \
     -cf - . | tar -C "$STAGE/Data_Collector" -xf -
 
 TARGET="$STAGE/Data_Collector"
@@ -133,7 +142,16 @@ if grep -qE 'configs/app_config\.yaml$' <<< "$LIST"; then
     exit 1
 fi
 
-# 自检 4：我们自己维护的录制脚本副本必须都在包里（规矩 6）。
+# 自检 4：使用者偏好同样不许随包分发（规矩 7）。
+# 它不报错、也不影响启动 —— 但会让现场的「上次遥操的人 / 上次的采集任务」变成开发机那份。
+if grep -qE 'configs/user_prefs\.yaml$' <<< "$LIST"; then
+    echo "✗ 自检失败：包里带上了 configs/user_prefs.yaml" >&2
+    echo "  （那是使用者偏好：上次遥操的人、上次的采集任务；解包后会顶掉现场自己的选择）" >&2
+    rm -f "$TARBALL"
+    exit 1
+fi
+
+# 自检 5：我们自己维护的录制脚本副本必须都在包里（规矩 6）。
 # 漏了不会报错，只会让起录制**静默回落**到机器侧那份 —— 那是本规则要挡的降级。
 MISSING=0
 for F in scripts/record_vla.sh scripts/record_bag.sh scripts/record_cmd.sh \
@@ -152,4 +170,4 @@ fi
 ENTRIES="$(wc -l <<< "$LIST" | tr -d ' ')"
 SIZE="$(du -h "$TARBALL" | cut -f1)"
 echo "✓ 已打包：$TARBALL"
-echo "  条目 $ENTRIES，大小 $SIZE，logs 内容 0 项 + 未带运行时标签文件与现场配置 + 录制脚本副本齐全（自检通过）"
+echo "  条目 $ENTRIES，大小 $SIZE，logs 内容 0 项 + 未带运行时标签/现场配置/使用者偏好 + 录制脚本副本齐全（自检通过）"

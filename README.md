@@ -1,8 +1,25 @@
-# 数据采集工具 v6.9.2
+# 数据采集工具 v6.9.3
 
 轮式人形机器人（布草机器人）桌面上位机，提供启动主程序、遥操作配置/标定、数据录制、
 机器人状态与急停、数据回传功能。
 
+> **v6.9.3**：**交付包里带上了使用者偏好（`configs/user_prefs.yaml`）。**
+>
+> **现象**：无 —— 这正是麻烦的地方。包里躺着开发机那份
+> `teleop_user: yyt` / `record_type: bag`，现场解包后「上次遥操的人」预填的是别人的名字，
+> 界面上没有任何报错或提示。
+>
+> **根因**：文件头那几条"每台机器都不同的文件不进包"是**逐个文件点名**的，
+> `point_labels.yaml` 与 `app_config.yaml` 点了，`user_prefs.yaml` 没点。
+> `.gitattributes` 里虽然早就有 `configs/user_prefs.yaml export-ignore`，
+> 但那条**只对 `git archive` 生效** —— `pack.sh` 走的是 `tar --exclude` 复制，两不相干。
+>
+> **改法**：`pack.sh` 补 `--exclude='configs/user_prefs.yaml'` +
+> 新增自检（带上就让打包失败）；守卫同时查**两处**（pack.sh 与 .gitattributes），
+> 任意一处漏了都红。
+>
+> ---
+>
 > **v6.9.2**：**两个现场 bug：列表三列内容错位、合格判定误杀好数据。**
 >
 > ### 一、列表列内容错位（`vla_… | vla_… | vla_2`）
