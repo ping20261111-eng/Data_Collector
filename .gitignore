@@ -31,6 +31,7 @@ venv/
 # 编译产物
 build/
 install/
+dist/
 
 # 数据文件
 *.bag
