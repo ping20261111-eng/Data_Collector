@@ -2661,6 +2661,40 @@ def test_report_says_optional_topics_are_skipped_instead_of_missing(bag_stat):
     assert "缺失 3 个目标话题" not in text, "可选话题不该写成缺失"
 
 
+def test_report_carries_the_script_version(bag_stat):
+    """报告里必须写**生成它的脚本版本**，且与上位机版本一致。
+
+    这条是被一次真实的误判逼出来的（2026-10-28）：现场把一份**升级前**生成的
+    「判定: 不合格」报告发过来当证据 —— 标尺早就放宽了，但旧报告不写版本，
+    它看起来和新报告一样，于是像"改完了还是不合格"。
+    写进版本后，旧报告能自己说明自己是旧的。
+
+    两件事都要钉住：
+    1. `SCRIPT_VERSION` 与 `data_collector/__init__.py` 的 `__version__` **不许分叉**
+       —— 版本唯一真源仍是 `__init__.py`，这里的常量只是给独立运行的脚本用；
+       只改一处就让这条红。
+    2. 版本行**不许挤掉判定行**的位置：上位机只读报告第 3 行，`判定:` 必须还在 index 2。
+    """
+    from pathlib import Path
+
+    init_text = (Path(__file__).resolve().parent.parent
+                 / "data_collector" / "__init__.py").read_text(encoding="utf-8")
+    real_version = next(line.split('"')[1] for line in init_text.splitlines()
+                        if line.startswith("__version__"))
+    assert bag_stat.SCRIPT_VERSION == real_version, (
+        f"报告脚本版本 {bag_stat.SCRIPT_VERSION} 与上位机 {real_version} 分叉了 —— "
+        f"两处一起改，别只改一处")
+
+    results = {tp: _stat(30.0 if "camera" in tp or "vision" in tp else 1000.0)
+               for tp in bag_stat.VERDICT_TOPICS}
+    text = bag_stat.build_report("/x", {k: [0, 1] for k in results}, results)
+    lines = text.splitlines()
+
+    assert lines[2].startswith("判定: "), f"判定行被挤走了：{lines[:4]}"
+    assert f"脚本版本: {bag_stat.SCRIPT_VERSION}" in lines, (
+        f"报告里没写脚本版本：{lines[:8]}")
+
+
 def test_a_failing_rate_is_never_printed_as_equal_to_the_floor(bag_stat):
     """不达标明细里**不许**出现「30.0Hz < 30Hz」这种自相矛盾的句子。
 

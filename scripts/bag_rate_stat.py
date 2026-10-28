@@ -20,6 +20,15 @@ import subprocess
 import sys
 import tempfile
 
+#: 生成报告的脚本版本。**必须与 `data_collector/__init__.py` 的 `__version__` 一致**
+#: （`test_scripts.py` 里有守卫钉着；只改一处会红）。
+#:
+#: 为什么要把版本写进报告：判定标尺改过两次（相机 30→28、手部 100→98、深度改可选），
+#: 而**旧报告与新报告长得几乎一样**。2026-10-28 真实发生过：现场把一份升级前生成的
+#: 「判定: 不合格」报告当成新结果发过来，看起来就像"改完了还是不合格"。
+#: 写上版本之后，旧报告能自己说明自己是旧的 —— 不用靠人去比格式差异。
+SCRIPT_VERSION = '6.9.4'
+
 #: **必需**话题：缺任何一个都判不合格（整段没录到 = 下游训练缺一路输入）。
 REQUIRED_TOPICS = ['/vision/rgb'] + [
     f'/camera_{side}/color/image_rect_raw' for side in ('left', 'right')]
@@ -233,6 +242,9 @@ def build_report(bag_path, samples, results, *, generated_at=None, host=None):
         f'生成时间: {when:%Y-%m-%d %H:%M:%S}',
         f'主机: {host}',
         f'数据目录: {bag_path}',
+        # 版本行放在判定行**之后**、明细之前：读判定的人先看结论，
+        # 怀疑结论"怎么和上次一样"时下一眼就能看到是哪一版出的报告。
+        f'脚本版本: {SCRIPT_VERSION}',
         f'分析分组: {len(results)}；必需话题 {len(VERDICT_TOPICS)} 个'
         f'（有数据 {len(VERDICT_TOPICS) - len(v.missing)}，缺失 {len(v.missing)}）；'
         f'可选话题 {len(OPTIONAL_TOPICS)} 个（缺了不影响判定）',
