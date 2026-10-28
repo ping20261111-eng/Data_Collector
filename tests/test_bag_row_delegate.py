@@ -82,12 +82,19 @@ def _render(widget, row, width, height=40):
     return image
 
 
-def _first_ink_x(image, x_from):
-    """从 `x_from` 往右扫，返回第一个**与底色不同**的像素列（即"有字"的位置）。"""
+def _first_ink_x(image, x_from, color=None):
+    """从 `x_from` 往右扫，返回第一个"有字"的像素列。
+
+    默认判据是"与底色不同"；给定 `color` 时判"等于这个字色"——
+    不合格行有淡红底，整行的底色都不等于主题底色，按底色判会把底纹当成字。
+    """
     background = _background()
+    target = color.name() if color is not None else None
     for x in range(x_from, image.width()):
         for y in range(image.height()):
-            if image.pixelColor(x, y) != background:
+            pixel = image.pixelColor(x, y)
+            hit = (pixel.name() == target) if target else (pixel != background)
+            if hit:
                 return x
     return None
 
@@ -112,8 +119,23 @@ def _expected_layout(widget, width):
         max(metrics.horizontalAdvance(text) for text in bag_verdict.ALL_LABELS),
         hpad=theme.px(bag_row_delegate.HPAD),
         gap=theme.px(bag_row_delegate.GAP),
-        name_cap=delegate.name_width() or None,
+        name_w=delegate.name_width() or None,
     )
+
+
+def _has_color(image, x0, x1, expected: QColor) -> bool:
+    """在 `[x0, x1)` 这段横向范围里找**完全等于** `expected` 的像素。
+
+    抗锯齿会让字形边缘变成混合色，但笔画内部仍是纯色 —— 判定一列的几个字里
+    总有足够多的"芯"像素。用精确相等而不是"接近"，是为了避免两种语义色
+    （红/绿）互相被误认。
+    """
+    target = expected.name()
+    for x in range(max(int(x0), 0), min(int(x1), image.width())):
+        for y in range(image.height()):
+            if image.pixelColor(x, y).name() == target:
+                return True
+    return False
 
 
 # ---------- 像素级：这版功能的全部意义 ----------
@@ -159,14 +181,20 @@ def test_verdict_column_starts_at_the_same_x_for_rows_with_different_labels(qapp
 
     layout = _expected_layout(widget, 600)
     starts = []
-    for row in range(len(rows)):
+    for row, label in enumerate((bag_verdict.PASS_TEXT, bag_verdict.FAIL_TEXT,
+                                 bag_verdict.NONE_TEXT)):
         image = _render(widget, row, 600)
-        starts.append(_first_ink_x(image, layout.verdict_x - theme.px(6)))
+        # 按**该行判定文字的颜色**扫：不合格行整行有淡红底，按"非底色"判会误把底纹当字
+        color = bag_verdict.column_color(bag_verdict.state(label),
+                                         bag_verdict.COLUMN_VERDICT)
+        starts.append(_first_ink_x(image, layout.verdict_x - theme.px(6), color))
 
     if any(x is None for x in starts):
         pytest.skip("此环境画不出文字（offscreen 也不渲染），像素校验无从进行")
 
-    assert len(set(starts)) == 1, f"判定列起点不一致：{starts}"
+    # 容差 2px：汉字各自的左侧留白（bearing）不同，「未」比「合」靠左 1px 是字形，
+    # 不是列位。列位错了会差出几个字宽，那才是这条要抓的。
+    assert max(starts) - min(starts) <= 2, f"判定列起点不一致：{starts}"
     assert abs(starts[0] - layout.verdict_x) <= 2, (starts[0], layout.verdict_x)
 
 
@@ -222,36 +250,155 @@ def test_column_widths_are_measured_with_the_font_that_paints(qapp):
     assert widget.itemDelegate().stamp_width() >= stamp, widget.itemDelegate().stamp_width()
 
 
-def test_longest_name_is_not_elided_when_there_is_room(qapp):
-    """宽窗口下**最长的名字不许被截** —— 用绘制里那条 `elidedText` 直接验。
+def test_longest_name_is_not_elided_at_any_viewport_width(qapp):
+    """**任何宽度下名字都不许被截**（v6.9.5 现场要求：名称要显示全部）。
 
-    只断言"列宽 ≥ 文字宽"还不够：`elidedText` 判"放得下"用的是它自己的口径，
-    差 1~2px 也会吐省略号。这里就把绘制那一行算式抄过来比 ——
-    它返回的还是原名，才说明画出来不会有「…」。
+    改口记录：v6.9.2 那版在窄窗口里会压缩名字列并吐省略号 ——
+    现场截图里三行都显示成 `vla_202610…`，**彼此无法区分**，等于这一列没信息。
+    现在名字列按最长名字的自然宽度定死，装不下就横向滚动。
     """
     from PyQt5.QtCore import Qt
     from PyQt5.QtGui import QFontMetrics
     from PyQt5.QtWidgets import QStyleOptionViewItem
 
     widest = "cloth_rack_20261027120000"
-    widget = _list([_row(widest)], width=1200)
+    metrics = QFontMetrics(theme.mono_font(theme.TYPE_SCALE["fs_sm"]))
+    needed = _paint_metrics(_list([_row(widest)])).horizontalAdvance(widest)
+
+    for viewport in (1200, 600, 320, 80):
+        widget = _list([_row(widest)], width=viewport)
+        bag_row_delegate.fit_columns(widget)
+        layout = _expected_layout(widget, viewport)
+
+        assert metrics.elidedText(widest, Qt.ElideRight, layout.name_w) == widest, (
+            f"视口 {viewport} 下名字被截了：列宽 {layout.name_w}，名字实测 {needed}")
+
+        # 装不下时必须**变宽**（视图据此出横向滚动条），而不是截断
+        option = QStyleOptionViewItem()
+        widget.itemDelegate().initStyleOption(option, widget.model().index(0, 0))
+        option.widget = widget
+        hint = widget.itemDelegate().sizeHint(option, widget.model().index(0, 0))
+        assert hint.width() >= layout.name_w + 2 * theme.px(bag_row_delegate.HPAD), (
+            f"视口 {viewport}: sizeHint 宽 {hint.width()} 装不下名字列 "
+            f"{layout.name_w}，名字会被裁掉")
+
+
+def test_content_wider_than_viewport_produces_a_horizontal_scrollbar(qapp):
+    """窄窗口里应当是**能横向滚动看到整行**，而不是把内容裁掉。"""
+    widget = _list([_row("cloth_rack_20261027120000")], width=240)
+    bag_row_delegate.fit_columns(widget)
+    widget.show()
+    qapp.processEvents()
+
+    assert widget.horizontalScrollBar().maximum() > 0, (
+        "内容比视口宽时应当出现横向滚动条（否则右侧的时间/判定列直接看不到）")
+
+
+def test_stamp_column_has_room_for_seconds(qapp):
+    """时间列必须按**带秒**的时间戳量宽（现场要求时间精确到秒）。
+
+    只断言"列宽>0"不够：`mm-dd HH:MM` 也大于 0，但画出来就是 `10-28 18` 这种
+    半截时间 —— 现场截图上出现的正是这个。
+    """
+    stamp = "10-27 12:00:00"
+    widget = _list([_row("a_20261027090000", stamp=stamp)], width=600)
     bag_row_delegate.fit_columns(widget)
 
     metrics = _paint_metrics(widget)
-    needed = metrics.horizontalAdvance(widest)
+    with_seconds = metrics.horizontalAdvance(stamp)
+    without = metrics.horizontalAdvance("10-27 12:00")
 
-    # 宽窗口：实际分到的名字列宽必须装得下（`column_layout` 的结果，不是 cap）
-    wide_w = _expected_layout(widget, 1200).name_w
-    assert metrics.elidedText(widest, Qt.ElideRight, wide_w) == widest, (
-        f"宽窗口下名字被截了：列宽 {wide_w}，名字实测 {needed}")
+    assert widget.itemDelegate().stamp_width() >= with_seconds, (
+        f"时间列 {widget.itemDelegate().stamp_width()} < 带秒时间戳 {with_seconds}")
+    assert with_seconds > without, "夹具本身不成立：带秒的时间戳并不比不带秒的宽"
 
-    # 窄窗口：分不到那么多，必须截（否则会压到时间列上）
-    narrow = _list([_row(widest)], width=320)
-    bag_row_delegate.fit_columns(narrow)
-    narrow_w = _expected_layout(narrow, 320).name_w
-    assert narrow_w < needed, (narrow_w, needed)
-    assert metrics.elidedText(widest, Qt.ElideRight, narrow_w) != widest, \
-        "窗口很窄时名字应该被截断"
+
+def test_verdict_color_follows_the_three_states(qapp):
+    """三档配色（v6.9.5）：合格绿 / 不合格红 / 未验证黑。
+
+    用**像素**验，不是只看常量表：状态是从行文本第三段反推出来的，
+    中间任何一步接错（把 label 传成 name、状态表 key 写错）纯函数测试都照样绿。
+    """
+    palette = theme.palette(theme.active_mode())
+    ok_color = QColor(palette["ok_text"])
+    bad_color = QColor(palette["danger_text"])
+    plain = QColor(palette["text"])
+
+    cases = [(bag_verdict.PASS_TEXT, ok_color),
+             (bag_verdict.FAIL_TEXT, bad_color),
+             (bag_verdict.NONE_TEXT, plain)]
+    for text, expected in cases:
+        widget = _list([_row("a_20261027090000", label=text)], width=600)
+        bag_row_delegate.fit_columns(widget)
+        layout = _expected_layout(widget, 600)
+        image = _render(widget, 0, 600)
+
+        assert _has_color(image, layout.verdict_x, layout.verdict_x + layout.verdict_w,
+                          expected), (
+            f"「{text}」的判定列没画成 {expected.name()}")
+
+    # 反过来也要钉住：合格的判定列里**不许**出现红，不合格的里不许出现绿
+    widget = _list([_row("a_20261027090000", label=bag_verdict.PASS_TEXT)], width=600)
+    bag_row_delegate.fit_columns(widget)
+    layout = _expected_layout(widget, 600)
+    image = _render(widget, 0, 600)
+    assert not _has_color(image, layout.verdict_x, layout.verdict_x + layout.verdict_w,
+                          bad_color), "合格行里出现了红字"
+
+    widget = _list([_row("a_20261027090000", label=bag_verdict.FAIL_TEXT)], width=600)
+    bag_row_delegate.fit_columns(widget)
+    layout = _expected_layout(widget, 600)
+    image = _render(widget, 0, 600)
+    assert not _has_color(image, layout.verdict_x, layout.verdict_x + layout.verdict_w,
+                          ok_color), "不合格行里出现了绿字"
+
+
+def test_failed_row_turns_the_name_red_but_leaves_the_time_neutral(qapp):
+    """不合格：**名字**跟判定一起红，**时间**保持中性（设计要求）。
+
+    时间列跟着红会让整行糊成一片红，而时间相对时间线时不该带判定含义。
+    """
+    palette = theme.palette(theme.active_mode())
+    bad_color = QColor(palette["danger_text"])
+    plain = QColor(palette["text"])
+
+    widget = _list([_row("linetest_20261027103000", label=bag_verdict.FAIL_TEXT)],
+                   width=600)
+    bag_row_delegate.fit_columns(widget)
+    layout = _expected_layout(widget, 600)
+    image = _render(widget, 0, 600)
+
+    assert _has_color(image, layout.name_x, layout.name_x + layout.name_w, bad_color), \
+        "不合格行的名字没转红"
+    assert _has_color(image, layout.stamp_x, layout.stamp_x + layout.stamp_w, plain), \
+        "不合格行的时间列应当保持正文色（不应该跟着红）"
+    assert not _has_color(image, layout.stamp_x, layout.stamp_x + layout.stamp_w,
+                          bad_color), "时间列被染红了"
+
+
+def test_failed_row_gets_a_tinted_background(qapp):
+    """不合格行有一层淡红底（参考图里能看到），合格/未验证行不加。
+
+    取列间距那一块空白采样：那里没有字，颜色就是行底。
+    """
+    background = _background()
+
+    def gap_pixel(label, name="a_20261027090000"):
+        widget = _list([_row(name, label=label)], width=600)
+        bag_row_delegate.fit_columns(widget)
+        layout = _expected_layout(widget, 600)
+        image = _render(widget, 0, 600)
+        x = layout.name_x + layout.name_w + theme.px(bag_row_delegate.GAP) // 2
+        return image.pixelColor(x, 20)
+
+    failed = gap_pixel(bag_verdict.FAIL_TEXT)
+    passed = gap_pixel(bag_verdict.PASS_TEXT)
+
+    assert passed.name() == background.name(), "合格行不该改行底"
+    assert failed.name() != background.name(), "不合格行没有底纹"
+    # 红底：红通道更高、蓝绿通道更低（别只比"不相等"，那样换成绿色底也能过）
+    assert failed.red() >= failed.green() and failed.red() > failed.blue(), (
+        f"底纹不是淡红：{failed.name()}")
 
 
 def test_short_names_still_get_a_minimum_width(qapp):

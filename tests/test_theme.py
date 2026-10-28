@@ -94,6 +94,65 @@ def test_light_and_dark_define_same_semantic_tokens():
     assert not missing, f"明色主题缺令牌: {missing}"
 
 
+# ---------- WCAG AA：文字色不许"看起来挺绿"就算 ----------
+def _luminance(hex_color: str) -> float:
+    """相对亮度（WCAG 2.x 的定义，与 sRGB 反 gamma 一致）。"""
+    hex_color = hex_color.lstrip("#")
+    channels = [int(hex_color[i:i + 2], 16) / 255 for i in (0, 2, 4)]
+    channels = [c / 12.92 if c <= 0.03928 else ((c + 0.055) / 1.055) ** 2.4
+                for c in channels]
+    return 0.2126 * channels[0] + 0.7152 * channels[1] + 0.0722 * channels[2]
+
+
+def _contrast(foreground: str, background: str) -> float:
+    a, b = _luminance(foreground), _luminance(background)
+    high, low = max(a, b), min(a, b)
+    return (high + 0.05) / (low + 0.05)
+
+
+def test_semantic_text_tokens_pass_wcag_aa_on_both_themes():
+    """合格绿 / 不合格红 / 正文，压**两套主题的两种行底**都要 ≥ 4.5:1（WCAG AA）。
+
+    ## 为什么这条必须存在
+
+    设计稿上"绿色"很容易选一个看起来对的 `#2F9E63` —— 它压白底只有 **3.39:1**，
+    现场在强光下看小字会糊。而 `danger`（#D64545）也只有 4.38:1、压隔行浅灰底
+    （#F4F6F5）掉到 4.03:1：**两种都是"看着没问题、量了不过"**。
+    所以文字色单独走 `ok_text` / `danger_text` 这一档，并由这条用例钉住。
+
+    检查的是**会画小字的那几个键**（正文、合格、不合格）；`ok` / `danger` 是
+    面色（按钮填充、急停），不在此列。
+    """
+    for mode in ("light", "dark"):
+        colors = theme.palette(mode)
+        backgrounds = [("surface", colors["surface"]),
+                       ("surface2", colors["surface2"])]
+        for token in ("text", "ok_text", "danger_text"):
+            for bg_name, bg in backgrounds:
+                ratio = _contrast(colors[token], bg)
+                assert ratio >= 4.5, (
+                    f"{mode} 主题：{token} 压 {bg_name} 只有 {ratio:.2f}:1，"
+                    f"不到 WCAG AA 的 4.5:1")
+
+
+def test_failed_verdict_stays_readable_on_its_own_tint():
+    """不合格行的红字压在**自己那层淡红底**上仍要 ≥4.5:1。
+
+    底纹是把 `danger` 按 10% 透明度叠在行底上算出来的，所以要按混合后的颜色量 ——
+    直接量"红压白"会得到一个偏乐观的数。
+    """
+    for mode in ("light", "dark"):
+        colors = theme.palette(mode)
+        danger = colors["danger"].lstrip("#")
+        base = colors["surface"].lstrip("#")
+        alpha = 26 / 255
+        mixed = "#" + "".join(
+            f"{round(int(danger[i:i + 2], 16) * alpha + int(base[i:i + 2], 16) * (1 - alpha)):02X}"
+            for i in (0, 2, 4))
+        ratio = _contrast(colors["danger_text"], mixed)
+        assert ratio >= 4.5, f"{mode} 主题：红字压在淡红底上只有 {ratio:.2f}:1"
+
+
 def test_active_mode_follows_apply_theme():
     """自绘控件（列表 delegate、电量环）要按主题取色，靠这个全局事实而不是持有窗口引用。
 

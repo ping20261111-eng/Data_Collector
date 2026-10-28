@@ -4478,7 +4478,10 @@ def test_data_view_shows_the_verdict_at_the_end_of_every_bag_row(ui_env, tmp_pat
     assert _verdict_label(rows["b_20261027110000"].text()) == "不合格"
     assert _verdict_label(rows["c_20261027120000"].text()) == "未验证"
 
-    danger = QColor(theme.palette(theme.active_mode())["danger"]).name()
+    # 列表行用**文字档**的红（`danger_text`）：`danger` 是面色，压白底 4.38:1 不过 AA。
+    # 逐列上色在 delegate 里（合格绿/不合格红/未验证黑），item 的 foreground 只表示
+    # "这一行是坏的那一类"，供无障碍/复制/测试读。
+    danger = QColor(theme.palette(theme.active_mode())["danger_text"]).name()
     assert rows["b_20261027110000"].foreground().color().name() == danger
     assert rows["a_20261027100000"].foreground().color().name() != danger
     assert rows["c_20261027120000"].foreground().color().name() != danger

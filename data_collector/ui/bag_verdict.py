@@ -8,17 +8,21 @@
 拆出来的都是**不依赖控件状态**的东西：给一个 verdict，返回该显示的文本 / 提示 / 颜色。
 `data_view` 那边只留"找到哪一行、把结果贴上去"这几行。
 
-## 三种判定 + 一种临时态
+## 四种文案 + 三档配色（v6.9.5 改口）
 
-| 状态 | 文案 | 颜色 |
-| --- | --- | --- |
-| 合格 | `合格` | 正文色 |
-| 不合格 | `不合格` | **danger（整行转红）** |
-| 未验证 | `未验证` | 正文色 |
-| 待验证 | `待验证` | 正文色（批量验证进行中，还没轮到它） |
+| 状态 | 文案 | 判定列 | 名字列 | 行底 |
+| --- | --- | --- | --- | --- |
+| 合格 | `合格` | **ok_text（绿）** | 正文色 | 不涂 |
+| 不合格 | `不合格` | **danger_text（红）** | **danger_text（红）** | 淡红（10% danger） |
+| 未验证 / 待验证 | `未验证` / `待验证` | 正文色（黑） | 正文色 | 不涂 |
 
-**只给不合格上色**：一屏几十行里如果合格也染绿，红色就不再跳眼 ——
-而"哪几条要返工"正是这个列表最该一眼看出来的东西。
+**v6.9.0 那版是「只给不合格上色」**，理由是"一屏里合格也染绿，红色就不再跳眼"。
+现场 2026-10-28 明确要求三档可辨（合格绿 / 不合格红 / 未验证黑）—— 于是改回三色，
+但把**红色的饱和度提上来**（`danger_text` 比 `danger` 深一档）保住"不合格最先跳眼"：
+红绿两色在白底上的对比度分别是 5.98:1 与 5.56:1，都过 WCAG AA。
+
+⚠️ `ok` / `danger` 是**面**色（按钮、急停），压白底只有 3.39:1 / 4.38:1，拿它写小字
+不过 AA。文字一律用 `ok_text` / `danger_text` —— 这两组键就是为此分出来的。
 """
 from collections import namedtuple
 from pathlib import Path
@@ -59,6 +63,34 @@ PENDING_TEXT = "待验证"
 
 #: 四种文案里最长的那一个决定判定列宽度（`ALL_LABELS` 见下）。
 ALL_LABELS = (PASS_TEXT, FAIL_TEXT, NONE_TEXT, PENDING_TEXT)
+
+#: 三列的**语义名**。取色函数按它区分"这一格该用什么颜色"——
+#: 用字符串而不是 0/1/2：调用处 `column_color(state, COLUMN_VERDICT)` 一眼看得懂。
+COLUMN_NAME = "name"
+COLUMN_STAMP = "stamp"
+COLUMN_VERDICT = "verdict"
+
+#: 三档状态。**从行文本的第三段反推**（`state()`）—— 这样绘制层不需要再多存一个字段，
+#: 也就不可能出现"存的状态与显示的字不一致"。
+STATE_PASS = "pass"
+STATE_FAIL = "fail"
+STATE_NONE = "none"
+STATE_PENDING = "pending"
+
+_STATE_BY_LABEL = {PASS_TEXT: STATE_PASS,
+                   FAIL_TEXT: STATE_FAIL,
+                   NONE_TEXT: STATE_NONE,
+                   PENDING_TEXT: STATE_PENDING}
+
+
+def state(verdict_label: str) -> str:
+    """从判定文案反推状态。认不出的文案按**未验证**处理（不该乱标绿/红）。"""
+    return _STATE_BY_LABEL.get(str(verdict_label or "").strip(), STATE_NONE)
+
+
+def state_of(verdict: Optional[dict], pending: bool = False) -> str:
+    """从 verdict 字典取状态（给不经过文本的调用方用，如 `foreground`）。"""
+    return state(label(verdict, pending))
 
 
 def label(verdict: Optional[dict], pending: bool = False) -> str:
@@ -116,39 +148,44 @@ def split_row(text: str):
 
 
 def column_layout(total_width: int, stamp_w: int, verdict_w: int,
-                  hpad: int, gap: int, name_cap: Optional[int] = None) -> ColumnLayout:
-    """按容器宽度算三列的固定列位（**与内容无关**，这就是"列对齐"）。
+                  hpad: int, gap: int, name_w: Optional[int] = None) -> ColumnLayout:
+    """按**内容**算三列的固定列位（v6.9.5 起不再压缩名字）。
 
-    ## 为什么由容器宽度算，而不是按最长的名字补空格
+    ## 为什么由内容算，而不是按容器宽度摊
 
     补空格有三个躲不掉的问题：得先知道"这一屏最长的名字"（逐条刷新时它会变，
     于是已画好的行要全部重排）；中文与 ASCII 的显示宽度不同，算错就整列串位；
     名字超过预留宽度时补不住，只能截断，而截断点又得自己算。
 
-    固定列位把这些问题一次解决：时间列与判定列的 x 只由**容器宽度**和两列的
-    固有宽度决定。名字多长都不影响它们；名字太长时压缩名字列并用省略号。
+    固定列位把这些问题一次解决：三列的 x 只由**几个宽度**决定，与某一行无关。
+
+    ## v6.9.5 为什么把"名字太长就截断"改掉
+
+    现场截图里三行名字全是 `vla_202610…` —— **截断后相同前缀的行彼此无法区分**，
+    等于名字列没有信息。所以现在：
+
+    - `name_w` 给定时（刷新后已量过最长名字）= **它的原值**，不压缩也不拉伸；
+    - 容器装不下时**不让某一列吃亏**，改由列表出现横向滚动条（`required_row_width`）；
+    - `name_w` 为 `None`（还没量过，例如空列表）= 退回旧行为：占用容器剩余宽度。
 
     Args:
-        total_width: 列表视口的宽度（每个 item 在 ListMode 下就是整行宽度）。
-        stamp_w: 时间列的固有宽度（等宽字体下所有时间戳同宽）。
+        total_width: 列表视口的宽度。**只在 `name_w` 为 None 时参与计算** ——
+            它是"兜底"，不是"上限"。
+        stamp_w: 时间列的固有宽度（按真实时间戳 `mm-dd HH:MM:SS` 量）。
         verdict_w: 判定列的固有宽度（按**最长**文案预留）。
         hpad: 左右留白。
         gap: 列间距。
-        name_cap: 名字列的**上限**（调用方按当前最长名字量出来的）。
-            给了它，宽窗口下多出来的宽度就留白，而不是摊进名字与时间的空当里 ——
-            否则窗口一宽，几十行看下来像两个互不相干的列表。
-            它只封顶、不兜底：窗口变窄时照常压缩名字列。
+        name_w: 名字列的宽度（= 最长名字的自然宽度 + 余量）。
 
     Returns:
         `ColumnLayout(name_x, name_w, stamp_x, stamp_w, verdict_x, verdict_w)`。
-        空间不够时**先压名字列**（可以截断），不挤时间与判定 —— 判定列是这一版的
-        全部意义所在，把它挤出视口等于功能没做。
     """
     available = max(int(total_width) - 2 * int(hpad), 0)
     reserve = 2 * int(gap) + int(stamp_w) + int(verdict_w)
-    name_w = max(available - reserve, 0)
-    if name_cap is not None:
-        name_w = min(name_w, max(int(name_cap), 0))
+    if name_w is None:
+        name_w = max(available - reserve, 0)
+    else:
+        name_w = max(int(name_w), 0)
     name_x = int(hpad)
     stamp_x = name_x + name_w + int(gap)
     verdict_x = stamp_x + int(stamp_w) + int(gap)
@@ -156,12 +193,76 @@ def column_layout(total_width: int, stamp_w: int, verdict_w: int,
                         verdict_x, int(verdict_w))
 
 
+def required_row_width(name_w: int, stamp_w: int, verdict_w: int,
+                       hpad: int, gap: int) -> int:
+    """一行**完整显示**三列所需的宽度（不截断任何一列）。
+
+    这个数交给 delegate 的 `sizeHint`：视口比它窄时列表出现横向滚动条，
+    而不是把名字截成 `vla_202610…`。反过来，视口更宽时行宽仍取视口宽 ——
+    否则行底纹会在右边空出一截，看起来像列表被切断了。
+    """
+    return (2 * int(hpad) + max(int(name_w), 0) + 2 * int(gap)
+            + int(stamp_w) + int(verdict_w))
+
+
 def foreground(verdict: Optional[dict], pending: bool = False) -> QColor:
-    """整行前景色：只有**不合格**用 danger，其余用正文色。
+    """**整行**的前景色（item 的 `ForegroundRole`）：不合格用红，其余用正文色。
+
+    绘制层不再直接用它上色（三列各有各的颜色，见 `column_color`），但这条要留着：
+    它是"这一行是什么状态"在一处能被程序读到的表示（无障碍、复制、以及既有测试）。
 
     颜色从主题取（`theme.palette(theme.active_mode())`），不写死色值 ——
     写死的话切主题后这一列会停留在旧配色上。
     """
     colors = theme.palette(theme.active_mode())
-    bad = (not pending) and verdict is not None and not verdict["ok"]
-    return QColor(colors["danger"] if bad else colors["text"])
+    bad = state_of(verdict, pending) == STATE_FAIL
+    return QColor(colors["danger_text"] if bad else colors["text"])
+
+
+#: 不合格行的底纹透明度（0~255）。10% 左右：能一眼分出"这一行有问题"，
+#: 又不至于把行底压成粉色块、抢掉文字的对比度（红字压上去仍 5.11:1）。
+ROW_TINT_ALPHA = 26
+
+
+def column_color(state_name: str, column: str,
+                 selected: Optional[QColor] = None) -> QColor:
+    """某一格该用的文字色。三态三色，**按列分别取**。
+
+    | 列 | 合格 | 不合格 | 未验证 / 待验证 |
+    | --- | --- | --- | --- |
+    | 名字 | 正文 | **红** | 正文 |
+    | 时间 | 正文 | 正文 | 正文 |
+    | 判定 | **绿** | **红** | 正文（黑） |
+
+    时间列**不跟着变红**：它是用来对时间线的，跟着染色只会让整行糊成一片红；
+    而且三种状态下时间都是"中性事实"，本身不含判定含义。
+
+    Args:
+        state_name: `STATE_*` 之一。
+        column: `COLUMN_NAME` / `COLUMN_STAMP` / `COLUMN_VERDICT`。
+        selected: 选中态该用的颜色（通常是样式的 `highlightedText`）。
+            给了它就**直接用它** —— 选中底色是主题强调色，红绿压上去都不好读。
+    """
+    if selected is not None:
+        return QColor(selected)
+    colors = theme.palette(theme.active_mode())
+    if state_name == STATE_FAIL and column in (COLUMN_NAME, COLUMN_VERDICT):
+        # 名字与判定一起红：名字红是"该返工的是这一条"，判定红是"为什么"。
+        # 时间列**不在**这里 —— 见上面那张表。
+        return QColor(colors["danger_text"])
+    if state_name == STATE_PASS and column == COLUMN_VERDICT:
+        return QColor(colors["ok_text"])
+    return QColor(colors["text"])
+
+
+def row_tint(state_name: str) -> Optional[QColor]:
+    """行底纹：**只有不合格**加一层淡红，其余返回 None（交样式原样画）。
+
+    用 danger 色叠 10% 透明度，而不是新加一个 `#FBE9E9` 之类的色值 ——
+    这样亮/暗两套主题各自算出正确的底，不会出现"暗色主题下淡红底刺眼"。
+    """
+    if state_name != STATE_FAIL:
+        return None
+    color = QColor(theme.palette(theme.active_mode())["danger"])
+    color.setAlpha(ROW_TINT_ALPHA)
+    return color

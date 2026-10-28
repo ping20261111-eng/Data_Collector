@@ -10,8 +10,9 @@
 补空格做不到稳：得先知道这一屏最长的名字（逐条刷新时会变，已画的行要重排）、
 中文与 ASCII 显示宽度不同（算错就整列串位）、超长名字补不住只能截断。
 
-固定列位把这些一次解决：时间列与判定列的 x 只由**容器宽度**算出来，
-名字多长都不影响；名字太长就压缩它并用省略号。
+固定列位把这些一次解决：三列的 x 只由**几个宽度**算出来，名字多长都不影响。
+v6.9.5 起名字列按**最长名字的自然宽度**定死，装不下时出现横向滚动条 ——
+现场明确要求"名称要显示全部"，截断成 `vla_202610…` 的行彼此无法区分，等于没名字。
 
 ## 🔴 三条硬约束（都踩过，别改）
 
@@ -26,7 +27,7 @@
    选中态、hover、隔行底色都还是主题那套。自己涂色迟早与 QSS 分叉。
 """
 from PyQt5.QtCore import QRect, QSize, Qt
-from PyQt5.QtGui import QColor, QFontMetrics, QPen
+from PyQt5.QtGui import QFontMetrics, QPalette, QPen
 from PyQt5.QtWidgets import (QApplication, QStyle, QStyledItemDelegate,
                              QStyleOptionViewItem)
 from typing import Optional
@@ -173,6 +174,16 @@ class BagRowDelegate(QStyledItemDelegate):
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
 
         name, stamp, label = bag_verdict.split_row(text)
+        # 状态由**判定文案**反推（`row_text` 的第三段）：绘制层不再单独存一份状态，
+        # 也就不可能出现"存的状态与显示的字不一致"。
+        state = bag_verdict.state(label)
+        selected = bool(opt.state & QStyle.State_Selected)
+
+        # 不合格：先叠一层 10% 的红底（选中时不叠 —— 选中底色本身就是强调色）。
+        tint = None if selected else bag_verdict.row_tint(state)
+        if tint is not None:
+            painter.fillRect(opt.rect, tint)
+
         metrics = QFontMetrics(opt.font)
         layout = bag_verdict.column_layout(
             opt.rect.width(),
@@ -180,33 +191,57 @@ class BagRowDelegate(QStyledItemDelegate):
             max(metrics.horizontalAdvance(item) for item in bag_verdict.ALL_LABELS),
             hpad=theme.px(HPAD),
             gap=theme.px(GAP),
-            name_cap=self._name_width or None,
+            name_w=self._name_width or None,
         )
 
-        # 颜色取 item 的前景色（`setForeground` 设的就是它）：不合格整行转红，
-        # 选中时**也保持红** —— 判定是这个列表最要紧的信息，选中一下就不红
-        # 反而会让人以为它变成合格了。
-        brush = index.data(Qt.ForegroundRole)
-        color = brush.color() if hasattr(brush, "color") else None
-        if color is None or not color.isValid():
-            color = QColor(theme.palette(theme.active_mode())["text"])
-        painter.setPen(QPen(color))
+        # 选中态一律用样式的 highlightedText：选中底色是强调色，红绿压上去都不好读，
+        # 而"合格/不合格"这几个字本身已经把语义说清了。
+        selected_color = (opt.palette.color(QPalette.HighlightedText)
+                          if selected else None)
 
         rect = opt.rect
-        if layout.name_w > 0:
-            # 名字可以截断（它只是标识），但时间与判定不能 —— 后两者是判据。
-            painter.drawText(
-                QRect(layout.name_x, rect.y(), layout.name_w, rect.height()),
-                int(Qt.AlignLeft | Qt.AlignVCenter),
-                metrics.elidedText(name, Qt.ElideRight, layout.name_w))
-        for x, width, value in ((layout.stamp_x, layout.stamp_w, stamp),
-                                (layout.verdict_x, layout.verdict_w, label)):
+        for column, x, width, value in (
+                (bag_verdict.COLUMN_NAME, layout.name_x, layout.name_w, name),
+                (bag_verdict.COLUMN_STAMP, layout.stamp_x, layout.stamp_w, stamp),
+                (bag_verdict.COLUMN_VERDICT, layout.verdict_x, layout.verdict_w, label)):
             if width <= 0 or not value:
                 continue
+            painter.setPen(QPen(bag_verdict.column_color(state, column, selected_color)))
+            # 名字列已按最长名字定宽，正常路径下 `elidedText` 会原样返回；
+            # 留着它只是兜底（列宽还没量过时也不至于糊出边界）。
+            if column == bag_verdict.COLUMN_NAME:
+                value = metrics.elidedText(value, Qt.ElideRight, width)
             painter.drawText(QRect(x, rect.y(), width, rect.height()),
                              int(Qt.AlignLeft | Qt.AlignVCenter), value)
 
     def sizeHint(self, option, index):  # noqa: N802 (Qt 命名)
-        """行高：字体高度 + 内边距，且不低于触摸门槛（32px 设计稿值）。"""
+        """行高按触摸门槛，行宽按**内容需要**（不够宽就横向滚动，不截名字）。
+
+        宽度这里只读 `option.widget`（视图）当场量，**不存下来** ——
+        delegate 持有宿主引用会形成引用环，实测能让之后的 `setStyleSheet` 段错误。
+        """
         height = QFontMetrics(option.font).height() + 2 * theme.px(VPAD)
-        return QSize(0, max(height, theme.px(MIN_ROW_H)))
+        return QSize(self._row_width(option), max(height, theme.px(MIN_ROW_H)))
+
+    def _row_width(self, option) -> int:
+        """这一行要画多宽：**内容需要**与**视口宽**取大者。
+
+        - 内容更宽（窄窗口）→ 返回内容宽度，视图出现横向滚动条，名字仍然完整；
+        - 视口更宽 → 返回视口宽度，行底纹铺满整行，不会在右侧空出一条。
+        """
+        metrics = QFontMetrics(option.font)
+        needed = bag_verdict.required_row_width(
+            self._name_width,
+            self._stamp_width or metrics.horizontalAdvance(STAMP_PROBE),
+            max(metrics.horizontalAdvance(item) for item in bag_verdict.ALL_LABELS),
+            hpad=theme.px(HPAD),
+            gap=theme.px(GAP),
+        )
+        widget = getattr(option, "widget", None)
+        viewport = 0
+        if widget is not None:
+            try:
+                viewport = widget.viewport().width()
+            except AttributeError:            # 不是视图（某些测试直接给 QWidget）
+                viewport = 0
+        return max(needed, viewport)

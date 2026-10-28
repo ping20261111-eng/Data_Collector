@@ -74,19 +74,80 @@ def test_row_text_handles_a_missing_timestamp():
 
 
 def test_only_a_failed_verdict_turns_red():
-    """**只有不合格**用 danger 色。
+    """**只有不合格**用红。
 
-    一屏几十行里如果合格也染色，红色就不跳了 —— 而"哪几条要返工"
-    正是这个列表最该一眼看出来的东西。
+    一屏几十行里如果合格也用红，红色就不跳了 —— 而"哪几条要返工"
+    正是这个列表最该一眼看出来的东西。合格用的是**绿**（判定列），不是红。
     """
     from PyQt5.QtGui import QColor
 
     colors = theme.palette(theme.active_mode())
-    danger, normal = QColor(colors["danger"]).name(), QColor(colors["text"]).name()
+    # 文字用 `*_text` 那一档：`danger` 是面色，压白底 4.38:1 不过 AA（见 theme 注释）
+    danger, normal = QColor(colors["danger_text"]).name(), QColor(colors["text"]).name()
 
     assert bag_verdict.foreground(_verdict(ok=False)).name() == danger
     assert bag_verdict.foreground(_verdict(ok=True)).name() == normal
     assert bag_verdict.foreground(None).name() == normal
+    assert danger != QColor(colors["ok_text"]).name(), "不合格与合格不能用同一个色"
+
+
+def test_state_is_derived_from_the_row_text_itself():
+    """三档状态从**判定文案**反推 —— 绘制层不再单独存一份状态。
+
+    这样"存的状态"与"显示的字"不可能分叉；代价是文案表必须齐（下面那条钉住）。
+    """
+    assert bag_verdict.state(bag_verdict.PASS_TEXT) == bag_verdict.STATE_PASS
+    assert bag_verdict.state(bag_verdict.FAIL_TEXT) == bag_verdict.STATE_FAIL
+    assert bag_verdict.state(bag_verdict.NONE_TEXT) == bag_verdict.STATE_NONE
+    assert bag_verdict.state(bag_verdict.PENDING_TEXT) == bag_verdict.STATE_PENDING
+    # 认不出（旧报告/手写行/空串）一律按未验证：乱标绿比标成黑更危险
+    assert bag_verdict.state("") == bag_verdict.STATE_NONE
+    assert bag_verdict.state("需要复查") == bag_verdict.STATE_NONE
+
+
+def test_column_colors_follow_the_design_table():
+    """三列各自的颜色（设计表见 `bag_verdict` 模块头）。
+
+    重点钉两件容易被"顺手统一"改掉的事：
+    1. 时间列**不跟着红**（整行糊成红会失去"对时间线"的功能）；
+    2. 合格只在**判定列**是绿的，名字列仍是正文色（否则一屏全绿，名字看不清）。
+    """
+    from PyQt5.QtGui import QColor
+
+    colors = theme.palette(theme.active_mode())
+    text = QColor(colors["text"]).name()
+    ok, bad = QColor(colors["ok_text"]).name(), QColor(colors["danger_text"]).name()
+    P, F, U = (bag_verdict.STATE_PASS, bag_verdict.STATE_FAIL,
+               bag_verdict.STATE_NONE)
+    name, stamp, verdict = (bag_verdict.COLUMN_NAME, bag_verdict.COLUMN_STAMP,
+                            bag_verdict.COLUMN_VERDICT)
+
+    assert bag_verdict.column_color(P, name).name() == text
+    assert bag_verdict.column_color(P, stamp).name() == text
+    assert bag_verdict.column_color(P, verdict).name() == ok
+
+    assert bag_verdict.column_color(U, name).name() == text
+    assert bag_verdict.column_color(U, stamp).name() == text
+    assert bag_verdict.column_color(U, verdict).name() == text
+
+    assert bag_verdict.column_color(F, name).name() == bad
+    assert bag_verdict.column_color(F, stamp).name() == text, "时间列被染红了"
+    assert bag_verdict.column_color(F, verdict).name() == bad
+
+    # 选中态一律让位给样式的 highlightedText（红绿压强调色底都不好读）
+    picked = QColor("#123456")
+    for state_name in (P, U, F):
+        for column in (name, stamp, verdict):
+            assert bag_verdict.column_color(state_name, column, picked).name() == "#123456"
+
+
+def test_only_the_failed_row_gets_a_tint():
+    """底纹只给不合格；其余返回 None（由样式原样画，不叠任何东西）。"""
+    tint = bag_verdict.row_tint(bag_verdict.STATE_FAIL)
+    assert tint is not None and 0 < tint.alpha() < 64
+    assert bag_verdict.row_tint(bag_verdict.STATE_PASS) is None
+    assert bag_verdict.row_tint(bag_verdict.STATE_NONE) is None
+    assert bag_verdict.row_tint(bag_verdict.STATE_PENDING) is None
 
 
 def test_a_pending_row_is_not_red():
@@ -126,45 +187,54 @@ def test_all_labels_lists_every_possible_verdict_text():
 
 
 def test_column_layout_ignores_the_name_length():
-    """列位的输入里**根本没有名字** —— 这就是"名字多长都不影响列对齐"的结构保证。
+    """列位的输入里**根本没有某个名字** —— 这就是"名字多长都不影响列对齐"的结构保证。
 
-    时间列与判定列的 x 只由容器宽度与两列的固有宽度决定；同一个容器宽度下，
+    时间列与判定列的 x 只由**名字列宽**（全场最长那个）与两列的固有宽度决定；
     无论哪一行、名字多长，算出来的坐标都是同一组。
     """
-    a = bag_verdict.column_layout(600, 109, 59, hpad=10, gap=16, name_cap=180)
-    b = bag_verdict.column_layout(600, 109, 59, hpad=10, gap=16, name_cap=180)
+    a = bag_verdict.column_layout(600, 109, 59, hpad=10, gap=16, name_w=180)
+    b = bag_verdict.column_layout(600, 109, 59, hpad=10, gap=16, name_w=180)
     assert a == b
-    # 与容器无关的常量只有两个列宽；起点必须由容器宽度推出来
     assert a.stamp_x > a.name_x and a.verdict_x > a.stamp_x
     assert a.stamp_x == a.name_x + a.name_w + 16
     assert a.verdict_x == a.stamp_x + 109 + 16
 
 
-def test_column_layout_shrinks_the_name_column_when_the_window_narrows():
-    """窗口变窄时**先压名字列**，不挤时间与判定。
+def test_column_layout_never_shrinks_the_name_column():
+    """窗口变窄时**不压名字列**，改由整行变宽（视图横向滚动）承担（v6.9.5 改口）。
 
-    判定列是这一版的全部意义；把它挤出视口等于功能没做。名字可以截断（它只是标识）。
+    改口记录：v6.9.2 那版是"先压名字列、压不下就省略"，现场截图里三行名字全成了
+    `vla_202610…` —— 相同前缀的行彼此无法区分，这一列等于没信息。
+    现在的契约是：**任何视口宽度下 name_w 都不变**，装不下就溢出，
+    溢出的是"整行宽度"（`required_row_width`），由视图出滚动条。
     """
-    wide = bag_verdict.column_layout(800, 109, 59, hpad=10, gap=16, name_cap=400)
-    narrow = bag_verdict.column_layout(300, 109, 59, hpad=10, gap=16, name_cap=400)
+    wide = bag_verdict.column_layout(800, 109, 59, hpad=10, gap=16, name_w=400)
+    narrow = bag_verdict.column_layout(300, 109, 59, hpad=10, gap=16, name_w=400)
 
-    assert narrow.name_w < wide.name_w, (narrow.name_w, wide.name_w)
-    assert narrow.verdict_x + narrow.verdict_w <= 300, "判定列被挤出视口了"
-    assert narrow.name_w >= 0, "名字列宽度不能为负"
+    assert narrow.name_w == wide.name_w == 400, (narrow.name_w, wide.name_w)
+    assert narrow.stamp_x == wide.stamp_x
+    assert narrow.verdict_x == wide.verdict_x
+    # 行宽需求大于视口 —— 这就是"该横向滚动"的信号
+    required = bag_verdict.required_row_width(400, 109, 59, hpad=10, gap=16)
+    assert required > 300
+    assert required == wide.verdict_x + wide.verdict_w + 10, "右侧留白要算进去"
 
 
-def test_column_layout_honours_the_name_cap_and_leaves_the_rest_blank():
-    """宽窗口下名字列到 `name_cap` 就停，多出来的宽度留白。
+def test_column_layout_uses_the_given_name_width_as_is():
+    """名字列宽 = 调用方量出来的那个数：**不拉伸、不压缩**。
 
-    不封顶的话，窗口一宽名字与时间之间就是一大片空白，几十行看下来像两个
-    互不相干的列表（第一版就是这样，实拍才发现）。
+    拉伸的话窗口一宽，时间列就被顶到右边缘，几十行看下来像两个互不相干的列表；
+    压缩的话名字会被截。所以它就是一个绝对值。
     """
-    capped = bag_verdict.column_layout(1200, 109, 59, hpad=10, gap=16, name_cap=200)
-    uncapped = bag_verdict.column_layout(1200, 109, 59, hpad=10, gap=16)
+    fixed = bag_verdict.column_layout(1200, 109, 59, hpad=10, gap=16, name_w=200)
+    assert fixed.name_w == 200
 
-    assert capped.name_w == 200
-    assert uncapped.name_w > capped.name_w
-    assert capped.stamp_x < uncapped.stamp_x
+    # 没量过（name_w=None）时退回首版行为：占满容器剩余宽度
+    fallback = bag_verdict.column_layout(1200, 109, 59, hpad=10, gap=16)
+    assert fallback.name_w == 1200 - 20 - 32 - 109 - 59
+    assert fallback.name_w > fixed.name_w
+    assert fixed.stamp_x < fallback.stamp_x
+
 
 def test_row_roles_live_after_qt_user_role():
     """行数据必须存在 `Qt.UserRole` 之后的角色号里（v6.9.2 踩过的坑）。
