@@ -23,7 +23,8 @@ from datetime import datetime
 from html import escape as html_escape
 from pathlib import Path
 from ... import theme
-from ...core import ConfigManager, logger, ProcessManager, DEFAULT_ACTION_LABELS
+from ...core import (ConfigManager, DEFAULT_ACTION_LABELS, human_size, logger,
+                     ProcessManager)
 from ...core_operations import (Launcher, TeleopManager, SdkServiceManager,
                               read_robot_status, EMERGENCY_STOP_TARGETS,
                               EMERGENCY_STOP_PART_NAMES)
@@ -156,6 +157,9 @@ class DataOpsMixin:
         # 必须在这里而不是交给脚本 —— 起录后才发现盘写不进去，界面只剩一句从脚本
         # 退出来的"启动后立即退出"，现场完全看不出是盘的问题。
         if not self._apply_record_target(settings):
+            return
+        # 盘还剩多少：目标已经定了，这里问的就是**这一包要写到的那块盘**。
+        if not self._confirm_low_free_space():
             return
         if self.recorder.start(settings["type"], settings["name"], settings["desc"],
                                settings["label"], settings["action_id"]):
@@ -303,6 +307,47 @@ class DataOpsMixin:
                         "若一直如此，把上面这个目录发我看一下。")
 
     # ---------- 保存位置（本机数据盘 / 移动硬盘） ----------
+
+    def _confirm_low_free_space(self) -> bool:
+        """起录前看目标盘剩余空间：**低于 10 GB 就告警**，返回 False = 不起录。
+
+        ## 为什么在界面上拦
+
+        录到一半写满的后果不是"少一段"，而是**这一包基本不能用、要重拍** ——
+        一场 VLA 采集几十 GB，重拍的时间成本远大于一句弹窗。
+        （录制**中**另有一条 1 GiB 的巡检告警，那是"已经写不进东西"的兜底；
+        这条是起录时的风险提示，两者阈值与时机都不同，不要合并。）
+
+        ## 为什么每次起录都问、不加"只报一次"的闩锁
+
+        现场明确要求「每次进行数据录制的时候弹出告警」。上次硬着头皮继续，
+        不代表这次也愿意（可能这次要录更长时间）。
+
+        ## 为什么用 `QMessageBox.question`
+
+        与项目里其他"要不要继续"的确认保持一致，也让测试替身能统一接管
+        （自造 QMessageBox 再 exec_ 的写法在测试里被 stub 成"立即返回"，
+        会把所有既有录制用例变成"用户点了取消"）。
+
+        读不到空间（`disk_free()` 返回 None）时**不拦**：宁可不吵，
+        也不要凭空告诉人家盘要满了。
+        """
+        free = self.recorder.disk_free()
+        if free is None or free >= RecorderManager.RECORD_MIN_FREE_BYTES:
+            return True
+
+        text = (f"保存位置所在磁盘只剩 {human_size(free)}，低于 10 GB。\n\n"
+                "继续录制可能在中途写满：写满之后这一包数据基本无法用于训练，通常要重拍。\n"
+                "建议先导出或清理旧数据，或换一块盘。\n\n"
+                "点「是」仍然录制；点「否」取消起录。")
+        answer = QMessageBox.question(
+            self, "磁盘空间不足", text,
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if answer == QMessageBox.Yes:
+            self.append(f"⚠ 磁盘只剩 {human_size(free)}（低于 10 GB），已按操作员确认继续录制")
+            return True
+        self.append(f"⚠ 磁盘只剩 {human_size(free)}（低于 10 GB），本次起录已取消")
+        return False
 
     def _apply_record_target(self, settings: dict) -> bool:
         """把「保存位置」的选择落到本次会话，并对移动硬盘做起录前预检。

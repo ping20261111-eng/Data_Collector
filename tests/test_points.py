@@ -967,6 +967,13 @@ class _RecordingStub:
         self.start_calls = 0
         self.health_result = {"alive": True, "producing": True, "message": ""}
         self.disk_full_result = ""
+        #: 起录前的可用空间（字节）。默认给足，免得每条录制用例都被"空间不足"拦下；
+        #: 要测告警就把它调到 10 GB 以下（生产门槛见 RecorderManager.RECORD_MIN_FREE_BYTES）。
+        self.disk_free_result = 100 * 1024 ** 3
+
+    # 替身的签名要与生产一致（v6.9.8：起录前要查可用空间）
+    def disk_free(self):
+        return self.disk_free_result
 
     def is_active(self):
         return self._active
@@ -1485,3 +1492,97 @@ def test_label_card_delegate_holds_no_reference_back(point_env):
     held = {name: value for name, value in vars(delegate).items()
             if isinstance(value, QObject)}
     assert held == {}, f"delegate 上还挂着 QObject 引用: {sorted(held)}"
+
+
+# ---------- 起录前的磁盘空间告警（v6.9.8） ----------
+
+def _patch_question(monkeypatch, answer):
+    """把「要不要继续」的弹窗换成固定答案，并记录它被问过几次。"""
+    from PyQt5.QtWidgets import QMessageBox
+
+    from data_collector.ui.panels import data_ops as module
+
+    asked = []
+
+    def fake_question(_parent, title, text, *_args, **_kwargs):
+        asked.append((title, text))
+        return answer
+
+    monkeypatch.setattr(module.QMessageBox, "question", staticmethod(fake_question))
+    return asked
+
+
+def test_recording_is_blocked_when_free_space_is_below_10g(qapp, point_env, monkeypatch):
+    """可用空间不足 10 GB 且操作员选「否」→ **不起录**（v6.9.8 现场要求）。
+
+    录到一半写满的后果是这一包不能用于训练、要重拍 —— 所以默认按钮是「否」。
+    """
+    from PyQt5.QtWidgets import QMessageBox
+
+    _patch_record_dialog(monkeypatch)
+    asked = _patch_question(monkeypatch, QMessageBox.No)
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+    harness.recorder.disk_free_result = 5 * 1024 ** 3          # 5 GB
+
+    harness.on_record()
+
+    assert harness.recorder.start_calls == 0, "空间不足且用户取消，仍然起录了"
+    assert asked, "没有弹出磁盘空间告警"
+    title, text = asked[0]
+    assert "磁盘空间不足" in title
+    assert "5.0GB" in text or "5.0 GB" in text, text      # 具体剩多少必须写出来
+    assert "10 GB" in text, "告警里要写明门槛（10 GB），否则现场不知道差多少"
+    assert any("已取消" in m for m in harness.messages)
+
+
+def test_operator_can_override_the_low_space_warning(qapp, point_env, monkeypatch):
+    """选「是」→ 照常起录（告警不是硬闸门，现场有时就要录最后这一段）。"""
+    from PyQt5.QtWidgets import QMessageBox
+
+    _patch_record_dialog(monkeypatch)
+    asked = _patch_question(monkeypatch, QMessageBox.Yes)
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+    harness.recorder.disk_free_result = 2 * 1024 ** 3
+
+    harness.on_record()
+
+    assert asked, "没有弹出磁盘空间告警"
+    assert harness.recorder.start_calls == 1, "用户选了继续，却没起录"
+    assert any("按操作员确认继续录制" in m for m in harness.messages)
+
+
+def test_no_warning_when_free_space_is_enough(qapp, point_env, monkeypatch):
+    """空间充足时**不许弹**（每次起录都弹一个空告警，现场会很快学会盲点确认）。"""
+    _patch_record_dialog(monkeypatch)
+    asked = _patch_question(monkeypatch, 0x00004000)     # 任何答案都不该被用到
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+    harness.recorder.disk_free_result = 12 * 1024 ** 3   # 12 GB > 10 GB
+
+    harness.on_record()
+
+    assert asked == [], f"空间足够却弹了告警：{asked}"
+    assert harness.recorder.start_calls == 1
+
+
+def test_unknown_free_space_does_not_warn(qapp, point_env, monkeypatch):
+    """读不到可用空间（None）时不拦：宁可不吵，也不要凭空说盘要满了。"""
+    _patch_record_dialog(monkeypatch)
+    asked = _patch_question(monkeypatch, 0x00004000)
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+    harness.recorder.disk_free_result = None
+
+    harness.on_record()
+
+    assert asked == []
+    assert harness.recorder.start_calls == 1
+
+
+def test_the_threshold_matches_the_documented_10g():
+    """门槛就是 10 GiB，别在 UI 里另写一个数字（两处各写一份迟早分叉）。"""
+    from data_collector.core_data import RecorderManager
+
+    assert RecorderManager.RECORD_MIN_FREE_BYTES == 10 * 1024 ** 3
