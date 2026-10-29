@@ -84,12 +84,22 @@ def _paint_metrics(delegate, bag_list) -> Optional[QFontMetrics]:
     时间列宽也会差 10%。
 
     所以一律以 `initStyleOption` 的 `font` 为准 —— 那才是 `paint()` 里画的字体。
+
+    ⚠️ 但"量的时候是这套、画的时候是那套"仍可能发生（窗口显示前量、之后样式或
+    DPI 把绘制字体换掉）。所以 delegate 在每次画之前会用 `_ensure_widths()`
+    核对字体指纹，不一致就当场重量 —— 见那里的说明。
     """
+    option = _paint_option(delegate, bag_list)
+    return QFontMetrics(option.font) if option is not None else None
+
+
+def _paint_option(delegate, bag_list) -> Optional[QStyleOptionViewItem]:
+    """`initStyleOption` 交给 delegate 的那个 option（取 `font` 用）。"""
     if bag_list.count() == 0:
         return None
     option = QStyleOptionViewItem()
     delegate.initStyleOption(option, bag_list.model().index(0, 0))
-    return QFontMetrics(option.font)
+    return option
 
 
 def measure_stamp_width(metrics: QFontMetrics, stamps) -> int:
@@ -118,14 +128,18 @@ def fit_columns(bag_list) -> None:
     if not isinstance(delegate, BagRowDelegate):
         return                      # 别人的 delegate，不去动它的设定
     metrics = _paint_metrics(delegate, bag_list)
-    if metrics is None:
+    option = _paint_option(delegate, bag_list)
+    if metrics is None or option is None:
         delegate.set_name_width(0)
         delegate.set_stamp_width(0)
+        delegate.mark_measured(None)
         return
     rows = [bag_verdict.split_row(bag_list.item(i).text())
             for i in range(bag_list.count())]
     delegate.set_name_width(measure_name_width(metrics, (r[0] for r in rows)))
     delegate.set_stamp_width(measure_stamp_width(metrics, (r[1] for r in rows)))
+    # 记下"这次是用哪套字体的指纹量的"：画的时候字体若变了，delegate 会重量。
+    delegate.mark_measured(option.font)
 
 
 class BagRowDelegate(QStyledItemDelegate):
@@ -133,13 +147,62 @@ class BagRowDelegate(QStyledItemDelegate):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        #: 名字列的上限 / 时间列的宽度（像素）。都由 `fit_columns()` 在刷新后量。
+        #: 名字列的宽度下限 / 时间列的宽度（像素）。都由 `fit_columns()` 在刷新后量。
         #: 这里存的是**整数**，不是控件引用 —— 见上面第 1 条硬约束。
         self._name_width = 0
         self._stamp_width = 0
+        #: 上次量宽用的**字体指纹**（`QFont.key()`）。画之前拿当前绘制字体的指纹比一比：
+        #: 不一致就重量 —— 这是"量的时候一套字体、画的时候另一套"的自愈点（v6.9.6）。
+        self._font_key = None
+
+    def mark_measured(self, font) -> None:
+        """记下这次是用哪套字体量的宽（`font=None` 表示没量过）。"""
+        self._font_key = font.key() if font is not None else None
+
+    def _ensure_widths(self, option, index, name: str = "", stamp: str = "") -> None:
+        """画之前核对列宽：**字体变了、或这一行装不下**就当场重量（v6.9.6）。
+
+        ## 现场现象
+
+        名字被截成 `rosbag2_20261027144…`、时间断在 `04-12 07:47`（少了 `:xx`）——
+        两列都窄了约 20%，正好是"另一套字体"的比例。
+
+        ## 根因
+
+        列宽是 `fit_columns()` 在**窗口显示前**量的一遍；之后样式 / DPI 把绘制字体
+        换成更大的一套，而宽度没跟着变 → 按旧宽度画，就截。
+
+        ## 两道判据（缺一不可）
+
+        1. **字体指纹变了** → 重量（`QFont.key()`，换主题/DPI 时触发）；
+        2. **这一行的名字或时间装不下** → 也重量。
+
+        第 2 条不是冗余：实测存在"指纹相同、宽度却偏小 20%"的情形
+        （量的时候与画的时候不是同一套字体，`key()` 恰好一致）。只盯指纹会漏过去，
+        而"装不下"恰好就是现场看到的现象 —— 以它兜底最直接。
+
+        重量走 `index.model()`（调用时传进来，**不持有引用**），只在真需要时遍历一次全表。
+        """
+        metrics = QFontMetrics(option.font)
+        fits = (metrics.horizontalAdvance(name) <= self._name_width
+                and metrics.horizontalAdvance(stamp) <= self._stamp_width)
+        if option.font.key() == self._font_key and fits:
+            return
+        model = index.model() if index is not None else None
+        if model is None:
+            return
+        names, stamps = [], []
+        for row in range(model.rowCount()):
+            row_name, row_stamp, _label = bag_verdict.split_row(
+                model.index(row, 0).data(Qt.DisplayRole))
+            names.append(row_name)
+            stamps.append(row_stamp)
+        self._name_width = measure_name_width(metrics, names)
+        self._stamp_width = measure_stamp_width(metrics, stamps)
+        self._font_key = option.font.key()
 
     def set_name_width(self, width: int) -> None:
-        """设置名字列的上限。量法见 `fit_columns()`。"""
+        """设置名字列的宽度下限。量法见 `fit_columns()`。"""
         self._name_width = max(int(width), 0)
 
     def name_width(self) -> int:
@@ -174,6 +237,17 @@ class BagRowDelegate(QStyledItemDelegate):
         style.drawControl(QStyle.CE_ItemViewItem, opt, painter, opt.widget)
 
         name, stamp, label = bag_verdict.split_row(text)
+        # 字体变了 / 这一行装不下，就先重量（否则会按旧宽度画 → 名字省略号、时间断秒）
+        self._ensure_widths(opt, index, name, stamp)
+
+        # 🔴 **把画字的字体显式设成量宽用的那套**（v6.9.6 现场 bug 的真根因）。
+        #
+        # 自绘时 painter 用的是**视图/控件当前的字体**，而不是 `opt.font` ——
+        # 两者在同一台机器上可以差 20%（QSS、DPI、字体回退都能让它们分开）。
+        # 于是"按 opt.font 量列宽、用另一套字体画字"，名字就被挤成
+        # `rosbag2_20261027144…`、时间断在 `04-12 07:47`（少了 `:xx`）。
+        # 一行 setFont 就让"量"和"画"变成同一套字，比任何余量都可靠。
+        painter.setFont(opt.font)
         # 状态由**判定文案**反推（`row_text` 的第三段）：绘制层不再单独存一份状态，
         # 也就不可能出现"存的状态与显示的字不一致"。
         state = bag_verdict.state(label)
@@ -221,6 +295,11 @@ class BagRowDelegate(QStyledItemDelegate):
         delegate 持有宿主引用会形成引用环，实测能让之后的 `setStyleSheet` 段错误。
         """
         height = QFontMetrics(option.font).height() + 2 * theme.px(VPAD)
+        # 先按当前字体核对一遍列宽：sizeHint 与 paint 必须用同一套宽度，
+        # 否则"行宽够、画的时候却按更窄的列位截断"。
+        name, stamp, _label = bag_verdict.split_row(
+            index.data(Qt.DisplayRole) if index is not None else "")
+        self._ensure_widths(option, index, name, stamp)
         return QSize(self._row_width(option), max(height, theme.px(MIN_ROW_H)))
 
     def _row_width(self, option) -> int:

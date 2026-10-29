@@ -159,33 +159,35 @@ def column_layout(total_width: int, stamp_w: int, verdict_w: int,
 
     固定列位把这些问题一次解决：三列的 x 只由**几个宽度**决定，与某一行无关。
 
-    ## v6.9.5 为什么把"名字太长就截断"改掉
+    ## v6.9.6 为什么改成"从右往左排"
 
-    现场截图里三行名字全是 `vla_202610…` —— **截断后相同前缀的行彼此无法区分**，
-    等于名字列没有信息。所以现在：
+    现场要求：**判定与时间靠右，左边剩下的地方全部给包名**。这不只是好看 ——
+    它把"名字够不够宽"从"扣掉两列后剩多少"变成了"整个左边的宽度"，宽窗口下
+    名字列能宽出一倍，`rosbag2_20261027144500` 这种长名字自然就放得下了。
 
-    - `name_w` 给定时（刷新后已量过最长名字）= **它的原值**，不压缩也不拉伸；
-    - 容器装不下时**不让某一列吃亏**，改由列表出现横向滚动条（`required_row_width`）；
-    - `name_w` 为 `None`（还没量过，例如空列表）= 退回旧行为：占用容器剩余宽度。
+    所以位置从**右边**推：`verdict_x = total - hpad - verdict_w`，
+    `stamp_x = verdict_x - gap - stamp_w`，名字列占 `hpad .. stamp_x-gap`。
+    等价写法是 `name_w = total - reserve`，但 `name_w` 还有个**下限** = 名字的自然宽度：
+    窗口窄到装不下时宁可整行变宽（视图横向滚动），也不截断名字。
 
     Args:
-        total_width: 列表视口的宽度。**只在 `name_w` 为 None 时参与计算** ——
-            它是"兜底"，不是"上限"。
+        total_width: 列表视口的宽度（行宽）。
         stamp_w: 时间列的固有宽度（按真实时间戳 `mm-dd HH:MM:SS` 量）。
         verdict_w: 判定列的固有宽度（按**最长**文案预留）。
         hpad: 左右留白。
         gap: 列间距。
-        name_w: 名字列的宽度（= 最长名字的自然宽度 + 余量）。
+        name_w: 名字的**自然宽度**（最长名字 + 余量）。它是最小值，不是固定值 ——
+            宽窗口下名字列会更宽（把右侧两列顶到右边去）。
+            为 `None` 时（还没量过，例如空列表）不做下限限制。
 
     Returns:
         `ColumnLayout(name_x, name_w, stamp_x, stamp_w, verdict_x, verdict_w)`。
     """
-    available = max(int(total_width) - 2 * int(hpad), 0)
-    reserve = 2 * int(gap) + int(stamp_w) + int(verdict_w)
-    if name_w is None:
-        name_w = max(available - reserve, 0)
-    else:
-        name_w = max(int(name_w), 0)
+    total = max(int(total_width), 0)
+    reserve = 2 * int(hpad) + 2 * int(gap) + int(stamp_w) + int(verdict_w)
+    leftover = max(total - reserve, 0)
+    natural = 0 if name_w is None else max(int(name_w), 0)
+    name_w = max(leftover, natural)
     name_x = int(hpad)
     stamp_x = name_x + name_w + int(gap)
     verdict_x = stamp_x + int(stamp_w) + int(gap)

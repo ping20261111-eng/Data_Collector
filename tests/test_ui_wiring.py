@@ -8649,3 +8649,82 @@ def test_a_bag_row_can_be_rendered_twice_without_losing_its_columns(ui_env, tmp_
     assert item.data(bag_verdict.STAMP_ROLE) == "10-28 10:21:23", \
         "时间列被整行文本污染了（角色号用错了）"
     assert item.data(bag_verdict.STAMP_ROLE) != item.text()
+
+
+def test_long_bag_names_are_not_elided_in_the_real_dialog(ui_env, tmp_path):
+    """**真实对话框里**长包名不许出现省略号、时间不许断秒（v6.9.6 现场 bug）。
+
+    ## 现场
+
+    `rosbag2_20261027144…` + `04-12 07:47`（`:xx` 没了）—— 两列都窄了约 20%。
+
+    ## 根因
+
+    列宽是在**窗口显示之前**量的一遍；显示之后样式/DPI 把绘制字体换了一套，
+    宽度没跟着变，于是按旧宽度画就截断了。
+
+    ## 这条为什么必须在真实对话框里验
+
+    `test_bag_row_delegate` 里的像素测试是自己造 widget 自己画，
+    走的字体路径可能和真程序不一样（`initStyleOption` 在没有 `FontRole` 时
+    **沿用调用方给的 font**，而视图与测试给的 font 不是同一个来源）。
+    只有让 `DataViewDialog` 自己 refresh + show + 排一次事件，
+    才等于现场那条路径。
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QFontMetrics
+    from PyQt5.QtWidgets import QStyleOptionViewItem
+
+    from data_collector.ui.data_view import DataViewDialog
+    from data_collector.ui import bag_row_delegate, bag_verdict
+
+    win, _cm = ui_env
+    root = tmp_path / "bags"
+    names = ("rosbag2_20261027144500", "rosbag2_20261026181654")
+    for name in names:
+        (root / name).mkdir(parents=True)
+    win.uploader.bag_dir = root
+
+    dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
+    try:
+        dlg.refresh_lists()
+        dlg.show()
+        QApplication.processEvents()
+
+        delegate = dlg.bag_list.itemDelegate()
+        assert isinstance(delegate, bag_row_delegate.BagRowDelegate)
+
+        # 取"绘制时那套字体"：视图把自己填好的 option 交给 delegate，字体沿用控件字体
+        option = QStyleOptionViewItem()
+        option.font = dlg.bag_list.font()
+        delegate.initStyleOption(option, dlg.bag_list.model().index(0, 0))
+        option.widget = dlg.bag_list
+        metrics = QFontMetrics(option.font)
+
+        # 把列宽**故意改小**，模拟现场那次"量的时候是另一套更小的字体"。
+        # 这一步让这条用例在本机也能判别真伪：没有自愈的实现会让下面的断言红。
+        delegate.set_name_width(max(metrics.horizontalAdvance(names[0]) // 2, 40))
+        delegate.set_stamp_width(metrics.horizontalAdvance("10-26 18:16") )
+
+        # 真画一遍整个视口 —— 绘制路径自己必须把宽度纠正回来
+        from PyQt5.QtGui import QImage, QPainter
+        canvas = QImage(max(dlg.bag_list.viewport().width(), 1),
+                        max(dlg.bag_list.viewport().height(), 1), QImage.Format_ARGB32)
+        painter = QPainter(canvas)
+        try:
+            dlg.bag_list.viewport().render(painter)
+        finally:
+            painter.end()
+
+        assert dlg.bag_list.count() == len(names)
+        for row in range(dlg.bag_list.count()):
+            name, stamp, label = bag_verdict.split_row(dlg.bag_list.item(row).text())
+            assert name in names, (name, label)
+            assert metrics.elidedText(name, Qt.ElideRight, delegate.name_width()) == name, (
+                f"名字被截了：{name}（列宽 {delegate.name_width()}，"
+                f"需要 {metrics.horizontalAdvance(name)}）")
+            assert metrics.horizontalAdvance(stamp) <= delegate.stamp_width(), (
+                f"时间列装不下 {stamp}")
+            assert stamp.count(":") == 2, f"时间没到秒：{stamp}"
+    finally:
+        dlg.close()

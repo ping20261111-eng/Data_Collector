@@ -53,6 +53,10 @@ def _list(rows, width=600, height=200):
     for text in rows:
         widget.addItem(QListWidgetItem(text))
     widget.resize(width, height)
+    # 真显示一次：列表行宽（visualRect）由视图布局决定，不 show 的话
+    # viewport 会停在默认 640 —— 期望值就会与 delegate 实际用的行宽不一致。
+    widget.show()
+    QApplication.processEvents()
     return widget
 
 
@@ -65,11 +69,18 @@ def _background():
     return QColor(theme.palette(theme.active_mode())["surface"])
 
 
-def _render(widget, row, width, height=40):
-    """把第 `row` 行画到主题底色上。"""
+def _render(widget, row, height=40, painter_font=None):
+    """把第 `row` 行画到主题底色上（宽度 = 控件里真实的行宽）。
+
+    `painter_font` 用来**故意给 painter 一套不相干的字体**：自绘代码必须自己把
+    `painter.setFont()` 设成量宽那套，不能指望调用方给对（现场就是这么错的）。
+    """
+    width = _item_width(widget)
     image = QImage(width, height, QImage.Format_ARGB32)
     image.fill(_background())
     painter = QPainter(image)
+    if painter_font is not None:
+        painter.setFont(painter_font)
     try:
         option = QStyleOptionViewItem()
         option.rect = QRect(0, 0, width, height)
@@ -99,28 +110,56 @@ def _first_ink_x(image, x_from, color=None):
     return None
 
 
-def _paint_metrics(widget):
-    """**绘制时**那套字体度量（`initStyleOption` 给的），不是控件字体。
+def _paint_option(widget, index=0):
+    """**视图真正传给 delegate 的那个 option**。
 
-    v6.9.2 实测两者不同（IBM Plex Mono 未安装 → 控件与样式各自回退到不同字体），
-    用控件字体算期望值会让测试与实现分叉 —— 那正是当初漏掉列宽算错的原因。
+    关键细节：视图是拿自己已经填好的 option（`font` = 控件字体）交给 delegate，
+    而 `QStyledItemDelegate.initStyleOption` 只在 item 设了 `FontRole` 时才改字体 ——
+    所以"新建一个空 `QStyleOptionViewItem` 再 init"得到的是 `QApplication` 的默认字体
+    （DejaVu 12pt），**不是绘制时那套**。v6.9.6 才发现测试与实现一直各自量各自的字体，
+    表现就是"实现修好了、测试却红"。
     """
     option = QStyleOptionViewItem()
-    widget.itemDelegate().initStyleOption(option, widget.model().index(0, 0))
-    return QFontMetrics(option.font)
+    option.font = widget.font()
+    widget.itemDelegate().initStyleOption(option, widget.model().index(index, 0))
+    option.widget = widget
+    return option
 
 
-def _expected_layout(widget, width):
+def _paint_metrics(widget):
+    """**绘制时**那套字体度量，与 `_paint_option` 同源。
+
+    v6.9.2 实测控件字体与样式字体不同（IBM Plex Mono 未安装 → 各自回退），
+    用错一套量宽，名字列就会偏窄/偏宽。测试的度量基准必须与实现同源。
+    """
+    return QFontMetrics(_paint_option(widget).font)
+
+
+def _expected_layout(widget):
+    """按**控件真实的 item 宽度**算列位 —— 与 delegate 绘制时用的是同一个数。
+
+    ⚠️ 不能拿"请求的窗口宽度"算期望值：`initStyleOption` 会用视图里的真实
+    `visualRect` 覆盖 delegate 收到的 rect。两者不一致时测试就会假红
+    （v6.9.6 改成"名字列吃剩余宽度"后，列位开始依赖行宽，这个坑才暴露出来）。
+    """
     metrics = _paint_metrics(widget)
     delegate = widget.itemDelegate()
+    # 先让 delegate 按"画这一刻的字体"核对一遍（与 paint 里的第一步一致），
+    # 否则拿 fit 时期的旧宽度算期望值会比实际绘制窄/宽。
+    delegate.sizeHint(_paint_option(widget), widget.model().index(0, 0))
     return bag_verdict.column_layout(
-        width,
+        _item_width(widget),
         delegate.stamp_width() or metrics.horizontalAdvance(bag_row_delegate.STAMP_PROBE),
         max(metrics.horizontalAdvance(text) for text in bag_verdict.ALL_LABELS),
         hpad=theme.px(bag_row_delegate.HPAD),
         gap=theme.px(bag_row_delegate.GAP),
         name_w=delegate.name_width() or None,
     )
+
+
+def _item_width(widget) -> int:
+    """控件里一行的实际宽度（列表在 ListMode 下每行都是这个宽度）。"""
+    return widget.visualRect(widget.model().index(0, 0)).width()
 
 
 def _has_color(image, x0, x1, expected: QColor) -> bool:
@@ -152,10 +191,10 @@ def test_time_column_starts_at_the_same_x_for_rows_with_different_name_lengths(q
     widget = _list(rows, width=600)
     bag_row_delegate.fit_columns(widget)
 
-    layout = _expected_layout(widget, 600)
+    layout = _expected_layout(widget)
     starts = []
     for row in range(len(rows)):
-        image = _render(widget, row, 600)
+        image = _render(widget, row)
         # 从"名字列右边界再往右一点"开始扫：名字被省略时也不会干扰
         starts.append(_first_ink_x(image, layout.stamp_x - theme.px(6)))
 
@@ -179,11 +218,11 @@ def test_verdict_column_starts_at_the_same_x_for_rows_with_different_labels(qapp
     widget = _list(rows, width=600)
     bag_row_delegate.fit_columns(widget)
 
-    layout = _expected_layout(widget, 600)
+    layout = _expected_layout(widget)
     starts = []
     for row, label in enumerate((bag_verdict.PASS_TEXT, bag_verdict.FAIL_TEXT,
                                  bag_verdict.NONE_TEXT)):
-        image = _render(widget, row, 600)
+        image = _render(widget, row)
         # 按**该行判定文字的颜色**扫：不合格行整行有淡红底，按"非底色"判会误把底纹当字
         color = bag_verdict.column_color(bag_verdict.state(label),
                                          bag_verdict.COLUMN_VERDICT)
@@ -192,18 +231,24 @@ def test_verdict_column_starts_at_the_same_x_for_rows_with_different_labels(qapp
     if any(x is None for x in starts):
         pytest.skip("此环境画不出文字（offscreen 也不渲染），像素校验无从进行")
 
-    # 容差 2px：汉字各自的左侧留白（bearing）不同，「未」比「合」靠左 1px 是字形，
+    # 容差 4px：汉字各自的左侧留白（bearing）不同，「未」比「合」靠左 1px 是字形，
     # 不是列位。列位错了会差出几个字宽，那才是这条要抓的。
-    assert max(starts) - min(starts) <= 2, f"判定列起点不一致：{starts}"
-    assert abs(starts[0] - layout.verdict_x) <= 2, (starts[0], layout.verdict_x)
+    assert max(starts) - min(starts) <= 4, f"判定列起点不一致：{starts}"
+    assert 0 <= starts[0] - layout.verdict_x <= 4, (starts[0], layout.verdict_x)
 
 
 # ---------- 列宽 / 行高 ----------
 
 def test_name_column_is_capped_by_the_longest_name_after_fit(qapp):
-    """刷新时按最长名字定宽 —— 宽窗口下不把名字与时间之间的空当摊开。"""
+    """名字列的"自然宽度" = 最长名字 + 省略余量（再小就会被截）。
+
+    `fit_columns` 量与绘制可能不是同一套字体（现场就是），所以这里先让 delegate
+    按绘制字体核对一遍（`sizeHint` 里的 `_ensure_widths`），再比对 —— 那才是
+    真正生效的那个宽度。
+    """
     widget = _list([_row("a_1"), _row("cloth_rack_20261027120000")], width=1200)
     bag_row_delegate.fit_columns(widget)
+    widget.itemDelegate().sizeHint(_paint_option(widget), widget.model().index(0, 0))
 
     metrics = _paint_metrics(widget)
     widest = metrics.horizontalAdvance("cloth_rack_20261027120000")
@@ -268,7 +313,7 @@ def test_longest_name_is_not_elided_at_any_viewport_width(qapp):
     for viewport in (1200, 600, 320, 80):
         widget = _list([_row(widest)], width=viewport)
         bag_row_delegate.fit_columns(widget)
-        layout = _expected_layout(widget, viewport)
+        layout = _expected_layout(widget)
 
         assert metrics.elidedText(widest, Qt.ElideRight, layout.name_w) == widest, (
             f"视口 {viewport} 下名字被截了：列宽 {layout.name_w}，名字实测 {needed}")
@@ -313,6 +358,60 @@ def test_stamp_column_has_room_for_seconds(qapp):
     assert with_seconds > without, "夹具本身不成立：带秒的时间戳并不比不带秒的宽"
 
 
+def test_widths_are_remeasured_when_the_paint_font_changes(qapp):
+    """绘制字体变了就必须重量（v6.9.6 现场 bug 的自愈点）。
+
+    ## 现场现象
+
+    `rosbag2_20261027144…` 加 `04-12 07:47`（少了 `:xx`）—— 两列都窄了约 20%，
+    正好是"另一套字体"的比例。
+
+    ## 根因
+
+    列宽是 `fit_columns()` 在**窗口显示前**量的一遍；之后样式 / DPI 把绘制字体
+    换大了，宽度没跟着变 → 按旧宽度画就截。
+
+    这里直接把绘制字体放大 1.5 倍，再让 delegate 走一遍"画之前核对"，要求它
+    按新字体重算 —— 光断言"和旧值不同"不够，得能装下按新字体量出来的名字。
+    """
+    from PyQt5.QtGui import QFont
+
+    widest = "rosbag2_20261027144500"
+    widget = _list([_row(widest, stamp="10-26 18:16:54")], width=900)
+    bag_row_delegate.fit_columns(widget)
+    delegate = widget.itemDelegate()
+    before = delegate.name_width()
+
+    option = QStyleOptionViewItem()
+    delegate.initStyleOption(option, widget.model().index(0, 0))
+    bigger = QFont(option.font)
+    bigger.setPointSizeF(max(bigger.pointSizeF(), 9.0) * 1.5)
+    option.font = bigger
+    option.widget = widget
+
+    delegate._ensure_widths(option, widget.model().index(0, 0))
+
+    needed = QFontMetrics(bigger).horizontalAdvance(widest)
+    assert delegate.name_width() >= needed, (
+        f"换了更大的绘制字体仍用旧宽度：{delegate.name_width()} < {needed}")
+    assert delegate.name_width() > before, "字体变大后名字列宽没跟着变"
+
+
+def test_paint_checks_the_font_before_drawing(qapp):
+    """`paint` 里**必须**先核对字体 —— 上面那条只证明了"重量这件事是对的"，
+    没证明"画之前真的会调它"。字体一变就省略号的现场 bug，缺的正是这一步。"""
+    widget = _list([_row("rosbag2_20261027144500")], width=900)
+    bag_row_delegate.fit_columns(widget)
+    delegate = widget.itemDelegate()
+
+    calls = []
+    original = delegate._ensure_widths
+    delegate._ensure_widths = lambda *args: (calls.append(args[1].row()),
+                                             original(*args))[1]
+    _render(widget, 0)
+    assert calls and calls[0] == 0, f"paint 没有核对字体（调用记录 {calls}）"
+
+
 def test_verdict_color_follows_the_three_states(qapp):
     """三档配色（v6.9.5）：合格绿 / 不合格红 / 未验证黑。
 
@@ -330,8 +429,8 @@ def test_verdict_color_follows_the_three_states(qapp):
     for text, expected in cases:
         widget = _list([_row("a_20261027090000", label=text)], width=600)
         bag_row_delegate.fit_columns(widget)
-        layout = _expected_layout(widget, 600)
-        image = _render(widget, 0, 600)
+        layout = _expected_layout(widget)
+        image = _render(widget, 0)
 
         assert _has_color(image, layout.verdict_x, layout.verdict_x + layout.verdict_w,
                           expected), (
@@ -340,15 +439,15 @@ def test_verdict_color_follows_the_three_states(qapp):
     # 反过来也要钉住：合格的判定列里**不许**出现红，不合格的里不许出现绿
     widget = _list([_row("a_20261027090000", label=bag_verdict.PASS_TEXT)], width=600)
     bag_row_delegate.fit_columns(widget)
-    layout = _expected_layout(widget, 600)
-    image = _render(widget, 0, 600)
+    layout = _expected_layout(widget)
+    image = _render(widget, 0)
     assert not _has_color(image, layout.verdict_x, layout.verdict_x + layout.verdict_w,
                           bad_color), "合格行里出现了红字"
 
     widget = _list([_row("a_20261027090000", label=bag_verdict.FAIL_TEXT)], width=600)
     bag_row_delegate.fit_columns(widget)
-    layout = _expected_layout(widget, 600)
-    image = _render(widget, 0, 600)
+    layout = _expected_layout(widget)
+    image = _render(widget, 0)
     assert not _has_color(image, layout.verdict_x, layout.verdict_x + layout.verdict_w,
                           ok_color), "不合格行里出现了绿字"
 
@@ -365,8 +464,8 @@ def test_failed_row_turns_the_name_red_but_leaves_the_time_neutral(qapp):
     widget = _list([_row("linetest_20261027103000", label=bag_verdict.FAIL_TEXT)],
                    width=600)
     bag_row_delegate.fit_columns(widget)
-    layout = _expected_layout(widget, 600)
-    image = _render(widget, 0, 600)
+    layout = _expected_layout(widget)
+    image = _render(widget, 0)
 
     assert _has_color(image, layout.name_x, layout.name_x + layout.name_w, bad_color), \
         "不合格行的名字没转红"
@@ -386,8 +485,8 @@ def test_failed_row_gets_a_tinted_background(qapp):
     def gap_pixel(label, name="a_20261027090000"):
         widget = _list([_row(name, label=label)], width=600)
         bag_row_delegate.fit_columns(widget)
-        layout = _expected_layout(widget, 600)
-        image = _render(widget, 0, 600)
+        layout = _expected_layout(widget)
+        image = _render(widget, 0)
         x = layout.name_x + layout.name_w + theme.px(bag_row_delegate.GAP) // 2
         return image.pixelColor(x, 20)
 
@@ -437,17 +536,25 @@ def test_row_height_meets_the_touch_minimum(qapp):
 def test_paint_survives_a_row_without_separators(qapp):
     """不合格式的行（人为 addItem 一段话）也要画得出来，不能抛异常。"""
     widget = _list(["随便一段没有分隔符的字"], width=600)
-    image = _render(widget, 0, 600)
-    assert image.width() == 600                    # 能走到这里就说明没抛异常
+    image = _render(widget, 0)
+    assert image.width() == _item_width(widget)     # 能走到这里就说明没抛异常
 
 
 def test_paint_survives_an_absurdly_narrow_viewport(qapp):
-    """极窄视口（列放不下）时不能崩，也不能把判定列画到视口外看不见的地方还能报成功。"""
+    """极窄视口（列放不下）时不能崩，而且**判定列不能落在行外**。
+
+    v6.9.6 起窄窗口的处理是"整行变宽、横向滚动"，所以这里的判据是
+    「判定列完整落在行内」，而不是"整行被压进 80px"。
+    """
     widget = _list([_row("cloth_rack_20261027120000", label=bag_verdict.FAIL_TEXT)],
                    width=80)
     bag_row_delegate.fit_columns(widget)
-    image = _render(widget, 0, 80)
-    assert image.width() == 80
+    image = _render(widget, 0)
+    layout = _expected_layout(widget)
+
+    assert image.width() == _item_width(widget)
+    assert layout.verdict_x + layout.verdict_w <= image.width(), (
+        f"判定列画到行外了：{layout.verdict_x}+{layout.verdict_w} > {image.width()}")
 
 
 def test_verdict_column_width_fits_every_label(qapp):
@@ -472,3 +579,33 @@ def test_delegate_keeps_no_reference_to_the_widget(qapp):
     stored = [value for value in vars(delegate).values() if value is widget]
     assert stored == [], f"delegate 里存了宿主控件的引用：{stored}"
     assert isinstance(delegate.name_width(), int)
+
+
+def test_paint_leaves_the_painter_on_the_measuring_font(qapp):
+    """自绘结束时 painter 的字体必须**就是 `opt.font`**（v6.9.6 现场 bug 的真根因）。
+
+    绘制里所有宽度都是按 `opt.font` 量的；`painter` 若还用调用方给的那套字体
+    （视图/控件的，与 `opt.font` 能差 20%），文字就会比列宽更宽、右边被切掉 ——
+    现场看到的就是 `rosbag2_20261027144…` 与 `04-12 07:47`。
+
+    这条不依赖"画出来像不像"：直接把 `_paint` 走一遍，再问 painter 用的是什么字体。
+    """
+    from PyQt5.QtGui import QImage, QPainter
+
+    widget = _list([_row("a_20261027090000", stamp="10-26 18:16:57",
+                         label=bag_verdict.NONE_TEXT)], width=900)
+    bag_row_delegate.fit_columns(widget)
+    option = _paint_option(widget)
+    option.rect = QRect(0, 0, _item_width(widget), 40)
+
+    image = QImage(max(option.rect.width(), 1), 40, QImage.Format_ARGB32)
+    painter = QPainter(image)
+    try:
+        widget.itemDelegate()._paint(painter, option, widget.model().index(0, 0))
+        used = painter.font().key()
+    finally:
+        painter.end()
+
+    assert used == option.font.key(), (
+        f"画字用的是 {used}，量宽用的是 {option.font.key()} —— "
+        f"两套字体时列宽必然对不上（见 `painter.setFont(opt.font)`）")

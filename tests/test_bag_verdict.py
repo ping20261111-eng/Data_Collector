@@ -187,9 +187,9 @@ def test_all_labels_lists_every_possible_verdict_text():
 
 
 def test_column_layout_ignores_the_name_length():
-    """列位的输入里**根本没有某个名字** —— 这就是"名字多长都不影响列对齐"的结构保证。
+    """列位的输入里**根本没有某一个具体名字** —— 名字只以"自然宽度"这个数进来。
 
-    时间列与判定列的 x 只由**名字列宽**（全场最长那个）与两列的固有宽度决定；
+    时间列与判定列的 x 只由行宽、名字列宽（全场最长那个）与两列的固有宽度决定；
     无论哪一行、名字多长，算出来的坐标都是同一组。
     """
     a = bag_verdict.column_layout(600, 109, 59, hpad=10, gap=16, name_w=180)
@@ -200,40 +200,50 @@ def test_column_layout_ignores_the_name_length():
     assert a.verdict_x == a.stamp_x + 109 + 16
 
 
+def test_column_layout_puts_the_last_two_columns_at_the_right_edge():
+    """**时间和判定靠右，左边剩下的全给名字**（v6.9.6 现场要求）。
+
+    这条就是"从右往左排"的契约：判定列右边缘必须贴住视口右边缘（减 hpad），
+    名字列吃掉中间所有空间 —— 而不是像早先那样让名字列封顶、右边留一片空白。
+    """
+    for total in (600, 900, 1400):
+        layout = bag_verdict.column_layout(total, 109, 59, hpad=10, gap=16, name_w=200)
+        assert layout.verdict_x + layout.verdict_w == total - 10, (
+            f"行宽 {total}: 判定列没有贴住右边（{layout.verdict_x}+{layout.verdict_w}）")
+        assert layout.name_w == total - 20 - 32 - 109 - 59, (
+            f"行宽 {total}: 名字列没有吃掉剩余空间（{layout.name_w}）")
+        assert layout.name_w > 200, "宽窗口下名字列应当比自然宽更宽"
+
+
 def test_column_layout_never_shrinks_the_name_column():
-    """窗口变窄时**不压名字列**，改由整行变宽（视图横向滚动）承担（v6.9.5 改口）。
+    """窗口窄到装不下时**不压名字列**，改由整行变宽（视图横向滚动）承担。
 
     改口记录：v6.9.2 那版是"先压名字列、压不下就省略"，现场截图里三行名字全成了
     `vla_202610…` —— 相同前缀的行彼此无法区分，这一列等于没信息。
-    现在的契约是：**任何视口宽度下 name_w 都不变**，装不下就溢出，
-    溢出的是"整行宽度"（`required_row_width`），由视图出滚动条。
+    现在的契约是：`name_w` 是**下限**，任何视口宽度下都不低于它；装不下就溢出。
     """
-    wide = bag_verdict.column_layout(800, 109, 59, hpad=10, gap=16, name_w=400)
-    narrow = bag_verdict.column_layout(300, 109, 59, hpad=10, gap=16, name_w=400)
+    wide = bag_verdict.column_layout(500, 109, 59, hpad=10, gap=16, name_w=400)
+    narrow = bag_verdict.column_layout(200, 109, 59, hpad=10, gap=16, name_w=400)
 
     assert narrow.name_w == wide.name_w == 400, (narrow.name_w, wide.name_w)
     assert narrow.stamp_x == wide.stamp_x
-    assert narrow.verdict_x == wide.verdict_x
     # 行宽需求大于视口 —— 这就是"该横向滚动"的信号
     required = bag_verdict.required_row_width(400, 109, 59, hpad=10, gap=16)
-    assert required > 300
-    assert required == wide.verdict_x + wide.verdict_w + 10, "右侧留白要算进去"
+    assert required > 200
+    assert required == 10 + 400 + 16 + 109 + 16 + 59 + 10, "右侧留白要算进去"
 
 
-def test_column_layout_uses_the_given_name_width_as_is():
-    """名字列宽 = 调用方量出来的那个数：**不拉伸、不压缩**。
+def test_column_layout_takes_the_natural_width_as_a_floor():
+    """`name_w` 是**下限**：宽窗口下名字列比它宽（把右侧两列顶到右边），窄窗口下就是它。"""
+    roomy = bag_verdict.column_layout(1200, 109, 59, hpad=10, gap=16, name_w=200)
+    assert roomy.name_w == 1200 - 20 - 32 - 109 - 59
 
-    拉伸的话窗口一宽，时间列就被顶到右边缘，几十行看下来像两个互不相干的列表；
-    压缩的话名字会被截。所以它就是一个绝对值。
-    """
-    fixed = bag_verdict.column_layout(1200, 109, 59, hpad=10, gap=16, name_w=200)
-    assert fixed.name_w == 200
+    tight = bag_verdict.column_layout(300, 109, 59, hpad=10, gap=16, name_w=200)
+    assert tight.name_w == 200
 
-    # 没量过（name_w=None）时退回首版行为：占满容器剩余宽度
-    fallback = bag_verdict.column_layout(1200, 109, 59, hpad=10, gap=16)
-    assert fallback.name_w == 1200 - 20 - 32 - 109 - 59
-    assert fallback.name_w > fixed.name_w
-    assert fixed.stamp_x < fallback.stamp_x
+    # 还没量过（name_w=None）：当作没有下限，剩余多少给多少
+    unmeasured = bag_verdict.column_layout(1200, 109, 59, hpad=10, gap=16)
+    assert unmeasured.name_w == roomy.name_w
 
 
 def test_row_roles_live_after_qt_user_role():
