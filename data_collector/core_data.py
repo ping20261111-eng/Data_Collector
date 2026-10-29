@@ -344,6 +344,11 @@ class RecorderManager:
         #: 都读它而不是实时读配置 —— 免得"起录之后落盘位置被改"导致巡检去看
         #: 另一个目录，把正常录制误报成「没有新文件落盘」。开新一次录制时覆盖。
         self._session_bag_dir: Optional[Path] = None
+        #: 按下「开始录制」的真实时刻（launch 之前）。用于量"首帧延迟"。
+        self._launch_at: Optional[float] = None
+        #: 本次录制**第一个数据文件落盘**的时刻（看门狗第一次看见文件时写入）。
+        #: `None` = 还没有数据 —— 界面据此区分「录制 启动中」与「录制 进行中」。
+        self._first_data_at: Optional[float] = None
 
     def session_bag_dir(self) -> Path:
         """本次会话的落盘根目录：起录时快照优先，否则实时取当前值。
@@ -379,6 +384,11 @@ class RecorderManager:
         # 可用空间）都以这个快照为准。开新一次录制时自动覆盖。
         self._session_bag_dir = (
             Path(self.config.get_bag_dir()) if self.config is not None else None)
+        # 「点下按钮」的真实时刻。`_started_at` 是**settle 之后**才写的（见下），
+        # 而现场关心的是"我点了开始，到数据真的开始落盘之间隔了多久" ——
+        # 那个差值必须从按下按钮算起，否则会少算 settle_seconds。
+        self._launch_at = time.time()
+        self._first_data_at = None
         try:
             self.current_proc = self.launcher.launch_record(
                 script_type, name, desc, label, action_id
@@ -672,6 +682,15 @@ class RecorderManager:
                 newest = max(newest, mtime)
         return count, newest
 
+    #: **起录窗口**（秒）：从按下「开始录制」到第一个数据文件落盘，通常要几秒。
+    #:
+    #: 2026-10-29 实测（开发机 x86，含 source 与 ros2 CLI 启动）：
+    #: `source install/setup.bash` 1.1 s、`ros2 bag --help` 2.0 s（其中 CLI 导入约 1 s）、
+    #: 再加 DDS 发现与 mcap 首帧 —— 合计约 3 s；机器人（ARM）上现场观感 5~7 s。
+    #: 所以这段时间**不是异常**，UI 要显示「录制 启动中」，看门狗也不许喊"没落盘"。
+    #: 取 20 s 是留足 ARM + 忙时的余量：超过它还没有任何文件，才是真的没在录。
+    STARTUP_GRACE_SECONDS = 20.0
+
     def health(self, stale_seconds: float = 15.0) -> dict:
         """录制健康检查：**进程活着 ≠ 数据在落盘**。
 
@@ -682,25 +701,54 @@ class RecorderManager:
         返回 {"alive": bool, "producing": bool, "message": str}。
         """
         if not self.is_active():
-            return {"alive": False, "producing": False,
+            return {"alive": False, "producing": False, "starting": False,
+                    "first_data_lag": self.startup_lag_seconds(),
                     "message": "录制进程已退出"}
 
         # 没有基线就不做产出判断（例如 start 之外的路径起来的录制）
         if self._started_at is None or self.config is None:
-            return {"alive": True, "producing": True, "message": ""}
+            return {"alive": True, "producing": True, "starting": False,
+                    "first_data_lag": None, "message": ""}
 
         bag_dir = self.session_bag_dir()
         # 文件系统的 mtime 精度可能低于 time.time()（tmpfs / 网络盘尤其明显），
         # 留 1 秒容差，避免录制刚开始那一瞬间被误判成"没有产出"而误报。
         count, newest = self._files_since(bag_dir, self._started_at - 1.0)
+        now = time.time()
+        if count and self._first_data_at is None:
+            # 首帧落盘：记下这一刻，界面据此从「启动中」切到「进行中」，
+            # 并把"点了开始到真有数据"的间隔写进日志（现场可量化，不必再猜）。
+            self._first_data_at = now
+            logger.info(f"录制数据开始落盘：起录后 {self.startup_lag_seconds():.1f} 秒")
+
         if count == 0:
-            return {"alive": True, "producing": False,
-                    "message": f"{bag_dir} 下还没有新文件落盘"}
-        age = time.time() - newest
+            base = self._launch_at if self._launch_at is not None else self._started_at
+            elapsed = now - base
+            starting = elapsed < self.STARTUP_GRACE_SECONDS
+            return {"alive": True, "producing": False, "starting": starting,
+                    "first_data_lag": None,
+                    "message": ("录制正在启动（录制脚本还没开始写数据）" if starting
+                                else f"{bag_dir} 下还没有新文件落盘")}
+        age = now - newest
         if age > stale_seconds:
-            return {"alive": True, "producing": False,
+            return {"alive": True, "producing": False, "starting": False,
+                    "first_data_lag": self.startup_lag_seconds(),
                     "message": f"{bag_dir} 已有 {age:.0f} 秒没有新数据写入"}
-        return {"alive": True, "producing": True, "message": ""}
+        return {"alive": True, "producing": True, "starting": False,
+                "first_data_lag": self.startup_lag_seconds(), "message": ""}
+
+    def startup_lag_seconds(self) -> Optional[float]:
+        """按下「开始录制」到**第一个数据文件落盘**间隔多少秒；还没落盘返回 None。
+
+        起点用 `_launch_at`（launch 之前那一刻）而不是 `_started_at`
+        （settle_seconds 之后）—— 现场问的是"我点了开始，几秒后才有数据"。
+        """
+        if self._first_data_at is None:
+            return None
+        base = self._launch_at if self._launch_at is not None else self._started_at
+        if base is None:
+            return None
+        return max(self._first_data_at - base, 0.0)
 
 
 @dataclass(frozen=True)

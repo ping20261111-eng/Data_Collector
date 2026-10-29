@@ -51,9 +51,6 @@ class DataOpsMixin:
     @guard_slot
     def update_record_time(self):
         self.record_seconds += 1
-        minutes = self.record_seconds // 60
-        seconds = self.record_seconds % 60
-        self.record_status_label.setText(f"录制 进行中 {minutes:02d}:{seconds:02d}")
 
         # 看门狗：录制期间每秒确认数据确实在落盘。"进程还在"不等于"在录"——
         # 话题无数据、ROS 环境不完整、磁盘满都会让脚本空转或直接退出，那种情况下
@@ -76,6 +73,32 @@ class DataOpsMixin:
             self._set_record_button("idle")
             self.append(f"录制进程已退出，计时已停止{self._record_exit_hint(health)}")
             return
+
+        # ---- 启动窗口：脚本还在 source ROS 环境 / 起 ros2 bag record ----
+        #
+        # 现场 2026-10-29：「点击开始录制，已经显示开启录制，但数据 5~7 秒后才有」。
+        # 那 5~7 秒是**真开销**（`source setup.bash` + ros2 CLI 导入 + DDS 发现），
+        # 但界面显示「进行中」属于说谎：操作员以为在采，回放时才发现头几秒没有数据。
+        # 所以这段显示「启动中」并且**不许报异常** —— 原先第一秒就会喊
+        # "还没有新文件落盘"，等于每次起录都先喊一次狼来了。
+        if health.get("starting"):
+            self.record_status_label.setText(f"录制 启动中… {self.record_seconds}s")
+            theme.set_state(self.record_status_label, "none")
+            return
+
+        # 首帧刚落地：切「进行中」，并把"点了开始到真有数据"的间隔写进日志。
+        # 这条日志是给现场看的量化依据（不必再猜到底慢在哪）。
+        if not getattr(self, "_record_data_started", False):
+            self._record_data_started = True
+            lag = health.get("first_data_lag")
+            detail = (f"（起录后 {lag:.1f} 秒）"
+                      if isinstance(lag, (int, float)) else "")
+            self.append(f"录制数据已开始落盘{detail}")
+            theme.set_state(self.record_status_label, "danger")
+
+        minutes = self.record_seconds // 60
+        seconds = self.record_seconds % 60
+        self.record_status_label.setText(f"录制 进行中 {minutes:02d}:{seconds:02d}")
 
         if health["producing"]:
             self._record_health_warned = False
@@ -181,6 +204,9 @@ class DataOpsMixin:
             # 的路径上复位，于是上一场录制报过一次异常之后，后面每一场录制都再也不会
             # 提示任何异常 —— 闩锁是按进程活着的，不是按录制会话算的。
             self._record_health_warned = False
+            # 首帧标志也要复位：上一场录制已经落过盘，不复位的话这一场一开始
+            # 就被当成"数据已在落盘"，界面直接显示「进行中」—— 又回到那条投诉上。
+            self._record_data_started = False
             # 打点会话必须**先于**按钮状态建立：_set_record_button → _sync_point_button
             # 会读 point_recorder 来决定按钮显示与否，顺序反了就永远不出现（现场症状）。
             # 起始时刻取自 RecorderManager（它才是真正发指令的时刻，打点的相对秒要以它

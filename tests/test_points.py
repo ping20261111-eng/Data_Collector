@@ -965,7 +965,8 @@ class _RecordingStub:
         self._active = False
         self.started_at = time.time()
         self.start_calls = 0
-        self.health_result = {"alive": True, "producing": True, "message": ""}
+        self.health_result = {"alive": True, "producing": True, "starting": False,
+                              "first_data_lag": 3.2, "message": ""}
         self.disk_full_result = ""
         #: 起录前的可用空间（字节）。默认给足，免得每条录制用例都被"空间不足"拦下；
         #: 要测告警就把它调到 10 GB 以下（生产门槛见 RecorderManager.RECORD_MIN_FREE_BYTES）。
@@ -1586,3 +1587,64 @@ def test_the_threshold_matches_the_documented_10g():
     from data_collector.core_data import RecorderManager
 
     assert RecorderManager.RECORD_MIN_FREE_BYTES == 10 * 1024 ** 3
+
+
+# ---------- 「界面说在录，其实还没落盘」那段窗口（v6.9.9） ----------
+
+def test_status_says_starting_until_the_first_data_lands(qapp, point_env):
+    """录制脚本还在 source ROS / 起 ros2 bag record 时，状态行必须写「启动中」。
+
+    现场 2026-10-29：「点击开始录制，界面已经显示开启录制，但数据 5~7 秒后才有」。
+    那几秒是真开销，界面显示「进行中」就是**说谎** —— 操作员回放时才发现头几秒空。
+    而且这段时间**不许报异常**：原来第一秒就喊"还没有新文件落盘"，等于每次起录
+    都先喊一次狼来了。
+    """
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+    harness.record_timer.start(0)          # 起录后会启动；这里直接手动驱动
+    harness.recorder.health_result = {"alive": True, "producing": False,
+                                      "starting": True, "first_data_lag": None,
+                                      "message": "录制正在启动（录制脚本还没开始写数据）"}
+
+    harness.update_record_time()
+
+    assert "启动中" in harness.record_status_label.text()
+    assert not any("录制异常" in m for m in harness.messages), \
+        f"启动窗口里不该报异常：{harness.messages}"
+
+
+def test_switches_to_in_progress_and_logs_the_startup_lag(qapp, point_env):
+    """首帧落盘后：切回「进行中」，并在日志里给出**起录到首帧**的秒数。
+
+    这条秒数是给现场看的量化依据 —— 有它才不用再靠"感觉五六秒"去猜。
+    """
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+    harness.recorder.health_result = {"alive": True, "producing": True,
+                                      "starting": False, "first_data_lag": 6.3,
+                                      "message": ""}
+
+    harness.update_record_time()
+
+    assert "进行中" in harness.record_status_label.text()
+    assert any("起录后 6.3 秒" in m for m in harness.messages), harness.messages
+
+    # 只播一次：第二个 tick 不该再重复这条日志
+    harness.update_record_time()
+    assert sum("已开始落盘" in m for m in harness.messages) == 1, harness.messages
+
+
+def test_starting_flag_does_not_hide_a_real_stall(qapp, point_env):
+    """启动窗口过了还没数据（`starting=False` + `producing=False`）→ 照常报异常。
+
+    不能为了消掉起录时的假警报，把"真的没在录"也一起放过。
+    """
+    config, _bag = point_env
+    harness = _RecordHarness(config)
+    harness.recorder.health_result = {"alive": True, "producing": False,
+                                      "starting": False, "first_data_lag": None,
+                                      "message": "/var/nerv/bag 下还没有新文件落盘"}
+
+    harness.update_record_time()
+
+    assert any("录制异常" in m for m in harness.messages), harness.messages

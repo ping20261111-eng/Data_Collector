@@ -102,6 +102,7 @@ class MainWindow(TopbarMixin, LayoutMixin, ActionsMixin, StatusMixin, LaunchMixi
         self.record_seconds = 0
         self.record_start_time = None
         self._record_health_warned = False   # 录制异常只报一次，避免每秒刷屏
+        self._record_data_started = False    # 首帧是否已落盘（界面靠它切「启动中→进行中」）
 
         # 实时帧率（v6.7.5）：只在「显示帧率」开关打开时跑，2 秒一次。
         # 单独一个定时器而不是挂在 record_timer 上 —— 后者只负责录制计时与看门狗，

@@ -891,14 +891,23 @@ def test_recorder_health_reports_not_alive_when_idle(tmp_path):
 
 
 def test_recorder_health_detects_no_output(tmp_path):
-    """进程活着但目录里没有新文件 —— 正是"以为在录、其实没录"。"""
+    """进程活着但目录里没有新文件 —— 正是"以为在录、其实没录"。
+
+    v6.9.9 起要**先过起录窗口**才算异常：窗口内是"启动中"（脚本在 source ROS /
+    起 ros2 bag record，现场 5~7 秒），窗口外还没文件才是真的没在录。
+    所以这里把 `_launch_at` 往前挪，越过 `STARTUP_GRACE_SECONDS` 再判。
+    """
+    from data_collector.core_data import RecorderManager
+
     rm, _bag, _launcher = _recorder_env(tmp_path)
 
     assert rm.start("bag", settle_seconds=0) is True
+    rm._launch_at = time.time() - (RecorderManager.STARTUP_GRACE_SECONDS + 5)
     health = rm.health()
 
     assert health["alive"] is True
     assert health["producing"] is False
+    assert health["starting"] is False
     assert "还没有新文件" in health["message"]
 
 
@@ -1155,3 +1164,64 @@ def test_retry_switches_to_tempfile_when_local_space_allows(uploader, tmp_path):
     # 只启了 1 个流式通道，说明第二次尝试没有再走流式
     assert len(uploader.fake_transport.cat_channels()) == 1
     assert f"{BASE}/{bag.name}.zip" in uploader.fake_sftp.remote_files
+
+
+def test_health_marks_a_startup_window_before_any_file_lands(tmp_path):
+    """起录后**头几秒没有文件是正常的**（2026-10-29）：要标成"启动中"而不是异常。
+
+    现场实测：点开始录制 → 界面已显示在录 → 数据 5~7 秒后才出现。那几秒是
+    `source setup.bash` + `ros2 bag record` 的导入与 DDS 发现，"没有新文件落盘"
+    在这个窗口里是**预期**，不能报异常（否则每次起录先喊一次狼来了）。
+    """
+    from data_collector.core_data import RecorderManager
+
+    rm, _bag, _launcher = _recorder_env(tmp_path)
+    assert rm.start("bag", settle_seconds=0) is True
+
+    health = rm.health()
+    assert health["alive"] is True
+    assert health["producing"] is False
+    assert health["starting"] is True, "起录窗口内应标成启动中"
+    assert health["first_data_lag"] is None
+
+    # 超过启动窗口还没有文件 → 不再算"启动中"，交给上层报异常
+    rm._launch_at = time.time() - (RecorderManager.STARTUP_GRACE_SECONDS + 5)
+    late = rm.health()
+    assert late["starting"] is False, "启动窗口过了就不该再护着"
+    assert late["producing"] is False
+
+
+def test_first_data_flips_producing_and_records_the_lag(tmp_path):
+    """第一个数据文件落盘 → producing 转真，并记下"起录到首帧"的秒数。"""
+    rm, bag, _launcher = _recorder_env(tmp_path)
+    assert rm.start("bag", settle_seconds=0) is True
+    assert rm.startup_lag_seconds() is None, "还没落盘就不该有延迟数字"
+
+    (bag / "bags_0.mcap").write_bytes(b"x" * 16)
+    health = rm.health()
+
+    assert health["producing"] is True
+    assert health["starting"] is False
+    lag = rm.startup_lag_seconds()
+    assert lag is not None and 0 <= lag < 5, lag
+    assert health["first_data_lag"] == pytest.approx(lag)
+
+    # 第一次就定格：后面再 tick 不该把它刷新成更大的数
+    time.sleep(0.01)
+    rm.health()
+    assert rm.startup_lag_seconds() == pytest.approx(lag)
+
+
+def test_startup_lag_is_measured_from_the_button_not_from_settle(tmp_path):
+    """延迟要以**按下按钮那一刻**（launch 前）为基准，不能用 settle 之后的 `_started_at`。
+
+    否则每场录制都会少算 settle_seconds，现场拿这个数去优化启动会一直对不上。
+    """
+    rm, bag, _launcher = _recorder_env(tmp_path)
+    assert rm.start("bag", settle_seconds=0) is True
+
+    rm._launch_at = time.time() - 6.0       # 假装按钮是 6 秒前按下的
+    (bag / "bags_0.mcap").write_bytes(b"x")
+    rm.health()
+
+    assert rm.startup_lag_seconds() == pytest.approx(6.0, abs=0.5)

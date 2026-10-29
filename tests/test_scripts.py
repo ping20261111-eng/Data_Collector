@@ -2517,18 +2517,20 @@ def test_arm_rate_gets_a_five_percent_margin(bag_stat):
     assert "950Hz" in bad_case.slow[0], bad_case.slow
 
 
-def test_hand_floor_is_98hz(bag_stat):
-    """手部下限 **98 Hz**：实测 98~100 之间算合格（现场 2026-10-28 口径）。
+def test_hand_floor_is_95hz(bag_stat):
+    """手部下限 **95 Hz**：>95 Hz 即合格（现场 2026-10-29 再放宽）。
 
-    实测一份好数据是 99.873 / 99.968 Hz —— 按 100 硬判会全判不合格。
+    历史：100（标称硬判）→ 98（2026-10-28）→ **95**（2026-10-29）。
+    判据是 `hz < 下限` 才算不合格，所以 **95.0 本身合格**、94.99 才不合格 ——
+    边界必须钉住，否则"放宽到 95"很容易被实现成"必须 >95"或"≥95.01"。
     """
-    for hz in (98.0, 99.0, 99.87, 99.968):
+    for hz in (95.0, 96.0, 98.0, 99.87, 99.968):
         v = _all_ok(bag_stat, **{HAND: _stat(hz)})
         assert v.ok is True, f"{hz} Hz 应合格：{v.detail}"
 
-    v2 = _all_ok(bag_stat, **{HAND: _stat(95.0)})
+    v2 = _all_ok(bag_stat, **{HAND: _stat(94.9)})
     assert v2.ok is False
-    assert "95.00Hz < 98Hz" in v2.slow[0], v2.slow
+    assert "94.90Hz < 95Hz" in v2.slow[0], v2.slow
 
     # 超频不判不合格：丢帧才是问题，多给数据无害（与手臂同一条口径）
     v3 = _all_ok(bag_stat, **{HAND: _stat(120.0)})
@@ -2768,7 +2770,7 @@ def test_rate_standard_text_matches_the_agreed_numbers(bag_stat):
     text = bag_stat.rate_standard_text()
     assert "相机 ≥28 Hz" in text and "标称 30 Hz" in text, text
     assert "手臂 ≥950 Hz" in text and "±5%" in text, text
-    assert "手部 ≥98 Hz" in text and "标称 100 Hz" in text, text
+    assert "手部 ≥95 Hz" in text and "标称 100 Hz" in text, text
 
 
 def test_real_joint_names_map_to_the_right_parts(bag_stat):
@@ -2784,7 +2786,7 @@ def test_real_joint_names_map_to_the_right_parts(bag_stat):
     trunk = bag_stat.rate_target_for("/joint_states [trunk_yaw]")
 
     assert arm is not None and arm[0] == "手臂" and arm[1] == 950.0, arm
-    assert hand is not None and hand[0] == "手部" and hand[1] == 98.0, hand
+    assert hand is not None and hand[0] == "手部" and hand[1] == 95.0, hand
     assert trunk is None, "躯干没有标称频率，不该有门槛"
     # 手臂下限比手部高一个数量级 —— 若两个 token 认混了，这条会立刻暴露
     assert arm[1] > 5 * hand[1], (arm, hand)
