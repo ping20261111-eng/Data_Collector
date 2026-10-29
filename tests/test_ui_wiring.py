@@ -8728,3 +8728,21 @@ def test_long_bag_names_are_not_elided_in_the_real_dialog(ui_env, tmp_path):
             assert stamp.count(":") == 2, f"时间没到秒：{stamp}"
     finally:
         dlg.close()
+
+
+def test_log_list_uses_the_two_column_delegate(ui_env):
+    """左侧日志列表必须挂"文件名靠左 / 时间靠右"的 delegate（v6.9.7）。
+
+    少了这一行 `setItemDelegate`，行文本还能照常显示（靠四个空格拼的），
+    功能上一切正常、界面上时间却是斜的 —— 只有这条能拦住。
+    """
+    from data_collector.ui.data_view import DataViewDialog
+    from data_collector.ui import log_row_delegate
+
+    win, _cm = ui_env
+    dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
+    try:
+        dlg.refresh_lists()
+        assert isinstance(dlg.log_list.itemDelegate(), log_row_delegate.LogRowDelegate)
+    finally:
+        dlg.close()

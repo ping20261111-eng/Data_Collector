@@ -135,3 +135,20 @@ stamp_x   = verdict_x − gap − stamp_w
 - [x] 选中态可读（`highlightedText`）
 - [x] 行高 ≥ 32px
 - [x] 画字与量宽用同一套字体（`painter.setFont`）
+
+---
+
+## 附：左侧「日志」列表（v6.9.7）
+
+同一页里的日志列表只有两列，规则更简单：
+
+```
+│←hpad→│              文件名（吃掉剩余，放不下才省略）              │←gap→│ 时间（贴右边缘）│←hpad→│
+```
+
+- **时间不省略**：它是这一列的意义；宽度就是它自己的宽度，右边界恒为 `rect.right() - hpad`。
+- **文件名可省略**：它只是标识，日志通常按时间读。
+- 时间右边缘与文件名长短**无关** —— 守卫 `test_time_right_edge_is_the_same_for_any_file_name_length`
+  用像素量：三种长度文件名的最后一行墨，右边缘差 ≤2px。
+- 同样遵守上文两条纪律：`painter.setFont(opt.font)`、QPainter try/finally。
+- 实现在 `ui/log_row_delegate.py`；样张 `docs/log-list-preview.png`。

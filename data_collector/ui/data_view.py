@@ -28,8 +28,7 @@ from ..core_data import RecorderManager, DataUploader, LogFetcher
 from ..core_data import (UploadBatchQueue, UploadCancelledError,
                          sort_bags_by_capture_time)
 from ..verify import read_bag_verdict
-from . import bag_verdict
-from . import bag_row_delegate
+from . import bag_verdict, bag_row_delegate, log_row_delegate
 
 
 from .common import (SP, describe_export_target, ensure_remote_password,
@@ -178,6 +177,7 @@ class DataViewDialog(QDialog):
         outer.addWidget(head)
 
         self.log_list = self._list_widget()
+        self.log_list.setItemDelegate(log_row_delegate.LogRowDelegate(self.log_list))
         self.log_list.itemDoubleClicked.connect(self._on_log_double_click)
         outer.addWidget(self.log_list, 1)
 
