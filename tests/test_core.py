@@ -4637,3 +4637,40 @@ def test_save_yaml_refuses_to_write_text_it_cannot_read_back(tmp_path, monkeypat
 
     assert "无法解析" in str(ei.value)
     assert target.read_text(encoding="utf-8") == before, "拒绝写盘却动了原文件"
+
+
+# ---------- ROS 域（启动主程序的 domain=，v6.9.11） ----------
+
+def test_ros_domain_goes_into_every_script_env(tmp_path):
+    """填了 domain 之后，**所有**脚本子进程都要带 ROS_DOMAIN_ID。
+
+    只给主程序设域、上位机自己的 ros2 调用还在 0 域，结果是"启动成功、界面一条话题
+    都看不到"（录制/遥操作/验证/监控全哑）—— 所以它必须是会话级环境变量。
+    """
+    cfg = tmp_path / "app_config.yaml"
+    save_yaml(cfg, {"workspace_root": str(tmp_path), "teleop_config_path": "t.yaml"})
+    cm = ConfigManager(cfg)
+
+    assert "ROS_DOMAIN_ID" not in cm.get_script_env(), "没填就不该凭空塞一个 0"
+
+    cm.set_ros_domain_id(7)
+    assert cm.ros_domain_id() == 7
+    assert cm.get_script_env()["ROS_DOMAIN_ID"] == "7"
+
+    cm.set_ros_domain_id(None)
+    assert cm.ros_domain_id() is None
+    assert "ROS_DOMAIN_ID" not in cm.get_script_env(), "清除后必须不再导出"
+
+
+def test_ros_domain_can_be_zero_and_rejects_out_of_range(tmp_path):
+    """`0` 是合法值（不能当成"没填"）；越界要抛错，而不是悄悄夹到边界。"""
+    cfg = tmp_path / "app_config.yaml"
+    save_yaml(cfg, {"workspace_root": str(tmp_path), "teleop_config_path": "t.yaml"})
+    cm = ConfigManager(cfg)
+
+    cm.set_ros_domain_id(0)
+    assert cm.get_script_env()["ROS_DOMAIN_ID"] == "0", "填 0 也要真的导出"
+
+    for bad in (-1, 256, 999):
+        with pytest.raises(ValueError):
+            cm.set_ros_domain_id(bad)

@@ -209,13 +209,36 @@ class LaunchMixin:
         if self.cb_rgb_only.isChecked():
             opts.append("rgb_only")
 
+        # ---- domain=（v6.9.11）----
+        # 填了就设成本次会话的 ROS 域，**对所有子进程生效**（见
+        # `ConfigManager.set_ros_domain_id` 的说明）；留空 = 清除，跟随系统默认。
+        # 先校验再判"主程序是否在跑"：域填错了还去检查主程序，等于让人白等一次。
+        domain = None
+        domain_text = self.edit_domain.text().strip()
+        if domain_text:
+            if not domain_text.isdigit():
+                self.show_error("domain 无效",
+                                f"domain 只能填数字（0~255），填的是「{domain_text}」。\n"
+                                "留空表示跟随系统默认（通常 0）。")
+                return
+            try:
+                domain = int(domain_text)
+                self.config.set_ros_domain_id(domain)
+            except ValueError as exc:
+                self.show_error("domain 无效", f"{exc}。\n留空表示跟随系统默认（通常 0）。")
+                return
+        else:
+            self.config.set_ros_domain_id(None)
+
         if not self._block_launch_when_running():
             return
         self.btn_launch.setEnabled(False)
         self.append("正在启动主程序...")
         try:
             self.launcher.launch_run_nodes(opts)
-            self.append(f"主程序已在新终端启动（参数: {' '.join(opts) or '默认'}）")
+            domain_note = f"；ROS 域 {domain}" if domain is not None else ""
+            self.append(
+                f"主程序已在新终端启动（参数: {' '.join(opts) or '默认'}{domain_note}）")
             self.btn_launch.setEnabled(True)
         except Exception as e:
             self.btn_launch.setEnabled(True)

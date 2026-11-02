@@ -8746,3 +8746,67 @@ def test_log_list_uses_the_two_column_delegate(ui_env):
         assert isinstance(dlg.log_list.itemDelegate(), log_row_delegate.LogRowDelegate)
     finally:
         dlg.close()
+
+
+# ---------- 启动主程序的 domain=（v6.9.11） ----------
+
+def _stub_launch(win, monkeypatch):
+    """把「启动主程序」这条链上的外部动作都换成替身，返回捕获到的参数列表。"""
+    launched = []
+    win.sdk_service.is_active = lambda: "inactive"
+    monkeypatch.setattr(win.sdk_service, "launch_pid", lambda: None)
+    win.launcher.launch_run_nodes = lambda opts: launched.append(opts) or type(
+        "P", (), {"poll": staticmethod(lambda: None)})()
+    _inline_task_thread(monkeypatch)
+    monkeypatch.setattr(win.launcher, "connect_chassis",
+                        lambda timeout=30.0: ["已自动连接底盘（底盘）"])
+    _stub_monitor(win, monkeypatch)
+    _no_live_monitor(win)
+    return launched
+
+
+def test_launch_applies_domain_to_every_script_env(ui_env, monkeypatch):
+    """启动主程序里填了 `domain=7` → **所有**子进程都带 ROS_DOMAIN_ID=7。
+
+    只给主程序设域是不够的：上位机自己的 ros2 调用（录制/遥操作/验证/监控）还在 0 域，
+    现场看到的是"主程序起来了，界面一条话题都没有"。所以这条必须落在会话级环境里。
+    """
+    win, _cm = ui_env
+    launched = _stub_launch(win, monkeypatch)
+
+    win.edit_domain.setText("7")
+    win.on_launch()
+
+    assert launched == [["joy", "rviz"]], "domain 不该被当成 argv 塞给脚本"
+    assert win.config.ros_domain_id() == 7
+    assert win.config.get_script_env()["ROS_DOMAIN_ID"] == "7"
+    assert "ROS 域 7" in win.log.toPlainText(), win.log.toPlainText()
+
+
+def test_launch_without_domain_clears_it(ui_env, monkeypatch):
+    """留空 → 不带 ROS_DOMAIN_ID（跟随系统默认），并且把上一次填的清掉。"""
+    win, _cm = ui_env
+    _stub_launch(win, monkeypatch)
+    win.config.set_ros_domain_id(9)
+
+    win.edit_domain.setText("")
+    win.on_launch()
+
+    assert win.config.ros_domain_id() is None
+    assert "ROS_DOMAIN_ID" not in win.config.get_script_env()
+    assert "ROS 域" not in win.log.toPlainText()
+
+
+def test_launch_refuses_a_bad_domain_instead_of_starting(ui_env, monkeypatch):
+    """填错（非数字 / 越界）→ **拦住不启动**，并且不动原来的设定。
+
+    域填错的后果是"启动成功但看不到任何话题"，比启动失败更难查 —— 所以在按钮这一层拦住。
+    """
+    win, _cm = ui_env
+    launched = _stub_launch(win, monkeypatch)
+
+    for bad in ("abc", "999"):
+        win.edit_domain.setText(bad)
+        win.on_launch()
+        assert launched == [], f"「{bad}」不该启动主程序"
+        assert win.config.ros_domain_id() is None, f"「{bad}」把域改了"

@@ -5,7 +5,8 @@
 """
 from PyQt5.QtWidgets import (QVBoxLayout, QHBoxLayout,
                              QPushButton, QCheckBox, QLabel, QProgressBar, QMenu,
-                             QFrame, QSizePolicy, QAction, QMessageBox)
+                             QFrame, QSizePolicy, QAction, QMessageBox, QLineEdit)
+from PyQt5.QtGui import QIntValidator, QFontMetrics
 from ... import theme
 from ...core_motion import TRUNK_LOCK_AXES_TEXT
 
@@ -164,6 +165,32 @@ class ActionsMixin(ExportTargetMixin):
             # 加到 32 只会让这一行高 14px，主窗口操作区高度够，不会破版面。
             box.setMinimumHeight(theme.px(TOUCH_BOX_HEIGHT))
             param_row.addWidget(box)
+
+        # ---- domain=（v6.9.11 现场要求）----
+        #
+        # 填的是 **ROS_DOMAIN_ID**：留空 = 跟随系统默认（通常 0），填 0~255。
+        # 为什么不把它只塞给 run_nodes.sh 当参数：ROS 2 的域隔离是**进程环境**决定的，
+        # 只给主程序设域、上位机自己的 ros2 调用还在 0 域 → 启动成功但界面一条话题
+        # 都看不到（录制/遥操作/验证/监控全哑）。所以它进的是会话级的脚本环境，
+        # 见 `ConfigManager.set_ros_domain_id`。
+        self.domain_label = QLabel("domain=")
+        self.domain_label.setObjectName("FactLabel")
+        self.edit_domain = QLineEdit()
+        self.edit_domain.setObjectName("DomainEdit")
+        self.edit_domain.setMaxLength(3)                     # 三位数足够（0~255）
+        self.edit_domain.setPlaceholderText("0-255")
+        self.edit_domain.setValidator(QIntValidator(0, 255, self))
+        # 宽度按"三个数字"量：写死像素在换字体/缩放后会裁字（v6.7.1 的老坑）
+        digits = QFontMetrics(theme.mono_font(theme.TYPE_SCALE["fs_sm"])).horizontalAdvance("000")
+        self.edit_domain.setFixedWidth(digits + 2 * theme.px(8))
+        self.edit_domain.setMinimumHeight(theme.px(TOUCH_BOX_HEIGHT))   # 触摸目标 ≥32px
+        self.edit_domain.setToolTip(
+            "ROS 域（ROS_DOMAIN_ID），三位数，留空 = 跟随系统默认（通常 0）。\n"
+            "填了会应用到主程序与本机所有 ROS 命令（录制 / 遥操作 / 数据验证 / 状态监控）——\n"
+            "只给主程序设域会让界面什么都看不到。")
+        param_row.addSpacing(SP["sp3"])
+        param_row.addWidget(self.domain_label)
+        param_row.addWidget(self.edit_domain)
         param_row.addStretch()
         body.addLayout(param_row)
 
