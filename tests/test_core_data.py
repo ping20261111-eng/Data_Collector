@@ -1225,3 +1225,85 @@ def test_startup_lag_is_measured_from_the_button_not_from_settle(tmp_path):
     rm.health()
 
     assert rm.startup_lag_seconds() == pytest.approx(6.0, abs=0.5)
+
+
+# ---------- lost+found / 读不了的目录（v6.9.10 现场弹窗） ----------
+
+def _bag_dir_with(tmp_path, names):
+    """造一个数据目录：其中 `names` 里每一项都是一个子目录。"""
+    root = tmp_path / "bag"
+    root.mkdir(exist_ok=True)
+    for name in names:
+        (root / name).mkdir(exist_ok=True)
+    return root
+
+
+def test_lost_found_is_not_listed_as_a_bag(tmp_path):
+    """`lost+found` 不能出现在数据列表里（现场 2026-11-02 弹的就是它）。
+
+    它是 ext4 格式化时自动建的、权限 `drwx------ root`：列出来之后每次刷新都会去读
+    它的 metadata → `PermissionError: [Errno 13]` → 界面弹「处理 on_view_data 时出错」。
+    移动硬盘在电脑上格式化过一次就会出现它，所以这条必须按**名字**挡掉。
+    """
+    from data_collector.core_data import DataUploader, LOST_FOUND_DIR
+
+    root = _bag_dir_with(tmp_path, ["cloth_rack_20261027120000", LOST_FOUND_DIR])
+    uploader = DataUploader(None)
+    uploader.bag_dir = root
+
+    names = [p.name for p in uploader.get_bag_folders()]
+
+    assert "cloth_rack_20261027120000" in names, "正常的数据目录不该被一起挡掉"
+    assert LOST_FOUND_DIR not in names, f"lost+found 被当成数据列出来了：{names}"
+
+
+def test_unreadable_directory_is_skipped_instead_of_failing(tmp_path, monkeypatch):
+    """读不了的目录整条跳过 —— 列表不能因为一个坏目录就打不开。"""
+    from pathlib import Path
+
+    from data_collector.core_data import DataUploader
+
+    root = _bag_dir_with(tmp_path, ["good_20261027120000", "blocked"])
+    original = Path.iterdir
+
+    def fake_iterdir(self):
+        if self.name == "blocked":
+            raise PermissionError(13, "权限不够", str(self))
+        return original(self)
+
+    monkeypatch.setattr(Path, "iterdir", fake_iterdir)
+    uploader = DataUploader(None)
+    uploader.bag_dir = root
+
+    names = [p.name for p in uploader.get_bag_folders()]
+
+    assert names == ["good_20261027120000"], names
+
+
+def test_metadata_probe_survives_permission_error(tmp_path, monkeypatch):
+    """读 metadata 前那一步 `is_file()` **本身会抛 PermissionError**（pathlib 不吃 EACCES）。
+
+    v6.9.10 现场那句话之所以出现，就是因为这个判断在 try 外面：
+    `/var/nerv/bag/lost+found/metadata.yaml` 的 stat 被拒 → 整个刷新中断。
+    现在它必须安静地退化成"没有 metadata"，走目录名/ mtime 兜底。
+    """
+    from pathlib import Path
+
+    from data_collector.core_data import resolve_capture_time
+
+    folder = tmp_path / "cloth_rack_20261027120000"
+    folder.mkdir()
+    (folder / "metadata.yaml").write_text("x", encoding="utf-8")
+    original = Path.is_file
+
+    def fake_is_file(self):
+        if self.name == "metadata.yaml":
+            raise PermissionError(13, "权限不够", str(self))
+        return original(self)
+
+    monkeypatch.setattr(Path, "is_file", fake_is_file)
+
+    captured, source = resolve_capture_time(folder)     # 不许抛
+
+    assert source == "name", source                     # 退化成目录名里的时间戳
+    assert captured.year == 2026 and captured.month == 10, captured

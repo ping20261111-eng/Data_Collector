@@ -28,6 +28,12 @@ from .manifest import (
 )
 from .verify import sha256_file, sha256_sftp, write_sha256_sidecar
 
+#: ext4 格式化时自动建的「丢失文件」目录名。权限是 `drwx------ root`，
+#: 普通用户连遍历都不行 —— 它**不是采集数据**，列出来只会在每次刷新时报权限错
+#: （v6.9.10 现场：`/var/nerv/bag/lost+found/metadata.yaml` PermissionError）。
+#: 移动硬盘在电脑上格式化过一次就会出现它，所以这条在每台机器上都会遇到。
+LOST_FOUND_DIR = "lost+found"
+
 #: 磁盘导出目标。**延迟导入**（不在模块顶层）：
 #: `disk_export` 会在 import 期读一次 `get_export_settings`（拿挂载点/盘标识），
 #: 顶��导入会把「导入 core_data」与「读配置」两件事绑死 ——
@@ -844,9 +850,14 @@ def _capture_time_from_metadata(folder: Path) -> Optional[datetime]:
     - 老版：`starting_time: 1761177000.123456789`（浮点秒）
     """
     meta = Path(folder) / "metadata.yaml"
-    if not meta.is_file():
-        return None
     try:
+        # ⚠️ `is_file()` 在这里**会抛 PermissionError**：pathlib 只容忍
+        # ENOENT/ENOTDIR/EBADF/ELOOP，**EACCES 会原样抛出**。而数据目录旁边常有
+        # `lost+found`（ext4 自动建、权限 700 root），对它做 stat 就是 EACCES ——
+        # v6.9.10 现场那句「处理 on_view_data 时出错」就是这么来的。
+        # 所以判存在这一步也必须放进 try 里，不能只在读文件那段捕异常。
+        if not meta.is_file():
+            return None
         data = yaml.safe_load(meta.read_text(encoding="utf-8")) or {}
         info = data.get("rosbag2_bagfile_information") or {}
         start = info.get("starting_time")
@@ -1044,11 +1055,37 @@ class DataUploader:
         self._bag_dir_override = Path(value)
 
     def get_bag_folders(self) -> List[Path]:
+        """数据目录下的**采集目录**列表（按 mtime 倒序）。
+
+        ## 为什么不是"所有子目录"
+
+        v6.9.10 现场：`/var/nerv/bag/lost+found` 被当成一条数据列出来，刷新时去读它的
+        `metadata.yaml` → `PermissionError: [Errno 13]` → 界面弹「处理 on_view_data 时出错」。
+
+        `lost+found` 是 **ext4 格式化时自动建的**（放 fsck 捡回来的孤儿 inode），
+        权限 `drwx------ root`，普通用户连遍历都不行 —— 它既不是采集数据，也永远读不了。
+        移动硬盘在电脑上格式化过一次，它就会出现，所以这条会**反复**在每台机器上冒出来。
+
+        另外顺手跳过**读不了的目录**：能列出来但点什么都报错的条目，比不列更糟
+        （操作员会以为数据坏了）。判据用 `iterdir()` 能不能起来 —— 那正是后续所有
+        操作（读 metadata / 算体积 / 验报告）都要用到的那一步权限。
+        """
         if not self.bag_dir.exists():
             return []
-        subdirs = [d for d in self.bag_dir.iterdir() if d.is_dir()]
-        subdirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
-        return subdirs
+        subdirs = []
+        for entry in self.bag_dir.iterdir():
+            try:
+                if not entry.is_dir() or entry.name == LOST_FOUND_DIR:
+                    continue
+                next(entry.iterdir(), None)      # 能否遍历：读不了就整条跳过
+                mtime = entry.stat().st_mtime
+            except OSError:
+                # 权限不足 / 目录正被删 / 坏符号链接 —— 都不该让整个刷新失败
+                logger.debug(f"跳过不可用的数据目录：{entry}")
+                continue
+            subdirs.append((mtime, entry))
+        subdirs.sort(key=lambda item: item[0], reverse=True)
+        return [entry for _mtime, entry in subdirs]
 
     # ---------- 采集数据候选（给「数据验证」等"选一个 bag"用） ----------
 
