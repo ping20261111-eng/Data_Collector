@@ -1135,16 +1135,6 @@ class ConfigManager:
         #: 会话级的落盘目录覆盖：`None` = 用配置里的 `bag_dir`。
         #: 选「移动硬盘」时是盘上那个目录；选「本机数据盘」时清回 `None`。
         self._record_dir_override: Optional[Path] = None
-        #: 本次运行的 **ROS_DOMAIN_ID**（「启动主程序」里填的 `domain=`）。
-        #: `None` = 不设，沿用系统/环境里的值（通常 0）。
-        #:
-        #: 为什么不只当成 run_nodes.sh 的一个参数：ROS 2 的域隔离是**进程环境**决定的，
-        #: 只给主程序设域、上位机自己的 ros2 调用还在 0 域，结果就是"启动成功、界面
-        #: 什么都看不到"（录制、遥操作、数据验证、状态监控全是哑的）。所以这里是
-        #: **会话级**设定，`get_script_env()` 会把它带给所有子进程。
-        #: 与落盘位置一样**只放内存、不写回配置**：换了 domain 连不上机器人时，
-        #: 现场至少不会被"上次谁填的 7"困住。
-        self._ros_domain_id: Optional[int] = None
         self.workspace = Path(self.app_config["workspace_root"]).expanduser()
         self.teleop_config_path = self.workspace / self.app_config["teleop_config_path"]
         # 末端参数（arm_control_config.yaml）：与标定配置一样**按工作空间存放**。
@@ -1438,35 +1428,25 @@ class ConfigManager:
             "LOG_DIR": str(self.get_log_dir()),
             "ROBOT_STATUS_FILE": str(self.get_robot_status_file()),
         }
-        # 只有**填了**才导出：没填时不要给子进程塞一个 ROS_DOMAIN_ID=0，
-        # 那会盖掉用户 shell 里已经设好的值（现场有人用别的域做隔离）。
-        if self._ros_domain_id is not None:
-            env["ROS_DOMAIN_ID"] = str(self._ros_domain_id)
         return env
 
-    # ---------- ROS 域（启动主程序里的 domain=） ----------
+    # ---------- ROS 域（机器人侧 configure_domain.sh 生成的那份） ----------
 
-    #: ROS 2 允许的 DOMAIN_ID 范围（官方是 0~232 更保守，这里按常用口径 0~255 收）。
-    ROS_DOMAIN_RANGE = (0, 255)
+    def ros_domain_bash_path(self) -> Path:
+        """机器人侧 `install/setup_domain.bash` 的路径（可能不存在）。
 
-    def set_ros_domain_id(self, value: Optional[int]) -> None:
-        """设定本次会话的 ROS 域（`None` = 不设/清除）。
+        ## 为什么域不从界面上设（v6.9.12 回退）
 
-        越界直接抛 `ValueError`，不静默夹到边界：填错域最常见的后果是"启动成功但
-        一条话题都看不到"，与其让人排查网络，不如在按下按钮那一刻就拦住。
+        机器人侧 v1.4.0-develop 起用 `configure_domain.sh domain=… local_ip=…` 生成
+        `install/setup_domain.bash` 和 `install/config/fastdds.xml`，里面除了
+        `ROS_DOMAIN_ID` 还有 `RMW_IMPLEMENTATION` 与两个 FastDDS profiles 路径 ——
+        而 profiles 里的 `local_ip` 是**这块机器自己的地址**，上位机凭空 export 一个
+        `ROS_DOMAIN_ID` 只会造出"域对上了，但 FastDDS 用的是另一套配置"的半吊子状态。
+
+        所以域的唯一真源是**机器人侧生成的那个文件**；上位机只负责"启动子进程时把它
+        source 进来"（见 `Launcher._env_prefix`），不再持有自己的 domain 设定。
         """
-        if value is None:
-            self._ros_domain_id = None
-            return
-        low, high = self.ROS_DOMAIN_RANGE
-        number = int(value)
-        if not low <= number <= high:
-            raise ValueError(f"domain 必须在 {low}~{high} 之间（填的是 {number}）")
-        self._ros_domain_id = number
-
-    def ros_domain_id(self) -> Optional[int]:
-        """本次会话的 ROS 域；`None` = 没设（跟随环境）。"""
-        return self._ros_domain_id
+        return self.workspace / "install" / "setup_domain.bash"
 
     # ---------- 机器人状态监控 / SDK 服务 ----------
     def get_robot_status_file(self) -> Path:

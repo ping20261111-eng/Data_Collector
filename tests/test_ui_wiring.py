@@ -8688,9 +8688,11 @@ def test_long_bag_names_are_not_elided_in_the_real_dialog(ui_env, tmp_path):
     dlg = DataViewDialog(win.uploader, win.log_fetcher, win)
     try:
         dlg.refresh_lists()
-        dlg.show()
-        QApplication.processEvents()
-
+        # 刻意**不 show()、不渲染整个视口**：整文件跑（前面的界面用例累积了大量
+        # Qt 状态）时，"一个真显示的对话框 + viewport().render()"会把进程带到段错误，
+        # 让后面几条用例跑不到（v6.9.12 实测：317 条后崩在这条上）。
+        # 这条要验的东西不需要像素 —— 是"绘制路径会不会把量窄的列宽纠正回来"，
+        # 用 `sizeHint()`（paint 的第一步，同一处 `_ensure_widths`）触发即可。
         delegate = dlg.bag_list.itemDelegate()
         assert isinstance(delegate, bag_row_delegate.BagRowDelegate)
 
@@ -8706,15 +8708,13 @@ def test_long_bag_names_are_not_elided_in_the_real_dialog(ui_env, tmp_path):
         delegate.set_name_width(max(metrics.horizontalAdvance(names[0]) // 2, 40))
         delegate.set_stamp_width(metrics.horizontalAdvance("10-26 18:16") )
 
-        # 真画一遍整个视口 —— 绘制路径自己必须把宽度纠正回来
-        from PyQt5.QtGui import QImage, QPainter
-        canvas = QImage(max(dlg.bag_list.viewport().width(), 1),
-                        max(dlg.bag_list.viewport().height(), 1), QImage.Format_ARGB32)
-        painter = QPainter(canvas)
-        try:
-            dlg.bag_list.viewport().render(painter)
-        finally:
-            painter.end()
+        # 走一遍绘制入口（sizeHint → _ensure_widths）：实现必须把宽度纠正回来
+        for row in range(dlg.bag_list.count()):
+            option = QStyleOptionViewItem()
+            option.font = dlg.bag_list.font()
+            delegate.initStyleOption(option, dlg.bag_list.model().index(row, 0))
+            option.widget = dlg.bag_list
+            delegate.sizeHint(option, dlg.bag_list.model().index(row, 0))
 
         assert dlg.bag_list.count() == len(names)
         for row in range(dlg.bag_list.count()):
@@ -8748,65 +8748,20 @@ def test_log_list_uses_the_two_column_delegate(ui_env):
         dlg.close()
 
 
-# ---------- 启动主程序的 domain=（v6.9.11） ----------
 
-def _stub_launch(win, monkeypatch):
-    """把「启动主程序」这条链上的外部动作都换成替身，返回捕获到的参数列表。"""
-    launched = []
-    win.sdk_service.is_active = lambda: "inactive"
-    monkeypatch.setattr(win.sdk_service, "launch_pid", lambda: None)
-    win.launcher.launch_run_nodes = lambda opts: launched.append(opts) or type(
-        "P", (), {"poll": staticmethod(lambda: None)})()
-    _inline_task_thread(monkeypatch)
-    monkeypatch.setattr(win.launcher, "connect_chassis",
-                        lambda timeout=30.0: ["已自动连接底盘（底盘）"])
-    _stub_monitor(win, monkeypatch)
-    _no_live_monitor(win)
-    return launched
+# ---------- ROS 域：界面不再持有它（v6.9.12 回退） ----------
 
+def test_the_launch_panel_does_not_hold_a_domain_setting(ui_env):
+    """域**不从界面设**了：真源是机器人侧 `configure_domain.sh` 生成的 setup_domain.bash。
 
-def test_launch_applies_domain_to_every_script_env(ui_env, monkeypatch):
-    """启动主程序里填了 `domain=7` → **所有**子进程都带 ROS_DOMAIN_ID=7。
+    v6.9.11 曾在「启动参数」行加过 `domain=` 输入框，把 ROS_DOMAIN_ID 塞进所有子进程。
+    机器人侧 v1.4.0-develop 起自己管域（还带 local_ip 与 FastDDS profiles），
+    两套来源必然打架 —— 于是回退：界面只负责在起子进程时 source 那个文件。
 
-    只给主程序设域是不够的：上位机自己的 ros2 调用（录制/遥操作/验证/监控）还在 0 域，
-    现场看到的是"主程序起来了，界面一条话题都没有"。所以这条必须落在会话级环境里。
+    这条守卫的作用是"别又加回来"：真要在界面上改域，正确做法是调用
+    `configure_domain.sh`，而不是自己 export。
     """
     win, _cm = ui_env
-    launched = _stub_launch(win, monkeypatch)
 
-    win.edit_domain.setText("7")
-    win.on_launch()
-
-    assert launched == [["joy", "rviz"]], "domain 不该被当成 argv 塞给脚本"
-    assert win.config.ros_domain_id() == 7
-    assert win.config.get_script_env()["ROS_DOMAIN_ID"] == "7"
-    assert "ROS 域 7" in win.log.toPlainText(), win.log.toPlainText()
-
-
-def test_launch_without_domain_clears_it(ui_env, monkeypatch):
-    """留空 → 不带 ROS_DOMAIN_ID（跟随系统默认），并且把上一次填的清掉。"""
-    win, _cm = ui_env
-    _stub_launch(win, monkeypatch)
-    win.config.set_ros_domain_id(9)
-
-    win.edit_domain.setText("")
-    win.on_launch()
-
-    assert win.config.ros_domain_id() is None
-    assert "ROS_DOMAIN_ID" not in win.config.get_script_env()
-    assert "ROS 域" not in win.log.toPlainText()
-
-
-def test_launch_refuses_a_bad_domain_instead_of_starting(ui_env, monkeypatch):
-    """填错（非数字 / 越界）→ **拦住不启动**，并且不动原来的设定。
-
-    域填错的后果是"启动成功但看不到任何话题"，比启动失败更难查 —— 所以在按钮这一层拦住。
-    """
-    win, _cm = ui_env
-    launched = _stub_launch(win, monkeypatch)
-
-    for bad in ("abc", "999"):
-        win.edit_domain.setText(bad)
-        win.on_launch()
-        assert launched == [], f"「{bad}」不该启动主程序"
-        assert win.config.ros_domain_id() is None, f"「{bad}」把域改了"
+    assert not hasattr(win, "edit_domain"), "启动参数行又出现 domain 输入框了"
+    assert not hasattr(win, "domain_label")

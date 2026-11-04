@@ -4639,38 +4639,49 @@ def test_save_yaml_refuses_to_write_text_it_cannot_read_back(tmp_path, monkeypat
     assert target.read_text(encoding="utf-8") == before, "拒绝写盘却动了原文件"
 
 
-# ---------- ROS 域（启动主程序的 domain=，v6.9.11） ----------
 
-def test_ros_domain_goes_into_every_script_env(tmp_path):
-    """填了 domain 之后，**所有**脚本子进程都要带 ROS_DOMAIN_ID。
+# ---------- ROS 域：上位机不再自己注入（v6.9.12 回退 + 适配机器人侧脚本） ----------
 
-    只给主程序设域、上位机自己的 ros2 调用还在 0 域，结果是"启动成功、界面一条话题
-    都看不到"（录制/遥操作/验证/监控全哑）—— 所以它必须是会话级环境变量。
+def test_script_env_does_not_inject_ros_domain_id(tmp_path):
+    """上位机**不许**自己往环境里塞 ROS_DOMAIN_ID。
+
+    v6.9.11 曾经这么做（界面上填 domain=）；机器人侧 v1.4.0-develop 起由
+    `configure_domain.sh` 生成 `install/setup_domain.bash`，里面还有 local_ip 与
+    FastDDS profiles —— 两套来源必然打架，且我们的那套**缺 profiles**，
+    表现是"域对上了但 FastDDS 不是那个配置"。所以域只从机器人侧那个文件来。
     """
     cfg = tmp_path / "app_config.yaml"
     save_yaml(cfg, {"workspace_root": str(tmp_path), "teleop_config_path": "t.yaml"})
     cm = ConfigManager(cfg)
 
-    assert "ROS_DOMAIN_ID" not in cm.get_script_env(), "没填就不该凭空塞一个 0"
-
-    cm.set_ros_domain_id(7)
-    assert cm.ros_domain_id() == 7
-    assert cm.get_script_env()["ROS_DOMAIN_ID"] == "7"
-
-    cm.set_ros_domain_id(None)
-    assert cm.ros_domain_id() is None
-    assert "ROS_DOMAIN_ID" not in cm.get_script_env(), "清除后必须不再导出"
+    assert "ROS_DOMAIN_ID" not in cm.get_script_env()
+    assert not hasattr(cm, "set_ros_domain_id"), "会话级 domain 设定已回退，别又加回来"
 
 
-def test_ros_domain_can_be_zero_and_rejects_out_of_range(tmp_path):
-    """`0` 是合法值（不能当成"没填"）；越界要抛错，而不是悄悄夹到边界。"""
-    cfg = tmp_path / "app_config.yaml"
-    save_yaml(cfg, {"workspace_root": str(tmp_path), "teleop_config_path": "t.yaml"})
-    cm = ConfigManager(cfg)
+def test_domain_setup_is_sourced_in_every_script_command(launcher_env, tmp_path):
+    """机器人侧有 `install/setup_domain.bash` 时，命令里必须**先 source 它**。
 
-    cm.set_ros_domain_id(0)
-    assert cm.get_script_env()["ROS_DOMAIN_ID"] == "0", "填 0 也要真的导出"
+    为什么放在统一前缀里：这条链上有 9 个入口（_build_cmd / _ros_run_cmd / 实时流 /
+    FCC 抓取 / vr_bridge …），漏一处就是"那个进程还在 0 域"，表现是界面看不到话题 ——
+    比启动失败难查得多。
+    """
+    launcher, tmp, _cfg, calls = launcher_env
+    domain_bash = tmp / "install" / "setup_domain.bash"
+    domain_bash.parent.mkdir(parents=True, exist_ok=True)
+    domain_bash.write_text("export ROS_DOMAIN_ID=10\n", encoding="utf-8")
 
-    for bad in (-1, 256, 999):
-        with pytest.raises(ValueError):
-            cm.set_ros_domain_id(bad)
+    launcher.launch_play_bag("/var/nerv/bag/bag_a")
+
+    command, _terminal = calls["terminal"]
+    assert f". {domain_bash}" in command, command
+    assert f"[ -f {domain_bash} ]" in command, "必须带存在性判断，否则老工作空间会被短路"
+
+
+def test_no_domain_setup_means_identical_command(launcher_env):
+    """没有那个文件时，命令里**不许**出现 setup_domain.bash（老工作空间行为不变）。"""
+    launcher, _tmp, _cfg, calls = launcher_env
+
+    launcher.launch_play_bag("/var/nerv/bag/bag_a")
+
+    command, _terminal = calls["terminal"]
+    assert "setup_domain.bash" not in command, command

@@ -1567,9 +1567,32 @@ class Launcher:
         return script
 
     def _env_prefix(self) -> str:
-        """脚本统一通过环境变量定位路径：ROBOT_WORKSPACE / NERV_DIR / BAG_DIR / LOG_DIR。"""
+        """脚本统一的环境前缀：ROS 域 + 路径类环境变量。
+
+        ## ROS 域（`install/setup_domain.bash`，v6.9.12）
+
+        机器人侧从 v1.4.0-develop 起用 `configure_domain.sh domain=… local_ip=…` 生成
+        `install/setup_domain.bash`（导出 `ROS_DOMAIN_ID` / `RMW_IMPLEMENTATION` /
+        两个 FastDDS profiles 路径）。**域的唯一真源就是那个文件**，所以这里把它
+        source 进来，让**每一个**子进程（主程序、录制、遥操作、数据验证、状态监控、
+        夹爪、实时流、vr_bridge）都落在同一个域与同一套 FastDDS 配置上。
+
+        为什么要放在**统一前缀**里而不是各调用点各加一次：漏一处就是"界面看不到话题"
+        这类最难查的故障；而这条链上现在有 9 个入口（见 `_build_cmd` / `_ros_run_cmd`
+        / 实时流 / FCC 抓取 / vr_bridge …），靠人记必漏。
+
+        `if [ -f … ]` 而不是 `&&`：文件不存在时也必须**返回成功**，否则后面整条命令
+        会被短路掉（老工作空间没有这个文件，行为应与改动前完全一致）。
+        """
+        domain_bash = self.config.ros_domain_bash_path()
+        domain_prefix = (
+            f"if [ -f {shlex.quote(str(domain_bash))} ]; then "
+            f". {shlex.quote(str(domain_bash))}; fi; "
+            if domain_bash.exists() else "")
         exports = self.config.get_script_env()
-        return "".join(f"export {name}={shlex.quote(value)}; " for name, value in exports.items())
+        prefix = "".join(f"export {name}={shlex.quote(value)}; "
+                         for name, value in exports.items())
+        return domain_prefix + prefix
 
     def _setup_script(self) -> Path:
         return self.config.workspace / "install/setup.bash"
@@ -3600,7 +3623,12 @@ class Launcher:
     def launch_vr_bridge(self) -> subprocess.Popen:
         if not self.config.check_workspace():
             raise FileNotFoundError(f"工作空间不存在: {self.config.workspace}")
-        cmd = f"source {self._setup_script()} && ros2 run teleop vr_bridge_node"
+        # 走统一前缀：它也要落在同一个 ROS 域与同一套 FastDDS 配置上。
+        # （原来自己拼 `source setup.bash && ros2 run`，绕过了 `_env_prefix` —— 配了域
+        #   之后它就是唯一一个"还在 0 域"的节点，表现是标定连不上 tracker。）
+        cmd = (f"{self._env_prefix()}"
+               f"source {shlex.quote(str(self._setup_script()))} && "
+               f"ros2 run teleop vr_bridge_node")
         # 输出写日志文件而不是 PIPE：vr_bridge 是常驻节点，用 PIPE 又没人读取时，
         # 管道缓冲写满（64KB）会让它阻塞在 write 上 —— 表现就是标定莫名卡死。
         proc = run_background_with_log(
