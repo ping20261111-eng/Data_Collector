@@ -74,6 +74,17 @@ bag_rate_stat_script: bag_rate_stat.py
 monitor_performance_script: monitor_record_performance.sh
 robot_monitor_script: robot_monitor.py   # 机器人状态监控（订阅电量/急停/定位/地图）
 
+# ---------- ROS 域（机器人侧 configure_domain.sh） ----------
+# 域的**唯一真源**是机器人脚本生成的 install/setup_domain.bash + install/config/fastdds.xml
+# （后者含 local_ip）。上位机不自己设 ROS_DOMAIN_ID，只在起子进程时 source 那份文件；
+# 界面上的「配置域…」按钮也只是**调用这个脚本**。见 docs/ADR-002_ROS域的唯一真源.md。
+#
+# configure_domain_script 相对 workspace_root 解析（现场确认：脚本在工作空间根）。
+configure_domain_script: configure_domain.sh
+# local_ip 是**这台机器自己**的监听地址（FastDDS 用它绑定网卡），换网段时要改。
+# 它同时也是「配置域…」对话框里 local_ip 输入框的默认值。
+domain_local_ip: 192.168.2.100
+
 # ---------- 数据转换工具（可选；nerv_lerobot 的图形界面） ----------
 # 把录好的 bag 转成训练数据集的界面，**在它自己的独立进程与独立窗口里运行**
 # （它需要 Python 3.12 与 lerobot，本工具是 3.10，两边不能同进程，见 ADR-003）。

@@ -1432,6 +1432,29 @@ class ConfigManager:
 
     # ---------- ROS 域（机器人侧 configure_domain.sh 生成的那份） ----------
 
+    #: 机器人侧 `configure_domain.sh` 的默认参数：`local_ip` 是**这块机器的监听地址**，
+    #: 与本机的网卡配置有关，所以放在配置文件里可改（`domain_local_ip`）。
+    DEFAULT_DOMAIN_LOCAL_IP = "192.168.2.100"
+
+    def get_configure_domain_script(self) -> Path:
+        """机器人侧 `configure_domain.sh` 的路径。
+
+        现场确认（2026-11-05）：脚本就在**工作空间根**，相对路径写进配置即可
+        （`configure_domain_script: configure_domain.sh`）。
+        """
+        raw = str(self.app_config.get("configure_domain_script") or "configure_domain.sh")
+        path = Path(raw).expanduser()
+        return path if path.is_absolute() else self.workspace / path
+
+    def get_domain_local_ip(self) -> str:
+        """`configure_domain.sh` 用的 `local_ip` 默认值（配置项 `domain_local_ip`）。
+
+        为什么它要可配：这个地址是**这台机器自己**的监听网卡地址，换网段就得改；
+        把它写死在代码里，换机器的人只能去改源码。
+        """
+        value = str(self.app_config.get("domain_local_ip") or "").strip()
+        return value or self.DEFAULT_DOMAIN_LOCAL_IP
+
     def ros_domain_bash_path(self) -> Path:
         """机器人侧 `install/setup_domain.bash` 的路径（可能不存在）。
 

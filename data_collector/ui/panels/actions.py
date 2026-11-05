@@ -10,6 +10,7 @@ from ... import theme
 from ...core_motion import TRUNK_LOCK_AXES_TEXT
 
 from ..common import (SP, make_panel_head)
+from ..safety import guard_slot
 from ..threads import LocalTaskThread
 from .export_target import ExportTargetMixin
 
@@ -26,6 +27,21 @@ TOUCH_BOX_HEIGHT = 32
 
 class ActionsMixin(ExportTargetMixin):
     """动作区（按钮矩阵）构建。"""
+
+    @guard_slot
+    def on_configure_domain(self):
+        """打开「配置 ROS 域」对话框（v6.9.13）。
+
+        **只调机器人侧脚本，不自己 export ROS_DOMAIN_ID** —— 域的真源是
+        `install/setup_domain.bash`（ADR-002）。改完必须重启上位机才生效，
+        对话框里已经写明这一点。
+        """
+        from ..domain_dialog import DomainDialog      # 延迟导入：不点就不加载
+
+        dlg = DomainDialog(self.config, self.launcher, self)
+        dlg.exec_()
+        if getattr(dlg, "changed", False):
+            self.append("ROS 域已按 configure_domain.sh 修改，重启上位机后生效")
 
     def _build_actions(self):
         """操作区：按「设备 / 数据 / 工具」三行分组，行内同权重、同尺寸。
@@ -166,6 +182,19 @@ class ActionsMixin(ExportTargetMixin):
             param_row.addWidget(box)
 
         param_row.addStretch()
+
+        # ---- 「配置域…」（v6.9.13）----
+        # 域本身**不是启动参数**（那是 v6.9.11 的错误做法，已回退）：它由机器人侧的
+        # `configure_domain.sh` 生成的文件决定（ADR-002）。这个按钮只是把那条命令
+        # 从终端搬到界面上，省掉"为了改个域去开终端"。
+        self.btn_domain = QPushButton("配置域…")
+        self.btn_domain.setProperty("variant", "ghost")
+        self.btn_domain.setMinimumHeight(theme.px(TOUCH_BOX_HEIGHT))
+        self.btn_domain.setToolTip(
+            "调机器人侧的 configure_domain.sh 配置或移除 ROS 域（domain + local_ip）。\n"
+            "配置后需重启上位机才生效。")
+        self.btn_domain.clicked.connect(self.on_configure_domain)
+        param_row.addWidget(self.btn_domain)
         body.addLayout(param_row)
 
         # ---- 运行状态（第二行）----

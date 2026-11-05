@@ -8765,3 +8765,17 @@ def test_the_launch_panel_does_not_hold_a_domain_setting(ui_env):
 
     assert not hasattr(win, "edit_domain"), "启动参数行又出现 domain 输入框了"
     assert not hasattr(win, "domain_label")
+
+
+def test_the_launch_row_has_a_configure_domain_button(ui_env):
+    """「启动参数」行要有「配置域…」入口（v6.9.13）。
+
+    域本身不是启动参数（v6.9.11 那种做法已回退），但这个入口必须留：现场就在机器人
+    跟前，为了改个域去开终端是多余的。它调的仍然是机器人侧 `configure_domain.sh`。
+    """
+    win, _cm = ui_env
+
+    assert hasattr(win, "btn_domain"), "启动参数行没有「配置域…」按钮"
+    assert "配置域" in win.btn_domain.text()
+    assert win.btn_domain.isEnabled(), "按钮不可点等于没有"
+    assert callable(getattr(win, "on_configure_domain", None))

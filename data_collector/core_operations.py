@@ -1510,6 +1510,10 @@ class SdkServiceManager:
         return runs_under_service(self.name)
 
 class Launcher:
+    #: 调 `configure_domain.sh` 的超时（秒）。它只写两个文件，正常不到 1 秒；
+    #: 给 30 秒是留足磁盘忙（移动硬盘 fsync 慢）时的余量。
+    DOMAIN_CONFIG_TIMEOUT = 30.0
+
     def __init__(self, config: ConfigManager):
         self.config = config
         self.pm = ProcessManager()
@@ -1703,6 +1707,57 @@ class Launcher:
                                              proc_name or label)
         return self._start_background(cmd, label, cwd=cwd, log_file=log_file,
                                       proc_name=proc_name)
+
+    # ---------- 配置 ROS 域（调机器人侧 configure_domain.sh） ----------
+
+    def configure_domain(self, domain, local_ip: str = "") -> Tuple[bool, str]:
+        """调机器人侧的 `configure_domain.sh`：配置或移除 ROS 域。返回 `(成功, 输出)`。
+
+        ## 为什么上位机只"调脚本"，不自己写文件
+
+        域的真源是机器人侧那两个生成物（`install/setup_domain.bash` +
+        `install/config/fastdds.xml`，后者带 `local_ip`）。我们照着文件格式自己写一份，
+        一旦机器人侧改了格式（比如多个字段、换 FastDDS 版本），就会静默错位 ——
+        所以这里只负责**触发**脚本，格式由它自己保证。
+
+        Args:
+            domain: `None` = 移除域（`no_domain`）；否则 0~255。
+            local_ip: 只在配置时有意义；空串表示用脚本自己的默认值。
+
+        Returns:
+            `(ok, text)`；`text` 用于界面直接展示（包含脚本原始输出或失败原因）。
+        """
+        script = self.config.get_configure_domain_script()
+        if not script.exists():
+            return False, (f"找不到配置脚本：{script}\n"
+                           "（配置项 configure_domain_script，默认在工作空间根）")
+
+        if domain is None:
+            args = ["no_domain"]
+        else:
+            number = int(domain)
+            if not 0 <= number <= 255:
+                return False, f"domain 必须在 0~255 之间（填的是 {number}）"
+            args = [f"domain={number}"]
+            if local_ip:
+                args.append(f"local_ip={local_ip}")
+
+        cmd = ["bash", str(script), *args]
+        logger.warning(f"配置 ROS 域：{' '.join(cmd)}（cwd={self.config.workspace}）")
+        try:
+            completed = subprocess.run(          # noqa: S603 (参数列表，无 shell)
+                cmd, cwd=str(self.config.workspace), capture_output=True,
+                text=True, timeout=self.DOMAIN_CONFIG_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return False, f"配置脚本超过 {self.DOMAIN_CONFIG_TIMEOUT} 秒没有结束"
+        except OSError as exc:
+            return False, f"配置脚本起不来：{exc}"
+
+        output = (completed.stdout or "") + (completed.stderr or "")
+        output = output.strip()
+        if completed.returncode != 0:
+            return False, (output or f"配置脚本退出码 {completed.returncode}")
+        return True, output
 
     def launch_run_nodes(self, options: List[str]) -> subprocess.Popen:
         """启动主程序（新终端，退出后保活以便查看报错）。"""

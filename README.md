@@ -1,8 +1,22 @@
-# 数据采集工具 v6.9.12
+# 数据采集工具 v6.9.13
 
 轮式人形机器人（布草机器人）桌面上位机，提供启动主程序、遥操作配置/标定、数据录制、
 机器人状态与急停、数据回传功能。
 
+> **v6.9.13**：**「启动参数」行加「配置域…」按钮 —— 在界面上配/移除 ROS 域。**
+>
+> 它做的事就一件：把 `./configure_domain.sh domain=… local_ip=…`（或 `no_domain`）
+> 从终端搬到界面上，**脚本照旧由机器人侧提供**；上位机仍然不自己写
+> `install/setup_domain.bash` / `fastdds.xml`，也不 export `ROS_DOMAIN_ID`（ADR-002）。
+>
+> - `local_ip` 默认 **192.168.2.100**，可在 `app_config.yaml` 的 `domain_local_ip` 改；
+> - 脚本路径 `configure_domain_script` 默认在工作空间根（现场确认）；
+> - **二次确认**：配置前问一次；`no_domain` 会删文件，措辞点明后果；
+> - 脚本的成功/失败**原样贴出来**（不吞成"失败了"），成功时提示**重启上位机生效**；
+> - domain 非数字 / 越界就地拦住，不交给脚本。
+>
+> ---
+>
 > **v6.9.12**：**域（domain）改由机器人侧管：回退界面输入框，改为统一 source `install/setup_domain.bash`。**
 >
 > 机器人侧 v1.4.0-develop 起用 `./configure_domain.sh domain=10 local_ip=192.168.2.100`
